@@ -18,7 +18,7 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-TRANSCRIPT = ROOT / "运行日志.txt"
+TRANSCRIPT = ROOT / "run_log.txt"   # 英文名：中文名在部分环境下会乱码
 
 
 class Tee:
@@ -160,13 +160,13 @@ def main(argv: list[str]) -> int:
     except Exception:
         print("\n\n出错了，完整堆栈如下：\n")
         traceback.print_exc(file=sys.stdout)
-        print("\n把 运行日志.txt 整个发给 Claude —— 这份堆栈是关键。")
+        print("\n把 run_log.txt 整个发给 Claude —— 这份堆栈是关键。")
 
     elapsed = (dt.datetime.now() - started).total_seconds()
     print(f"\n{'=' * 62}")
     print(f"结束，用时 {elapsed / 60:.1f} 分钟")
     print(f"\n完整日志：{TRANSCRIPT}")
-    print(f"发给 Claude：{ROOT / '发给CLAUDE.txt'}")
+    print(f"发给 Claude：{ROOT / 'SEND_TO_CLAUDE.txt'}")
     if ok:
         print(f"结果网页：{ROOT / 'data' / 'screening' / 'report.html'}")
     print("=" * 62)

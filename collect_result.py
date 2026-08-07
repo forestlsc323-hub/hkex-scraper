@@ -2,7 +2,7 @@
 """把这次运行的结果打包成一个文件，发给 Claude 就够了。
 
 用法：python collect_result.py
-产出：发给CLAUDE.txt
+产出：SEND_TO_CLAUDE.txt
 """
 
 import csv
@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT / "发给CLAUDE.txt"
+OUT = ROOT / "SEND_TO_CLAUDE.txt"
 LIMIT = 60          # 每段最多贴多少行
 
 
@@ -72,8 +72,8 @@ def main() -> int:
             parts += [section("配置"), f"（读不了：{exc}）"]
 
     logs = ROOT / "logs"
-    parts += [section("抓取日志（最后 %d 行）" % LIMIT),
-              tail(logs / "vendor.log", LIMIT)]
+    parts += [section("运行日志（最后 %d 行）" % LIMIT),
+              tail(ROOT / "run_log.txt", LIMIT)]
 
     raw = ROOT / "data" / "raw"
     parts += [section("抓到的公告列表"),

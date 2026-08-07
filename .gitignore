@@ -10,4 +10,7 @@ logs/
 __pycache__/
 *.pyc
 .pytest_cache/
+SEND_TO_CLAUDE.txt
+run_log.txt
 发给CLAUDE.txt
+运行日志.txt
