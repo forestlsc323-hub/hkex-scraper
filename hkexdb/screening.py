@@ -18,6 +18,8 @@ from pathlib import Path
 
 import yaml
 
+from .config import resolve_file
+
 # 判定桶
 EXCLUDED = "excluded"        # 灰：后续/程序公告
 RETAINED = "retained"        # 留：命中 T0 特征
@@ -76,7 +78,11 @@ class Rules:
 
 
 def load_rules(path: str | Path = "screening_rules.yaml") -> Rules:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    resolved = resolve_file(path)
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"找不到规则文件 {resolved}。请在仓库根目录下运行。")
+    raw = yaml.safe_load(resolved.read_text(encoding="utf-8"))
     markers = raw.get("title_correction_markers", {})
     rules = Rules(
         raw=raw,

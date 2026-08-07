@@ -16,7 +16,7 @@ import csv
 import sys
 from pathlib import Path
 
-from hkexdb import config, logsetup, screening as S
+from hkexdb import config, console, logsetup, screening as S
 
 
 # 演示样本：三条是真实公告标题（1417 / 3336 / 00195，已人工核对），
@@ -164,6 +164,7 @@ def write_report(report: S.QualityReport, rules: S.Rules, out_dir: Path,
 
 
 def main(argv: list[str]) -> int:
+    console.init()
     cfg = config.load("config.yaml")
     cfg.ensure_dirs()
     logsetup.setup(cfg.log_dir, cfg.log_level, run_name="screening")
@@ -175,7 +176,7 @@ def main(argv: list[str]) -> int:
     if is_demo:
         records = demo_records()
         source = "演示数据（非真实）"
-        print("⚠️ 演示模式：15 条样本中仅 4 条为真实公告标题，其余为构造样本。\n")
+        print(f"{console.WARN} 演示模式：15 条样本中仅 4 条为真实公告标题，其余为构造样本。\n")
     else:
         src = Path(argv[0]) if argv else cfg.raw_dir / "listing_raw.csv"
         if not src.exists():
@@ -210,7 +211,7 @@ def main(argv: list[str]) -> int:
     print(f"\n全量结果：{out_dir / 'screened.csv'}（{len(records)} 行，软删除，一行不少）")
     print(f"质控报告：{path}")
     print(f"\n判定桶：{report.counts}")
-    print(f"数量校验：{'✅ 平' if report.reconciled else '❌ 不平'}")
+    print(f"数量校验：{console.OK + ' 平' if report.reconciled else console.FAIL + ' 不平'}")
     print(f"矛盾行 {len(report.contradictions)} 条、"
           f"人工复核桶 {report.counts.get(S.MANUAL, 0)} 条 —— 先看完再进抽取（铁律二）")
     return 0

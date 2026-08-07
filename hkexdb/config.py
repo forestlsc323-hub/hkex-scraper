@@ -11,6 +11,23 @@ from pathlib import Path
 
 import yaml
 
+# 仓库根目录 = 本文件的上一级。用它兜底，这样从任何工作目录启动都能找到
+# config.yaml / screening_rules.yaml（GUI 启动器常常不在仓库根目录跑 python）。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_file(name: str | Path) -> Path:
+    """按「当前目录 → 仓库根目录」的顺序找文件。都找不到就报当前目录那个，
+    让错误信息指向用户以为它该在的地方。"""
+    path = Path(name)
+    if path.is_absolute():
+        return path
+    for base in (Path.cwd(), REPO_ROOT):
+        candidate = base / path
+        if candidate.exists():
+            return candidate.resolve()
+    return (Path.cwd() / path).resolve()
+
 
 @dataclass(frozen=True)
 class Query:
@@ -69,9 +86,19 @@ def _as_date(value) -> date:
 
 
 def load(config_path: str | Path = "config.yaml") -> Config:
-    config_path = Path(config_path)
+    config_path = resolve_file(config_path)
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"找不到配置文件 {config_path}。\n"
+            f"当前工作目录：{Path.cwd()}\n"
+            f"仓库根目录：{REPO_ROOT}\n"
+            f"请在仓库根目录下运行，或把 config.yaml 放到上述任一位置。")
     with config_path.open(encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
+
+    # 数据/日志目录一律相对 config.yaml 所在目录，而不是相对当前工作目录。
+    # 否则从别处启动会把 data/ 建到意想不到的地方，下一步就找不到上一步的产物。
+    anchor = config_path.parent
 
     paths = raw["paths"]
     date_range = raw["date_range"]
@@ -86,11 +113,11 @@ def load(config_path: str | Path = "config.yaml") -> Config:
     return Config(
         raw=raw,
         config_path=config_path,
-        data_dir=Path(paths["data_dir"]),
-        raw_dir=Path(paths["raw_dir"]),
-        cache_dir=Path(paths["cache_dir"]),
-        probe_dir=Path(paths["probe_dir"]),
-        log_dir=Path(paths["log_dir"]),
+        data_dir=anchor / paths["data_dir"],
+        raw_dir=anchor / paths["raw_dir"],
+        cache_dir=anchor / paths["cache_dir"],
+        probe_dir=anchor / paths["probe_dir"],
+        log_dir=anchor / paths["log_dir"],
         date_from=_as_date(date_range["from"]),
         date_to=_as_date(date_range["to"]),
         user_agent=http["user_agent"],

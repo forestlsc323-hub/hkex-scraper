@@ -11,7 +11,7 @@
 import logging
 import sys
 
-from hkexdb import config, logsetup
+from hkexdb import config, console, logsetup
 from hkexdb.pdf_source import open_pdf
 
 # 要在公告里定位的锚点。命中即打印页码和原文行 —— 铁律三要的 page 出处。
@@ -26,6 +26,7 @@ ANCHORS = [
 
 
 def main(argv: list[str]) -> int:
+    console.init()
     if not argv:
         print(__doc__)
         return 2
@@ -53,7 +54,7 @@ def main(argv: list[str]) -> int:
         print(f"共 {doc.page_count} 页 | 文本层：{'有' if doc.has_text_layer else '无（需 OCR）'}"
               f" | {'本地副本' if doc.from_cache else '刚从网上取回'}")
         if not doc.has_text_layer:
-            print("⚠️ 扫描件，本工具取不到文本，须走 OCR 并强制人工复核。")
+            print(f"{console.WARN} 扫描件，本工具取不到文本，须走 OCR 并强制人工复核。")
             continue
 
         for anchor in ANCHORS:

@@ -9,10 +9,11 @@
 import logging
 import sys
 
-from hkexdb import config, listing, logsetup
+from hkexdb import config, console, listing, logsetup
 
 
 def main() -> int:
+    console.init()
     cfg = config.load("config.yaml")
     cfg.ensure_dirs()
     log_file = logsetup.setup(cfg.log_dir, cfg.log_level, run_name="listing")

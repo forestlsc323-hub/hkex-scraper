@@ -9,11 +9,12 @@
 
 import logging
 
-from hkexdb import config, logsetup, probe
+from hkexdb import config, console, logsetup, probe
 from hkexdb.http_client import PoliteSession
 
 
 def main() -> int:
+    console.init()
     cfg = config.load("config.yaml")
     cfg.ensure_dirs()
     log_file = logsetup.setup(cfg.log_dir, cfg.log_level, run_name="probe")
