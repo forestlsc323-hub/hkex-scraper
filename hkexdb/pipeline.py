@@ -59,20 +59,28 @@ def status(cfg: Config) -> list[Step]:
             days_done = 0
     total_days = (cfg.date_to - cfg.date_from).days + 1
 
+    # vendor 路径（run_all.py / run_vendor.py 用你那份客户端抓的）写的是
+    # vendor_listing.csv，没有 checkpoint。两条路都要认，否则跑完了
+    # 状态还显示「未运行」，等于给了个假信号。
+    vendor_csv = cfg.raw_dir / "vendor_listing.csv"
+    vendor_rows = _count_csv_rows(vendor_csv)
     raw_rows = _count_csv_rows(raw_csv)
     screened_rows = _count_csv_rows(screened)
 
     return [
         Step(1, "probe", "勘察接口", "python run_probe.py",
              "data/probe/PROBE_REPORT.md",
-             "确认接口地址与参数名。跳过它，第 2 步可能抓到 0 条却不报错。",
-             probe_ok, probe_detail),
+             "确认接口地址与参数名。走 vendor 路径（一键运行.bat）时可跳过，"
+             "因为那边直接用已验证过的客户端。",
+             probe_ok or vendor_rows > 0,
+             probe_detail if not vendor_rows else "vendor 路径已抓到数据，无需勘察"),
         Step(2, "listing", "抓取列表", "python run_listing.py",
              "data/raw/listing_raw.csv",
              "按天抓全量公告。中断可直接重跑，已完成的天会跳过。",
-             days_done >= total_days and raw_rows > 0,
-             f"已完成 {days_done}/{total_days} 天，raw 表 {raw_rows} 行"
-             if days_done else "未运行"),
+             (days_done >= total_days and raw_rows > 0) or vendor_rows > 0,
+             f"vendor 路径已抓 {vendor_rows} 行" if vendor_rows else
+             (f"已完成 {days_done}/{total_days} 天，raw 表 {raw_rows} 行"
+              if days_done else "未运行")),
         Step(3, "screening", "质控筛查", "python run_screening.py",
              "data/screening/screened.csv + QC_REPORT.md",
              "T0 标题层筛选。软删除，一行不少。跑完必须人工过一遍再进抽取（铁律二）。",
