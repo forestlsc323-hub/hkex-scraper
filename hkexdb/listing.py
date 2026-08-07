@@ -138,14 +138,25 @@ def parse_payload(text: str) -> tuple[list[dict], int, bool, int]:
 
 
 def warm_up_session(session: PoliteSession) -> None:
-    """先访问检索页建立会话。
+    """先访问检索页建立会话，拿到 cookie。
 
-    接口依赖检索页种下的 cookie；直接打 servlet 可能拿不到数据。
+    照搬实战客户端 `HKEXClient.__init__` 的做法：检索接口依赖检索页种下的
+    cookie，直接打 servlet 容易被拒。
+
+    ⚠️ **必须 `use_cache=False`。** 这里踩过一个坑：
+    走缓存的话，第二次运行时检索页会从本地副本返回 ——
+    **一个 HTTP 请求都没发出去，cookie 自然也没种上**，
+    随后所有 servlet 请求都是裸的。第一次跑得好好的，重跑却静默失效，
+    表现是「突然抓不到数据了」而日志上一切正常。
+    cookie 是会话状态，不是可缓存的内容。
+
     失败不致命 —— 实战客户端也是只记警告继续跑。
     """
     try:
-        session.get(SEARCH_PAGE, params={"lang": "zh"})
-        log.info("会话已建立")
+        session.get(SEARCH_PAGE, params={"lang": "zh"}, use_cache=False)
+        jar = getattr(getattr(session, "session", None), "cookies", None)
+        names = sorted(c.name for c in jar) if jar else []
+        log.info("会话已建立，cookie：%s", names or "（服务端未下发）")
     except Exception as exc:
         log.warning("建立会话失败（不一定影响检索）：%s", exc)
 
