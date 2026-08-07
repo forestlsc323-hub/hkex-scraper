@@ -58,7 +58,10 @@ def load_csv(path: Path) -> list[dict]:
             "date": (r.get("DATE_TIME") or "").split()[0] if r.get("DATE_TIME") else "",
             "code": r.get("STOCK_CODE", ""),
             "name": r.get("STOCK_NAME", ""),
-            "title": r.get("TITLE", ""),
+            # 优先用清洗后的标题：接口返回的 TITLE 是 HTML 片段，
+            # 带 &amp; / <br/> / tooltip 残留，直接拿去匹配词表会静默失配。
+            "title": r.get("TITLE_CLEAN") or r.get("TITLE", ""),
+            "title_raw": r.get("TITLE", ""),
             "pdf_url": r.get("FILE_LINK", ""),
             "file_info": r.get("FILE_INFO", ""),
         })

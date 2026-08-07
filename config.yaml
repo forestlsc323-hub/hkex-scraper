@@ -35,39 +35,26 @@ http:
   cache_enabled: true
 
 listing:
-  # 把日期范围切成小块抓，好处有二：
-  # 1) 单次查询命中数不会撞上服务端的返回上限
-  # 2) 断点续跑的粒度更细，中断后不用整段重来
-  chunk_months: 1
-
-  row_range: 100              # 每页条数
-  max_pages_per_chunk: 200    # 安全阀，防止分页逻辑出错时无限翻页
-
   # ----------------------------------------------------------
-  # 查询清单：每个 profile 是一组传给检索接口的参数。
+  # 检索策略照搬实战客户端 hkex_client.py：
+  #   · 按**天**抓当日全部公告，不带标题关键词
+  #   · 筛选交给 screening 层（词表可迭代，抓取不必重来）
   #
-  # 现在默认用"标题关键词"检索（recall 优先，精确分类留给阶段二）。
-  # 等 run_probe.py 确认了 Headline Category 的真实代码后，
-  # 在这里加一条 t1code/t2code 的 profile 会大幅缩小抓取面。
-  #
-  # 中英双语版本都抓：raw 层不去重，按 deal 去重是后续阶段的事
-  # （附录 C 第 8 项）。
+  # 为什么不用标题关键词：关键词漏一个变体就静默漏一单，
+  # 而抓全量 + 本地筛，词表改了只要重跑 screening，不用重抓。
+  # 单日全市场约 600~800 条，一年约 20 万条，本地筛毫无压力。
   # ----------------------------------------------------------
-  queries:
-    - name: "title_zh_trad"
-      lang: "ZH"
-      params:
-        title: "要約"
 
-    - name: "title_zh_simp"
-      lang: "ZH"
-      params:
-        title: "要约"
+  # 翻页机制：接口没有 pageNo，靠加大 rowRange 重查 + 按 NEWS_ID 去重。
+  # 每轮在上一轮基础上加这个步长。
+  row_range_step: 100
 
-    - name: "title_en"
-      lang: "EN"
-      params:
-        title: "OFFER"
+  # 单日最多重查多少轮的安全阀（100 × 100 = 10000，正好是服务端上限）
+  max_rounds_per_day: 100
+
+  # 类别交叉核对用（双保险，不作为主抓取口径）
+  category_t1code: "10000"
+  category_t2codes: []        # 待 run_probe.py 或 F12 确认收购相关类别代码后填
 
 logging:
   level: "INFO"               # DEBUG 会打印每一次请求的完整参数

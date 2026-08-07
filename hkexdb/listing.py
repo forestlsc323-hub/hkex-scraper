@@ -1,17 +1,47 @@
-"""按日期范围拉取公告列表。
+"""按日期范围拉取披露易公告列表。
 
-阶段一的主力脚本。做的事很窄：把检索接口的分页结果**原样**取回来交给 storage。
-不判断公告类型、不解析 PDF、不去重——那些都是后面阶段的事。
+**本模块的检索逻辑照搬自你提供的 `hkex_client.py`（实战验证过的客户端）。**
+我原先那版是按接口文档推测写的，有五处硬错误，逐条记在下面，
+免得以后有人"顺手改回去"：
+
+| 项目 | 我原来写的（错） | 实战客户端（对） |
+| --- | --- | --- |
+| 翻页机制 | `pageNo` 递增 | **`rowRange` 递增后重查，按 NEWS_ID 去重** |
+| 切块粒度 | 按月 | **按天**（单日全市场 600~800 条） |
+| `searchType` | `1` | `0`（日期区间全量检索）|
+| `t1code`/`t2Gcode`/`t2code` | `-1` | **`-2`** |
+| `lang` | `ZH` | `zh`（小写）|
+| 检索策略 | 标题关键词 | **不带关键词，抓当日全量，本地筛** |
+| 会话 | 直接打接口 | **先访问检索页建立会话** |
+
+## 翻页机制为什么长这样
+
+披露易这个接口**没有 pageNo**。`rowRange` 是"返回前 N 条"的上限，
+要拿更多就把 N 调大重查一次 —— 每次返回的都是从头开始的一整段，
+和上一次大量重叠。所以：
+
+    rowRange=100 → 前 100 条
+    rowRange=200 → 前 200 条（含刚才那 100 条）
+
+**必须按 NEWS_ID 去重**，否则记录会成倍膨胀。
+用 `pageNo` 翻页则根本不生效 —— 服务端忽略这个参数，
+每次都返回同一批，循环靠 `hasNextRow` 才会停，结果就是抓到一堆重复或干脆抓不全。
+
+## 为什么按天切
+
+服务端单次查询返回上限约 10000 条（`SERVER_RECORD_CAP`），
+超过之后加大 `rowRange` 也没用，只能缩小日期区间。
+单日全市场公告约 600~800 条，安全余量很大；按月切会撞上限并**静默截断**。
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
-from datetime import date
-from pathlib import Path
+from html import unescape
 
-from .config import Config, Query
+from .config import Config
 from .http_client import PoliteSession
 from .storage import RawStore, row_uid
 
@@ -19,136 +49,198 @@ log = logging.getLogger(__name__)
 
 BASE = "https://www1.hkexnews.hk"
 SEARCH_PAGE = f"{BASE}/search/titlesearch.xhtml"
-
-# ⚠️ 下面两项由 run_probe.py 实测确认。若勘察报告的结论与此不符，改这里。
 SERVLET = f"{BASE}/search/titleSearchServlet.do"
-DATE_PARAM_NAMES = ("fromDate", "toDate")
 
-XHR_HEADERS = {
-    "X-Requested-With": "XMLHttpRequest",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Referer": SEARCH_PAGE + "?lang=zh",
-}
+# 服务端单次查询返回记录上限。超过后加大 rowRange 无效，只能缩小区间。
+SERVER_RECORD_CAP = 10000
+
+# 需要做 HTML 反转义 + tooltip 剥离的字段（接口返回的是带标记的 HTML 片段）
+_HTML_FIELDS = ("TITLE", "SHORT_TEXT", "LONG_TEXT", "STOCK_NAME")
 
 
-def month_chunks(start: date, end: date, months: int = 1) -> list[tuple[date, date]]:
-    """把日期范围切成若干块。
+def day_chunks(start: dt.date, end: dt.date) -> list[tuple[dt.date, dt.date]]:
+    """按天切分。每天一个抓取单元，也是断点续跑的最小粒度。"""
+    out = []
+    cur = start
+    while cur <= end:
+        out.append((cur, cur))
+        cur += dt.timedelta(days=1)
+    return out
 
-    切块的两个理由：
-    1) 单次查询命中太多会撞上服务端的返回条数上限，切小就不会漏。
-    2) 断点续跑的粒度更细——中断后只需重跑没做完的那一块。
+
+def clean_text(value: str) -> str:
+    """把接口返回的 HTML 片段还原成纯文本。
+
+    接口给的 TITLE 里带 HTML 实体（`&amp;` `&#x2f;`）、`<br/>`，
+    有时还拖着一段 tooltip 的 `<div>...`。不还原的话，
+    screening 层的词表匹配会在这些标题上**静默失效** ——
+    标题看着对，但 `&amp;` 这种地方一比就不等。
+
+    注意：raw 层仍然保留原始字段，清洗结果另存为 `*_CLEAN` 列，
+    两份都在，可随时回溯（铁律：原始层不动，加工层另开）。
     """
-    if start > end:
-        return []
-
-    chunks: list[tuple[date, date]] = []
-    cursor = start
-    while cursor <= end:
-        # 往后推 months 个月，落到"下一块的第一天"
-        year, month = cursor.year, cursor.month + months
-        year += (month - 1) // 12
-        month = (month - 1) % 12 + 1
-        next_start = date(year, month, 1)
-        chunk_end = min(end, date.fromordinal(next_start.toordinal() - 1))
-        chunks.append((cursor, chunk_end))
-        cursor = next_start
-    return chunks
+    text = unescape(value or "").replace("<br/>", " ").replace("&#x2f;", "/")
+    if "<div" in text:                      # 剥掉 tooltip 残留
+        text = text.split("<div")[0]
+    return " ".join(text.split())
 
 
-def _parse_payload(text: str) -> tuple[list[dict], bool]:
-    """接口把结果放在 result 字段里，且常常是"JSON 字符串套 JSON"。"""
-    payload = json.loads(text)
-    rows = payload.get("result")
-    if isinstance(rows, str):
-        rows = json.loads(rows) if rows.strip() else []
-    has_next = str(payload.get("hasNextRow", "")).lower() == "true"
-    return rows or [], has_next
-
-
-def _build_params(cfg: Config, query: Query, chunk: tuple[date, date],
-                  page_no: int) -> dict:
-    from_key, to_key = DATE_PARAM_NAMES
-    params = {
+def _build_params(cfg: Config, d1: dt.date, d2: dt.date, row_range: int,
+                  *, search_type: str = "0", t1code: str = "-2",
+                  t2code: str = "-2", category: str = "0",
+                  stock_id: str = "-1") -> dict:
+    """参数取值全部照搬实战客户端，不要凭印象改。"""
+    return {
         "sortDir": "0",
         "sortByOptions": "DateTime",
-        "category": "0",
-        "market": "SEHK",
-        "stockId": "-1",
+        "category": category,
+        "market": "SEHK",          # 实测已同时覆盖主板与 GEM
+        "stockId": stock_id,
         "documentType": "-1",
-        from_key: chunk[0].strftime("%Y%m%d"),
-        to_key: chunk[1].strftime("%Y%m%d"),
-        "title": "",
-        "searchType": "1",
-        "t1code": "-1",
-        "t2Gcode": "-1",
-        "t2code": "-1",
-        "rowRange": str(cfg.row_range),
-        "lang": query.lang,
-        "pageNo": str(page_no),
+        "fromDate": d1.strftime("%Y%m%d"),
+        "toDate": d2.strftime("%Y%m%d"),
+        "title": "",               # 不带关键词：抓全量，筛选交给 screening 层
+        "searchType": search_type,
+        "t1code": t1code,
+        "t2Gcode": "-2",
+        "t2code": t2code,
+        "rowRange": str(row_range),
+        "lang": "zh",              # 小写
     }
-    # config.yaml 里 profile 自己写的参数优先，可覆盖上面任何一项
-    params.update({k: str(v) for k, v in query.params.items()})
-    return params
 
 
-def fetch_chunk(session: PoliteSession, store: RawStore, cfg: Config,
-                query: Query, chunk: tuple[date, date]) -> int:
-    """抓一个 (查询 × 时间块) 的全部分页，返回记录数。"""
-    unit = f"{query.name}|{chunk[0].isoformat()}_{chunk[1].isoformat()}"
+def parse_payload(text: str) -> tuple[list[dict], int, bool, int]:
+    """解析接口响应。
 
+    返回 (记录列表, loadedRecord, hasNextRow, recordCnt)。
+    `result` 是 JSON 字符串套 JSON，且可能是 None 或字符串 "null"。
+    """
+    payload = json.loads(text)
+    raw = payload.get("result")
+    recs = json.loads(raw) if raw not in (None, "null", "") else []
+    if isinstance(recs, dict):
+        recs = [recs]
+    loaded = int(payload.get("loadedRecord", len(recs)) or len(recs))
+    total = int(payload.get("recordCnt", loaded) or loaded)
+    return recs, loaded, bool(payload.get("hasNextRow")), total
+
+
+def warm_up_session(session: PoliteSession) -> None:
+    """先访问检索页建立会话。
+
+    接口依赖检索页种下的 cookie；直接打 servlet 可能拿不到数据。
+    失败不致命 —— 实战客户端也是只记警告继续跑。
+    """
+    try:
+        session.get(SEARCH_PAGE, params={"lang": "zh"})
+        log.info("会话已建立")
+    except Exception as exc:
+        log.warning("建立会话失败（不一定影响检索）：%s", exc)
+
+
+def fetch_day(session: PoliteSession, store: RawStore, cfg: Config,
+              day: dt.date) -> int:
+    """抓单日全部公告。返回本日去重后的记录数。
+
+    翻页靠加大 rowRange 重查，按 NEWS_ID 去重 —— 见模块头的说明。
+    """
+    unit = day.isoformat()
     if store.is_done(unit):
         log.info("跳过（已完成）%s", unit)
         return 0
 
-    total = 0
-    for page_no in range(1, cfg.max_pages_per_chunk + 1):
-        params = _build_params(cfg, query, chunk, page_no)
-        resp = session.get(SERVLET, params=params, headers=XHR_HEADERS)
+    day_records: dict[str, dict] = {}
+    row_range = cfg.row_range_step
+
+    for round_no in range(1, cfg.max_rounds_per_day + 1):
+        params = _build_params(cfg, day, day, row_range)
+        resp = session.get(SERVLET, params=params)
 
         try:
-            rows, has_next = _parse_payload(resp.text)
+            recs, loaded, has_next, total = parse_payload(resp.text)
         except json.JSONDecodeError:
-            log.error("%s 第 %d 页返回的不是 JSON，前 200 字：%r",
-                      unit, page_no, resp.text[:200])
+            log.error("%s 第 %d 轮返回的不是 JSON，前 200 字：%r",
+                      unit, round_no, resp.text[:200])
             raise
 
-        store.save_page_json(unit, page_no, resp.text)
+        store.save_page_json(unit, round_no, resp.text)
 
-        enriched = []
-        for position, row in enumerate(rows):
-            # 原样保留接口返回的所有字段，只追加以 _ 开头的出处信息
-            record = dict(row)
-            record["_row_uid"] = row_uid(query.name, chunk[0].isoformat(),
-                                         page_no, position,
-                                         str(row.get("FILE_LINK", "")))
-            record["_query_name"] = query.name
-            record["_lang"] = query.lang
-            record["_chunk_from"] = chunk[0].isoformat()
-            record["_chunk_to"] = chunk[1].isoformat()
-            record["_page_no"] = page_no
+        before = len(day_records)
+        for position, rec in enumerate(recs):
+            news_id = str(rec.get("NEWS_ID", "")).strip()
+            if not news_id or news_id in day_records:
+                continue          # 加大 rowRange 会重复返回前面的记录
+            record = dict(rec)    # 原始字段一字不改
+            for field in _HTML_FIELDS:
+                if field in record:
+                    record[f"{field}_CLEAN"] = clean_text(str(record[field]))
+            record["_row_uid"] = row_uid("all", unit, round_no, position, news_id)
+            record["_query_name"] = "all"
+            record["_lang"] = "zh"
+            record["_chunk_from"] = unit
+            record["_chunk_to"] = unit
+            record["_page_no"] = round_no      # 这里是"第几轮 rowRange"，非页码
+            record["_row_range"] = row_range
             record["_fetched_at"] = resp.fetched_at
             record["_source_url"] = SERVLET
-            enriched.append(record)
+            day_records[news_id] = record
 
-        store.append_rows(enriched)
-        total += len(enriched)
+        log.info("%s 第 %d 轮：rowRange=%s，接口返回 %s 条，新增 %s 条，本日累计 %s 条%s",
+                 unit, round_no, row_range, loaded,
+                 len(day_records) - before, len(day_records),
+                 "（缓存）" if resp.from_cache else "")
 
-        log.info("%s 第 %d 页：%d 条%s%s", unit, page_no, len(rows),
-                 "（缓存）" if resp.from_cache else "",
-                 "" if has_next else "（末页）")
+        if loaded >= SERVER_RECORD_CAP:
+            log.warning("%s 当日公告达到服务端上限 %s 条，可能存在截断！"
+                        "需把该日再切细（按半天/按类别）后重抓。",
+                        unit, SERVER_RECORD_CAP)
 
-        if not has_next or not rows:
+        if not has_next:
             break
+        row_range += cfg.row_range_step
     else:
-        log.warning("%s 翻到了 max_pages_per_chunk=%d 上限仍未结束，"
-                    "可能是分页判断有误，请检查。", unit, cfg.max_pages_per_chunk)
+        log.warning("%s 轮到上限 %d 仍未取完，可能是 hasNextRow 判断有误，请检查。",
+                    unit, cfg.max_rounds_per_day)
 
+    store.append_rows(list(day_records.values()))
     store.mark_done(unit)
-    return total
+    return len(day_records)
 
 
-def run(cfg: Config) -> tuple[Path, int]:
-    """阶段一入口：按配置抓完所有 (查询 × 时间块)，生成 raw CSV。"""
+def fetch_category_crosscheck(session: PoliteSession, cfg: Config,
+                              t2code: str) -> list[dict]:
+    """按收购相关类别代码检索（双保险，只用于比对差集）。
+
+    类别筛选后记录数远小于上限，故按月分段即可，无需按天。
+
+    ⚠️ 这一路**不能单独用作抓取口径**：分类是发行人自己选的，
+    归错类的公告会静默漏掉。它的用途是和全量口径比差集 ——
+    差集里的东西告诉你词表还缺什么、或者归类有多不可靠。
+    """
+    results: dict[str, dict] = {}
+    cur = cfg.date_from
+    while cur <= cfg.date_to:
+        nxt = (dt.date(cur.year + 1, 1, 1) if cur.month == 12
+               else dt.date(cur.year, cur.month + 1, 1))
+        end = min(cfg.date_to, nxt - dt.timedelta(days=1))
+
+        params = _build_params(cfg, cur, end, cfg.row_range_step,
+                               search_type="1", t1code=cfg.category_t1code,
+                               t2code=t2code)
+        resp = session.get(SERVLET, params=params)
+        recs, _, _, _ = parse_payload(resp.text)
+        for rec in recs:
+            news_id = str(rec.get("NEWS_ID", "")).strip()
+            if news_id:
+                rec["TITLE_CLEAN"] = clean_text(str(rec.get("TITLE", "")))
+                results[news_id] = rec
+        log.info("类别 %s %s~%s：%d 条", t2code, cur, end, len(recs))
+        cur = end + dt.timedelta(days=1)
+    return list(results.values())
+
+
+def run(cfg: Config):
+    """按配置抓完日期范围内每一天，生成 raw CSV。"""
     session = PoliteSession(
         user_agent=cfg.user_agent,
         cache_dir=cfg.cache_dir,
@@ -158,19 +250,20 @@ def run(cfg: Config) -> tuple[Path, int]:
         backoff_base_seconds=cfg.backoff_base_seconds,
         cache_enabled=cfg.cache_enabled,
     )
-    store = RawStore(cfg.raw_dir)
-    chunks = month_chunks(cfg.date_from, cfg.date_to, cfg.chunk_months)
+    warm_up_session(session)
 
-    log.info("日期范围 %s ~ %s，切成 %d 块；查询 profile %d 个",
-             cfg.date_from, cfg.date_to, len(chunks), len(cfg.queries))
+    store = RawStore(cfg.raw_dir)
+    days = day_chunks(cfg.date_from, cfg.date_to)
+    log.info("日期范围 %s ~ %s，共 %d 天（按天抓取全量公告，不带标题关键词）",
+             cfg.date_from, cfg.date_to, len(days))
 
     grand_total = 0
-    for query in cfg.queries:
-        for chunk in chunks:
-            grand_total += fetch_chunk(session, store, cfg, query, chunk)
+    for i, (d1, _) in enumerate(days, 1):
+        grand_total += fetch_day(session, store, cfg, d1)
+        if i % 10 == 0 or i == len(days):
+            log.info("进度 %d/%d 天，累计新增 %d 条", i, len(days), grand_total)
 
     log.info("本次新增 %d 条；网络请求 %d 次，缓存命中 %d 次，重试 %d 次",
              grand_total, session.stats["network"], session.stats["cache"],
              session.stats["retries"])
-
     return store.rebuild_csv()

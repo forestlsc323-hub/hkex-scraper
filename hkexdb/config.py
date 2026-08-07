@@ -63,10 +63,10 @@ class Config:
     cache_enabled: bool
 
     # listing
-    chunk_months: int
-    row_range: int
-    max_pages_per_chunk: int
-    queries: list[Query]
+    row_range_step: int
+    max_rounds_per_day: int
+    category_t1code: str
+    category_t2codes: list[str]
 
     # logging
     log_level: str
@@ -105,11 +105,6 @@ def load(config_path: str | Path = "config.yaml") -> Config:
     http = raw["http"]
     listing = raw["listing"]
 
-    queries = [
-        Query(name=q["name"], lang=q.get("lang", "ZH"), params=dict(q.get("params", {})))
-        for q in listing["queries"]
-    ]
-
     return Config(
         raw=raw,
         config_path=config_path,
@@ -126,9 +121,9 @@ def load(config_path: str | Path = "config.yaml") -> Config:
         max_retries=int(http["max_retries"]),
         backoff_base_seconds=float(http["backoff_base_seconds"]),
         cache_enabled=bool(http["cache_enabled"]),
-        chunk_months=int(listing["chunk_months"]),
-        row_range=int(listing["row_range"]),
-        max_pages_per_chunk=int(listing["max_pages_per_chunk"]),
-        queries=queries,
+        row_range_step=int(listing["row_range_step"]),
+        max_rounds_per_day=int(listing["max_rounds_per_day"]),
+        category_t1code=str(listing.get("category_t1code", "10000")),
+        category_t2codes=[str(c) for c in listing.get("category_t2codes", [])],
         log_level=str(raw.get("logging", {}).get("level", "INFO")),
     )

@@ -1,269 +1,317 @@
-"""阶段一的离线测试。
+"""列表抓取的离线测试。
 
-这些测试**不联网**：网络那一层被替换成假的，返回预设的 JSON。
-目的是验证"拿到数据之后我们怎么处理"这部分逻辑，
-特别是工程要求里两条硬指标：幂等、断点续跑。
+不联网：网络层被替换成假的，**并且假的服务端模拟了披露易真实的翻页行为**
+—— 这是本文件的重点。接口没有 pageNo，靠加大 rowRange 重查，
+每次返回从头开始的一整段，与上次大量重叠。不按 NEWS_ID 去重就会成倍膨胀。
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
-from datetime import date
 
 import pytest
 
-from hkexdb import listing, probe
-from hkexdb.config import Config, Query
+from hkexdb import listing
+from hkexdb.config import Config
 from hkexdb.http_client import Response, cache_key
 from hkexdb.storage import RawStore
 
 
 # ---------------------------------------------------------------- 切块
 
-def test_month_chunks_splits_on_calendar_months():
-    chunks = listing.month_chunks(date(2026, 1, 1), date(2026, 3, 15))
-    assert chunks == [
-        (date(2026, 1, 1), date(2026, 1, 31)),
-        (date(2026, 2, 1), date(2026, 2, 28)),
-        (date(2026, 3, 1), date(2026, 3, 15)),
-    ]
+def test_day_chunks_is_one_unit_per_day():
+    days = listing.day_chunks(dt.date(2026, 1, 1), dt.date(2026, 1, 4))
+    assert days == [(dt.date(2026, 1, d), dt.date(2026, 1, d)) for d in (1, 2, 3, 4)]
 
 
-def test_month_chunks_starts_mid_month():
-    chunks = listing.month_chunks(date(2026, 1, 20), date(2026, 2, 10))
-    assert chunks == [
-        (date(2026, 1, 20), date(2026, 1, 31)),
-        (date(2026, 2, 1), date(2026, 2, 10)),
-    ]
+def test_day_chunks_crosses_month_and_year():
+    days = listing.day_chunks(dt.date(2025, 12, 30), dt.date(2026, 1, 2))
+    assert len(days) == 4
+    assert days[0][0] == dt.date(2025, 12, 30)
+    assert days[-1][0] == dt.date(2026, 1, 2)
 
 
-def test_month_chunks_crosses_year_end():
-    chunks = listing.month_chunks(date(2025, 12, 1), date(2026, 1, 31))
-    assert chunks == [
-        (date(2025, 12, 1), date(2025, 12, 31)),
-        (date(2026, 1, 1), date(2026, 1, 31)),
-    ]
+def test_day_chunks_empty_when_reversed():
+    assert listing.day_chunks(dt.date(2026, 3, 1), dt.date(2026, 1, 1)) == []
 
 
-def test_month_chunks_multi_month_size():
-    chunks = listing.month_chunks(date(2026, 1, 1), date(2026, 6, 30), months=3)
-    assert chunks == [
-        (date(2026, 1, 1), date(2026, 3, 31)),
-        (date(2026, 4, 1), date(2026, 6, 30)),
-    ]
+# ---------------------------------------------------------------- 参数
+
+def test_params_match_the_battle_tested_client():
+    """这些取值是实战客户端验证过的，改一个就可能抓不到数据。"""
+    cfg = _make_config(None)
+    p = listing._build_params(cfg, dt.date(2026, 1, 5), dt.date(2026, 1, 5), 100)
+
+    assert p["searchType"] == "0"       # 日期区间全量检索，不是 "1"
+    assert p["t1code"] == "-2"          # 不是 "-1"
+    assert p["t2Gcode"] == "-2"
+    assert p["t2code"] == "-2"
+    assert p["lang"] == "zh"            # 小写
+    assert p["title"] == ""             # 不带关键词，抓全量
+    assert p["market"] == "SEHK"        # 已覆盖主板与 GEM
+    assert p["fromDate"] == p["toDate"] == "20260105"
+    assert "pageNo" not in p            # 接口没有这个参数
 
 
-def test_month_chunks_empty_when_reversed():
-    assert listing.month_chunks(date(2026, 3, 1), date(2026, 1, 1)) == []
-
-
-# ---------------------------------------------------------------- 缓存键
-
-def test_cache_key_ignores_param_order():
-    assert cache_key("u", {"a": "1", "b": "2"}) == cache_key("u", {"b": "2", "a": "1"})
-
-
-def test_cache_key_changes_with_value():
-    assert cache_key("u", {"a": "1"}) != cache_key("u", {"a": "2"})
+def test_category_crosscheck_uses_a_different_search_type():
+    cfg = _make_config(None)
+    p = listing._build_params(cfg, dt.date(2026, 1, 1), dt.date(2026, 1, 31), 100,
+                              search_type="1", t1code="10000", t2code="40200")
+    assert (p["searchType"], p["t1code"], p["t2code"]) == ("1", "10000", "40200")
 
 
 # ---------------------------------------------------------------- 解析
 
-def test_parse_payload_handles_json_string_in_result():
-    """接口把结果放在 result 里，且是 JSON 字符串套 JSON。"""
+def test_parse_payload_unwraps_the_nested_json_string():
     inner = json.dumps([{"NEWS_ID": "1", "TITLE": "要約"}])
-    text = json.dumps({"hasNextRow": "true", "result": inner})
-    rows, has_next = listing._parse_payload(text)
-    assert rows == [{"NEWS_ID": "1", "TITLE": "要約"}]
-    assert has_next is True
+    text = json.dumps({"hasNextRow": True, "loadedRecord": 1,
+                       "recordCnt": 5, "result": inner})
+    recs, loaded, has_next, total = listing.parse_payload(text)
+    assert recs == [{"NEWS_ID": "1", "TITLE": "要約"}]
+    assert (loaded, has_next, total) == (1, True, 5)
 
 
-def test_parse_payload_handles_plain_list_and_empty():
-    rows, has_next = listing._parse_payload(
-        json.dumps({"hasNextRow": "false", "result": [{"NEWS_ID": "9"}]}))
-    assert rows == [{"NEWS_ID": "9"}] and has_next is False
-
-    rows, has_next = listing._parse_payload(
-        json.dumps({"hasNextRow": "false", "result": ""}))
-    assert rows == [] and has_next is False
+@pytest.mark.parametrize("result", [None, "null", ""])
+def test_parse_payload_tolerates_empty_result(result):
+    """接口在无结果时会给 None / 字符串 "null" / 空串，三种都要吃下。"""
+    recs, loaded, has_next, _ = listing.parse_payload(
+        json.dumps({"hasNextRow": False, "result": result}))
+    assert recs == [] and loaded == 0 and has_next is False
 
 
-def test_query_params_override_defaults():
-    cfg = _make_config(None)
-    query = Query(name="cat", lang="ZH", params={"t2code": "40200", "title": "要約"})
-    params = listing._build_params(cfg, query, (date(2026, 1, 1), date(2026, 1, 31)), 1)
-    assert params["t2code"] == "40200"      # profile 覆盖了默认的 -1
-    assert params["title"] == "要約"
-    assert params["fromDate"] == "20260101"
-    assert params["lang"] == "ZH"
+# ---------------------------------------------------------------- HTML 清洗
+
+def test_clean_text_undoes_html_entities_and_tooltips():
+    """接口返回的 TITLE 是 HTML 片段，不还原会让词表匹配静默失效。"""
+    assert listing.clean_text("A &amp; B") == "A & B"
+    assert listing.clean_text("甲<br/>乙") == "甲 乙"
+    assert listing.clean_text("要約&#x2f;收購") == "要約/收購"
+    assert listing.clean_text("標題<div class='tip'>提示</div>") == "標題"
+    assert listing.clean_text("  多  空格  ") == "多 空格"
+    assert listing.clean_text("") == ""
 
 
-# ---------------------------------------------------------------- 假会话
+def test_raw_fields_are_kept_alongside_cleaned_ones(tmp_path):
+    """铁律：原始层不动，加工层另开。两份都要在。"""
+    cfg = _make_config(tmp_path)
+    store = RawStore(cfg.raw_dir)
+    session = FakeHKEX({dt.date(2026, 1, 5): [
+        {"NEWS_ID": "n1", "TITLE": "甲 &amp; 乙<div>tip</div>",
+         "STOCK_NAME": "丙&amp;丁", "FILE_LINK": "/x.pdf"}]})
 
-class FakeSession:
-    """替身：按 (查询关键词, 页码) 返回预设数据，并记录被调用了几次。"""
+    listing.fetch_day(session, store, cfg, dt.date(2026, 1, 5))
+    saved = json.loads(store.rows_path.read_text(encoding="utf-8").strip())
 
-    def __init__(self, pages_by_title: dict[str, list[list[dict]]],
-                 fail_on: tuple[str, int] | None = None):
-        self.pages_by_title = pages_by_title
-        self.fail_on = fail_on
+    assert saved["TITLE"] == "甲 &amp; 乙<div>tip</div>"     # 原样
+    assert saved["TITLE_CLEAN"] == "甲 & 乙"                  # 清洗后
+    assert saved["STOCK_NAME_CLEAN"] == "丙&丁"
+
+
+# ---------------------------------------------------------------- 假服务端
+
+class FakeHKEX:
+    """模拟披露易的真实翻页行为。
+
+    关键点：**没有 pageNo**。rowRange 是「返回前 N 条」的上限，
+    每次返回的都是从头开始的一整段，和上一次大量重叠。
+    hasNextRow 为真当且仅当还有更多记录没返回。
+    """
+
+    def __init__(self, by_day: dict[dt.date, list[dict]]):
+        self.by_day = by_day
         self.calls: list[tuple[str, int]] = []
         self.stats = {"network": 0, "cache": 0, "retries": 0}
 
     def get(self, url, params=None, headers=None, use_cache=True):
-        title = params["title"]
-        page_no = int(params["pageNo"])
-        self.calls.append((title, page_no))
         self.stats["network"] += 1
+        if params is None or "fromDate" not in params:
+            return self._resp(url, params, "<html>search page</html>")
 
-        if self.fail_on == (title, page_no):
-            raise RuntimeError("模拟网络中断")
+        day = dt.datetime.strptime(params["fromDate"], "%Y%m%d").date()
+        row_range = int(params["rowRange"])
+        self.calls.append((params["fromDate"], row_range))
 
-        pages = self.pages_by_title.get(title, [])
-        rows = pages[page_no - 1] if page_no <= len(pages) else []
-        text = json.dumps({
-            "hasNextRow": "true" if page_no < len(pages) else "false",
-            "result": json.dumps(rows),
+        all_recs = self.by_day.get(day, [])
+        page = all_recs[:row_range]                    # 永远从第一条开始
+        body = json.dumps({
+            "hasNextRow": len(all_recs) > row_range,
+            "loadedRecord": len(page),
+            "recordCnt": len(all_recs),
+            "result": json.dumps(page),
         })
-        return Response(url=url, params=params, status=200, text=text,
+        return self._resp(url, params, body)
+
+    @staticmethod
+    def _resp(url, params, text):
+        return Response(url=url, params=params or {}, status=200, text=text,
                         fetched_at="2026-08-07T00:00:00+00:00", from_cache=False)
 
 
-def _make_config(tmp_path, queries=None) -> Config:
+def _make_config(tmp_path) -> Config:
     base = tmp_path if tmp_path is not None else __import__("pathlib").Path(".")
     return Config(
         raw={}, config_path=base / "config.yaml",
         data_dir=base / "data", raw_dir=base / "data/raw",
         cache_dir=base / "data/cache", probe_dir=base / "data/probe",
         log_dir=base / "logs",
-        date_from=date(2026, 1, 1), date_to=date(2026, 2, 28),
+        date_from=dt.date(2026, 1, 5), date_to=dt.date(2026, 1, 6),
         user_agent="test", min_interval_seconds=0, timeout_seconds=5,
         max_retries=0, backoff_base_seconds=0, cache_enabled=False,
-        chunk_months=1, row_range=100, max_pages_per_chunk=10,
-        queries=queries or [Query(name="zh", lang="ZH", params={"title": "要約"})],
+        row_range_step=100, max_rounds_per_day=50,
+        category_t1code="10000", category_t2codes=[],
         log_level="INFO",
     )
 
 
-def _rows(*news_ids):
-    return [{"NEWS_ID": n, "DATE_TIME": f"2026-01-0{i+1} 08:00",
-             "STOCK_CODE": "00001", "TITLE": "要約公告",
-             "FILE_LINK": f"/x/{n}.pdf"}
-            for i, n in enumerate(news_ids)]
+def _recs(n: int, prefix: str = "n") -> list[dict]:
+    return [{"NEWS_ID": f"{prefix}{i}", "DATE_TIME": "2026-01-05 08:00",
+             "STOCK_CODE": "00001", "TITLE": f"公告{i}",
+             "FILE_LINK": f"/x/{prefix}{i}.pdf"} for i in range(n)]
 
 
-# ---------------------------------------------------------------- 分页/幂等/续跑
+# ---------------------------------------------------------------- 翻页
 
-def test_fetch_chunk_follows_pagination(tmp_path):
+def test_row_range_grows_until_all_records_are_in(tmp_path):
+    """250 条记录、步长 100 → 需要 3 轮：100 / 200 / 300。"""
     cfg = _make_config(tmp_path)
-    session = FakeSession({"要約": [_rows("a", "b"), _rows("c")]})
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({day: _recs(250)})
     store = RawStore(cfg.raw_dir)
 
-    count = listing.fetch_chunk(session, store, cfg, cfg.queries[0],
-                                (date(2026, 1, 1), date(2026, 1, 31)))
-    assert count == 3
-    assert session.calls == [("要約", 1), ("要約", 2)]
+    count = listing.fetch_day(session, store, cfg, day)
+
+    assert count == 250
+    assert [rr for _, rr in session.calls] == [100, 200, 300]
 
 
-def test_completed_chunk_is_skipped_on_rerun(tmp_path):
-    """断点续跑：已完成的时间块不再发请求。"""
+def test_overlapping_rounds_are_deduplicated_by_news_id(tmp_path):
+    """这条是本文件最重要的测试。
+
+    每轮返回的记录大量重叠（第 2 轮的前 100 条就是第 1 轮那批）。
+    不按 NEWS_ID 去重的话，250 条会变成 100+200+250=550 条。
+    """
     cfg = _make_config(tmp_path)
-    session = FakeSession({"要約": [_rows("a")]})
-    store = RawStore(cfg.raw_dir)
-    chunk = (date(2026, 1, 1), date(2026, 1, 31))
-
-    listing.fetch_chunk(session, store, cfg, cfg.queries[0], chunk)
-    calls_after_first = len(session.calls)
-
-    listing.fetch_chunk(session, store, cfg, cfg.queries[0], chunk)
-    assert len(session.calls) == calls_after_first     # 一次新请求都没发
-
-
-def test_interrupted_run_resumes_and_stays_idempotent(tmp_path):
-    """中断 → 重跑：结果与"一次跑完"完全一致，不重不漏。"""
-    cfg = _make_config(tmp_path)
-    pages = {"要約": [_rows("a", "b"), _rows("c", "d")]}
-    chunk = (date(2026, 1, 1), date(2026, 1, 31))
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({day: _recs(250)})
     store = RawStore(cfg.raw_dir)
 
-    # 第一次：第 2 页炸了。第 1 页的数据已经落盘，但这块没被标记完成。
-    broken = FakeSession(pages, fail_on=("要約", 2))
-    with pytest.raises(RuntimeError):
-        listing.fetch_chunk(broken, store, cfg, cfg.queries[0], chunk)
-    assert not store.is_done(f"zh|2026-01-01_2026-01-31")
+    listing.fetch_day(session, store, cfg, day)
+    _, rows = store.rebuild_csv()
 
-    # 第二次：从头重跑这一块，第 1 页的行会被再次追加
-    listing.fetch_chunk(FakeSession(pages), store, cfg, cfg.queries[0], chunk)
+    assert rows == 250                    # 不是 550
+    lines = store.rows_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 250              # 落盘时就已去重
 
-    _, count = store.rebuild_csv()
-    assert count == 4          # 重复追加的第 1 页被 _row_uid 去掉了
 
-    # 与"一次跑完"的干净结果逐字节比对
-    clean_dir = tmp_path / "clean"
-    clean_store = RawStore(clean_dir)
-    listing.fetch_chunk(FakeSession(pages), clean_store, cfg, cfg.queries[0], chunk)
-    clean_csv, clean_count = clean_store.rebuild_csv()
-    assert clean_count == 4
-    assert store.csv_path.read_text(encoding="utf-8-sig") == \
-        clean_csv.read_text(encoding="utf-8-sig")
+def test_single_round_when_everything_fits(tmp_path):
+    cfg = _make_config(tmp_path)
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({day: _recs(30)})
+    listing.fetch_day(session, RawStore(cfg.raw_dir), cfg, day)
+    assert [rr for _, rr in session.calls] == [100]
+
+
+def test_empty_day_costs_one_request(tmp_path):
+    cfg = _make_config(tmp_path)
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({})
+    assert listing.fetch_day(session, RawStore(cfg.raw_dir), cfg, day) == 0
+    assert len(session.calls) == 1
+
+
+def test_records_without_news_id_are_skipped(tmp_path):
+    """NEWS_ID 是去重的唯一依据，没有它的记录无法安全处理。"""
+    cfg = _make_config(tmp_path)
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({day: [{"NEWS_ID": "", "TITLE": "无 id"},
+                              {"NEWS_ID": "ok", "TITLE": "有 id"}]})
+    assert listing.fetch_day(session, RawStore(cfg.raw_dir), cfg, day) == 1
+
+
+# ---------------------------------------------------------------- 断点/幂等
+
+def test_completed_day_is_skipped_on_rerun(tmp_path):
+    cfg = _make_config(tmp_path)
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({day: _recs(30)})
+    store = RawStore(cfg.raw_dir)
+
+    listing.fetch_day(session, store, cfg, day)
+    before = len(session.calls)
+    listing.fetch_day(session, store, cfg, day)
+    assert len(session.calls) == before          # 一次新请求都没发
 
 
 def test_rebuild_csv_is_byte_identical_across_runs(tmp_path):
-    """幂等：同样的输入，重复生成 CSV 结果不变。"""
     cfg = _make_config(tmp_path)
+    day = dt.date(2026, 1, 5)
     store = RawStore(cfg.raw_dir)
-    listing.fetch_chunk(FakeSession({"要約": [_rows("a", "b")]}), store, cfg,
-                        cfg.queries[0], (date(2026, 1, 1), date(2026, 1, 31)))
+    listing.fetch_day(FakeHKEX({day: _recs(150)}), store, cfg, day)
 
     first = store.rebuild_csv()[0].read_text(encoding="utf-8-sig")
     second = store.rebuild_csv()[0].read_text(encoding="utf-8-sig")
     assert first == second
 
 
-def test_raw_layer_keeps_all_fields_and_adds_provenance(tmp_path):
-    """raw 层不清洗：接口给什么存什么，只追加 _ 开头的出处字段。"""
+def test_run_covers_every_day_in_range(tmp_path):
+    cfg = _make_config(tmp_path)        # 2026-01-05 ~ 01-06
+    session = FakeHKEX({dt.date(2026, 1, 5): _recs(10, "a"),
+                        dt.date(2026, 1, 6): _recs(10, "b")})
+    monkey = _patch_session(session)
+    try:
+        _, rows = listing.run(cfg)
+    finally:
+        monkey()
+    assert rows == 20
+    assert {d for d, _ in session.calls} == {"20260105", "20260106"}
+
+
+def _patch_session(fake):
+    """把 listing.run 里 new 出来的 PoliteSession 换成假的。"""
+    original = listing.PoliteSession
+    listing.PoliteSession = lambda **kwargs: fake
+    return lambda: setattr(listing, "PoliteSession", original)
+
+
+# ---------------------------------------------------------------- 上限告警
+
+def test_server_cap_is_logged_as_a_truncation_risk(tmp_path, caplog):
+    """单次查询超过 10000 条时服务端会截断，必须告警。
+
+    按月切块就会撞上这个（30 天 × 700 条 ≈ 21000），而且是**静默**截断
+    —— 所以本项目按天切。
+    """
     cfg = _make_config(tmp_path)
-    odd_row = [{"NEWS_ID": "  1  ", "TITLE": "要約  ", "WEIRD_FIELD": "keep me",
-                "FILE_LINK": "/x/1.pdf"}]
-    store = RawStore(cfg.raw_dir)
-    listing.fetch_chunk(FakeSession({"要約": [odd_row]}), store, cfg,
-                        cfg.queries[0], (date(2026, 1, 1), date(2026, 1, 31)))
+    cfg = Config(**{**cfg.__dict__, "row_range_step": listing.SERVER_RECORD_CAP})
+    day = dt.date(2026, 1, 5)
+    session = FakeHKEX({day: _recs(listing.SERVER_RECORD_CAP)})
 
-    saved = json.loads(store.rows_path.read_text(encoding="utf-8").strip())
-    assert saved["NEWS_ID"] == "  1  "        # 空格原样保留
-    assert saved["TITLE"] == "要約  "
-    assert saved["WEIRD_FIELD"] == "keep me"  # 没见过的字段也不丢
-    assert saved["_query_name"] == "zh"
-    assert saved["_page_no"] == 1
-    assert saved["_fetched_at"] == "2026-08-07T00:00:00+00:00"
+    with caplog.at_level("WARNING"):
+        listing.fetch_day(session, RawStore(cfg.raw_dir), cfg, day)
+    assert any("上限" in r.message for r in caplog.records)
 
 
-def test_both_languages_are_kept_separately(tmp_path):
-    """中英双版是两条 raw 记录，不在 raw 层合并（附录 C 第 8 项）。"""
-    queries = [Query(name="zh", lang="ZH", params={"title": "要約"}),
-               Query(name="en", lang="EN", params={"title": "OFFER"})]
-    cfg = _make_config(tmp_path, queries)
-    session = FakeSession({"要約": [_rows("zh1")], "OFFER": [_rows("en1")]})
-    store = RawStore(cfg.raw_dir)
-    chunk = (date(2026, 1, 1), date(2026, 1, 31))
+# ---------------------------------------------------------------- 会话
 
-    for query in queries:
-        listing.fetch_chunk(session, store, cfg, query, chunk)
-
-    _, count = store.rebuild_csv()
-    assert count == 2
+def test_warm_up_hits_the_search_page_first(tmp_path):
+    """接口依赖检索页种下的 cookie，必须先访问它。"""
+    session = FakeHKEX({})
+    listing.warm_up_session(session)
+    assert session.stats["network"] == 1
 
 
-# ---------------------------------------------------------------- 分类挖掘
+def test_warm_up_failure_is_not_fatal():
+    class Broken:
+        stats = {"network": 0, "cache": 0, "retries": 0}
 
-def test_find_takeover_entries_picks_up_nested_categories():
-    taxonomy = {"tier1": [
-        {"code": "40000", "name": "公告及通告", "children": [
-            {"code": "40200", "name": "收購及合併"},
-            {"code": "40300", "name": "季度業績"},
-        ]},
-    ]}
-    hits = probe._find_takeover_entries(taxonomy)
-    codes = {code for _, code in hits}
-    assert "40200" in codes
-    assert "40300" not in codes
+        def get(self, *a, **kw):
+            raise RuntimeError("连不上")
+
+    listing.warm_up_session(Broken())      # 不抛异常即通过
+
+
+# ---------------------------------------------------------------- 缓存键
+
+def test_cache_key_ignores_param_order():
+    assert cache_key("u", {"a": "1", "b": "2"}) == cache_key("u", {"b": "2", "a": "1"})
