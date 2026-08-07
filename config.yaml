@@ -1,0 +1,73 @@
+# ============================================================
+# 阶段一配置：数据源勘察与列表抓取
+#
+# 改这个文件就能改行为，不要去改 .py 代码。
+# 后续阶段（分类/抽取/校验）的配置项会追加到这里。
+# ============================================================
+
+paths:
+  data_dir: "data"
+  raw_dir: "data/raw"         # raw 表：列表原样存放，不做任何清洗
+  cache_dir: "data/cache"     # HTTP 响应缓存，同一 URL 不重复请求
+  probe_dir: "data/probe"     # 勘察脚本的产物（HTML/JSON 原样落盘）
+  log_dir: "logs"
+
+# 抓取的日期范围（含首尾）
+date_range:
+  from: "2026-01-01"
+  to: "2026-08-07"
+
+http:
+  # 礼貌爬取：请在 UA 里留下真实联系方式，这是爬公开数据的基本礼貌，
+  # 也让对方在你请求过频时能直接联系你而不是直接封 IP。
+  user_agent: "hkex-precedent-db/0.1 (research; contact: YOUR_EMAIL_HERE)"
+
+  # 两次"真实网络请求"之间的最小间隔（秒）。命中缓存不计入。
+  # 1.5 秒 ≈ 每分钟 40 次，对一个政府背景的公开披露站属于保守水平。
+  min_interval_seconds: 1.5
+
+  timeout_seconds: 60
+
+  # 失败重试：仅对网络错误、429、5xx 重试；4xx（除 429）不重试。
+  max_retries: 4
+  backoff_base_seconds: 2     # 退避间隔 2s, 4s, 8s, 16s
+
+  cache_enabled: true
+
+listing:
+  # 把日期范围切成小块抓，好处有二：
+  # 1) 单次查询命中数不会撞上服务端的返回上限
+  # 2) 断点续跑的粒度更细，中断后不用整段重来
+  chunk_months: 1
+
+  row_range: 100              # 每页条数
+  max_pages_per_chunk: 200    # 安全阀，防止分页逻辑出错时无限翻页
+
+  # ----------------------------------------------------------
+  # 查询清单：每个 profile 是一组传给检索接口的参数。
+  #
+  # 现在默认用"标题关键词"检索（recall 优先，精确分类留给阶段二）。
+  # 等 run_probe.py 确认了 Headline Category 的真实代码后，
+  # 在这里加一条 t1code/t2code 的 profile 会大幅缩小抓取面。
+  #
+  # 中英双语版本都抓：raw 层不去重，按 deal 去重是后续阶段的事
+  # （附录 C 第 8 项）。
+  # ----------------------------------------------------------
+  queries:
+    - name: "title_zh_trad"
+      lang: "ZH"
+      params:
+        title: "要約"
+
+    - name: "title_zh_simp"
+      lang: "ZH"
+      params:
+        title: "要约"
+
+    - name: "title_en"
+      lang: "EN"
+      params:
+        title: "OFFER"
+
+logging:
+  level: "INFO"               # DEBUG 会打印每一次请求的完整参数

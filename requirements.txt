@@ -1,3 +1,9 @@
-requests>=2.31
+# 阶段一依赖
+requests>=2.31          # HTTP
+PyYAML>=6.0             # 读 config.yaml
+beautifulsoup4>=4.12    # 勘察时解析检索页的下拉框
+pytest>=8.0             # 跑测试
+
+# 后续阶段（PDF 解析）才会用到，现在装上也无妨
 pdfplumber>=0.11
 pypdf>=4.0
