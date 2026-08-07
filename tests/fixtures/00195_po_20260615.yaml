@@ -1,0 +1,210 @@
+# ============================================================
+# 回归测试基准：綠科科技國際（00195）附帶先決條件的自願現金部分收購要約
+# 要约人：Yellowstone International Limited
+#
+# 这单的特殊之处：最後交易日是 2024-08-30，公告日是 2026-06-15 ——
+# 停牌接近两年。六个月高低价区间锚在最後交易日，不是公告日。
+#
+# 状态：Claude 摘录 + Python 复算通过；三个字段与人工答案一致。
+# ============================================================
+
+meta:
+  fixture_id: "00195_po_20260615"
+  source_pdf: "9ebd0d25-_______po__.pdf"
+  total_pages: 25
+  has_text_layer: true
+  numeral_style: "arabic"
+  rules_version: null
+  human_verified: true          # 三个主值与你给的人工答案一致
+
+deal:
+  target_stock_code: "00195"
+  target_name: "綠科科技國際有限公司"
+  target_board: "主板"
+  offeror: "Yellowstone International Limited"
+
+  offer_type: "PO"
+  offer_type_evidence:
+    page: 1
+    quote: "由華富建業企業融資有限公司代表YELLOWSTONE INTERNATIONAL LIMITED提出附帶先決條件的自願現金部分收購要約以收購綠科科技國際有限公司的不超過230,000,000股股份"
+
+  first_announcement_date: "2026-06-15"
+  first_announcement_evidence:
+    page: 25
+    quote: "香港，2026年6月15日"
+  first_announcement_note: "p1/p4 另载「於2026年6月15日，要約人通知受要約公司，彼有確實意向提出部分收購要約」，与署期同日。"
+
+  decoy_dates:
+    - date: "2024-08-30"
+      what: "最後交易日（暫停買賣前最後交易日，距公告近两年）"
+      page: 23
+      quote: "「最後交易日」 指 2024年8月30日，即暫停買賣前股份於聯交所主"
+    - date: "2026-06-30"
+      what: "先決條件最後達成日"
+      page: 5
+      quote: "倘先決條件未能於2026年6月30日（或要約人酌情及"
+    - date: "2024-11-21"
+      what: "停牌期间刊发的 11 月补充公告日"
+      page: 7
+    - date: "2026-04-21"
+      what: "披露上市委员会决定的公告日"
+      page: 7
+
+  offer_price: "0.40"
+  offer_price_currency: "HKD"
+  offer_price_evidence:
+    page: 1
+    quote: "以要約價每股要約股份0.40港元收購要約人及其一致行動人士尚未擁有的不超過230,000,000股要約股份"
+
+# ---- PO 特有：接纳上限，不是全部要约股份 ----
+partial_offer:
+  max_shares: 230000000
+  max_shares_pct: "16.84"
+  is_cap_not_target: true
+  page: 4
+  quote: "於本公告日期，受要約公司有1,366,000,000股已發行股份。"
+  note: >
+    ⚠️ PO 与 MGO/VGO 的结构差异：要约股份数是「不超過」的上限，
+    并非要约人已持有以外的全部股份。
+    1,366,000,000 − 12,664,538（一致行动人）= 1,353,335,462 股在外，
+    远大于 230,000,000 的收购上限。
+    故 PO 不存在「100% 股本隐含估值 = 已付 + 要约最高现金」这种闭合关系，
+    V3 的闭合式必须按要约类型切换，不能套用 MGO/VGO 的公式。
+  public_float_before: "44.43"
+  public_float_after_note: "公告称完成后公众持股仍将高于 25%"
+  public_float_page: 20
+
+pre_condition:
+  page: 24
+  quote: "「先決條件」 指 作出部分收購要約的先決條件，載於本公告「附帶先決條件的自願現金部分收購要約 — 部分收購要約的先決條件」一節"
+  waivable: false
+  waivable_page: 5
+  waivable_quote: "要約人不得豁免先決條件。"
+  satisfied_at_announcement: false
+
+numbers:
+  total_issued_shares: 1366000000
+  offer_shares_cap: 230000000
+  concert_party_shares: 12664538
+  offer_max_cash: 92000000
+  audited_nav_2023: 1004700000
+  unaudited_nav_2024h1: 1001800000
+
+# ---- 价值比较（p6）：6 项 ----
+price_comparisons:
+  - label: "最後交易日 2024-08-30 收市价"
+    anchor: "last_trading_day"
+    window: "spot"
+    benchmark: "0.28"
+    benchmark_decimals: 2
+    benchmark_is_exact: true
+    stated_pct: "42.86"
+    stated_direction: "premium"
+    page: 6
+    quote: "(i) 股份於2024年8月30日（即最後交易日）在聯交所所報收市價每股0.28港元溢價約42.86%"
+
+  - label: "最後交易日前5日均价"
+    anchor: "last_trading_day"
+    window: "5d"
+    benchmark: "0.401"
+    benchmark_decimals: 3
+    benchmark_is_exact: true
+    stated_pct: "0.25"
+    stated_direction: "discount"
+    page: 6
+    quote: "(ii) 股份於截至最後交易日（包括該日）止最後連續五個交易日在聯交所所報平均收市價每股0.401港元折讓約0.25%"
+
+  - label: "最後交易日前10日均价"
+    anchor: "last_trading_day"
+    window: "10d"
+    benchmark: "0.3925"
+    benchmark_decimals: 4
+    benchmark_is_exact: true
+    stated_pct: "1.91"
+    stated_direction: "premium"
+    page: 6
+    quote: "(iii) 股份於截至最後交易日（包括該日）止最後連續十個交易日在聯交所所報平均收市價每股0.3925港元溢價約1.91%"
+
+  # ★ 这一项就是主值：你的人工答案 +4.49%
+  - label: "最後交易日前30日均价"
+    anchor: "last_trading_day"
+    window: "30d"
+    benchmark: "0.3828"
+    benchmark_decimals: 4
+    benchmark_is_exact: false     # 原文写「約0.3828」
+    stated_pct: "4.49"
+    stated_direction: "premium"
+    page: 6
+    quote: "(iv) 股份於截至最後交易日（包括該日）止最後連續三十個交易日在聯交所所報平均收市價每股約0.3828港元溢價約4.49%"
+
+  - label: "2023-12-31 每股经审核综合资产净值"
+    anchor: "nav"
+    window: "nav"
+    benchmark: "0.7355"
+    benchmark_decimals: 4
+    benchmark_is_exact: false
+    stated_pct: "45.62"
+    stated_direction: "discount"
+    page: 6
+    quote: "(v) 截至2023年12月31日的每股經審核受要約公司擁有人應佔綜合資產淨值約0.7355港元（乃按截至2023年12月31日的經審核受要約公司擁有人應佔綜合資產淨值約1,004.7百萬港元及於本公告日期的1,366,000,000股已發行股份計算）折讓約45.62%。"
+
+  - label: "2024-06-30 每股未经审核综合资产净值"
+    anchor: "nav"
+    window: "nav"
+    benchmark: "0.7334"
+    benchmark_decimals: 4
+    benchmark_is_exact: false
+    stated_pct: "45.46"
+    stated_direction: "discount"
+    page: 6
+    quote: "(vi) 截至2024年6月30日的每股未經審核受要約公司擁有人應佔綜合資產淨值約0.7334港元"
+
+nonmarket_labels:
+  - "2023-12-31 每股经审核综合资产净值"
+  - "2024-06-30 每股未经审核综合资产净值"
+
+six_month_range:
+  low: "0.28"
+  high: "0.495"
+  page: 7
+  quote: "於緊接最後交易日前六個月期間（包括該日）（即2024年3月1日至2024年8月30日）：(i) 股份於聯交所所報的最高收市價為於2024年5月8日的每股0.495港元；及(ii) 股份於聯交所所報的最低收市價為於2024年8月30日（即最後交易日）的每股0.28港元。"
+  anchor: "last_trading_day"
+  anchor_note: >
+    ⚠️ 六个月区间锚在最後交易日（2024-08-30），不是公告日（2026-06-15）。
+    停牌近两年，两者相差 21 个月。若按公告日回推六个月去取行情，全是停牌期，
+    会得到空区间。V6 必须用公告自报的区间，不能自行按公告日推算。
+
+deal_size_candidates:
+  - key: "offer_max_cash"
+    value: 92000000              # ← 你的人工答案取此值
+    value_recomputed: 92000000
+    printed_is_rounded: false
+    role: "部分要约悉数接纳时的现金代价总额（主值）"
+    page: 7
+    quote: "按要約價每股要約股份0.40港元計算，並假設合資格股東已就全部230,000,000股要約股份悉數提呈有效接納部分收購要約，要約人根據部分收購要約向合資格股東購買230,000,000股要約股份須支付的現金代價總額為92,000,000港元。"
+
+# ---- 人工答案（你提供）----
+human_answer:
+  first_announcement_date: "2026-06-15"
+  offer_type: "PO"
+  premium_pct: "4.49"
+  premium_basis: "最後交易日前30日均价"
+  deal_size: 92000000
+
+scenarios:
+  multi_scenario: false
+  reason: "要约股份为固定上限 230,000,000 股，现金代价总额 92,000,000 已是各情境上限。"
+
+irrevocable_undertakings:
+  exists: false
+  page: 12
+  quote: "(vi) 除部分收購要約的要約價外，要約人或其一致行動人士概無就部分收購要約已支付或將支付任何形式的其他代價、補償或利益"
+
+expected_findings:
+  v3_all_pass: true
+  v4_all_pass: true
+  v5_all_pass: true
+  v6_all_pass: true
+  v8_all_pass: true
+  v10_note: "标题「附帶先決條件的自願現金部分收購要約」与正文一致。p2/p5 载「待先決條件獲達成後，部分收購要約一經作出則於所有方面均屬無條件」—— ⚠️ 此处「無條件」指要约作出后的状态，非要约类型，词频法会误判。"
+  v11_note: "股份代號 00195；p23 载「其已發行股份於聯交所主板上市」。一致。"

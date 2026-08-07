@@ -106,6 +106,8 @@ numbers:
 #    公告百分比是用未取整的真实均价算的 → V4 必须做区间检验。
 price_comparisons:
   - label: "最後交易日 2026-04-22 收市价"
+    anchor: "last_trading_day"
+    window: "spot"
     benchmark: "4.05"
     benchmark_decimals: 2
     benchmark_is_exact: true
@@ -115,6 +117,8 @@ price_comparisons:
     quote: "1. 最後交易日於聯交所所報之收市價每股股份4.05港元折讓約45.68%"
 
   - label: "未受干擾日 2026-04-21 收市价"
+    anchor: "undisturbed"
+    window: "spot"
     benchmark: "3.18"
     benchmark_decimals: 2
     benchmark_is_exact: true
@@ -124,6 +128,8 @@ price_comparisons:
     quote: "2. 未受干擾日於聯交所所報之收市價每股股份3.18港元折讓約為30.82%"
 
   - label: "最後交易日前5日均价"
+    anchor: "last_trading_day"
+    window: "5d"
     benchmark: "3.18"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -133,6 +139,8 @@ price_comparisons:
     quote: "3. 緊接最後交易日（包括該日）前5個交易日於聯交所所報之平均收市價約每股股份3.18港元折讓約30.73%"
 
   - label: "未受干擾日前5日均价"
+    anchor: "undisturbed"
+    window: "5d"
     benchmark: "2.89"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -142,6 +150,8 @@ price_comparisons:
     quote: "4. 緊接未受干擾日（包括該日）前5個交易日於聯交所所報之平均收市價約每股股份2.89港元折讓約23.82%"
 
   - label: "最後交易日前10日均价"
+    anchor: "last_trading_day"
+    window: "10d"
     benchmark: "2.76"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -151,6 +161,8 @@ price_comparisons:
     quote: "5. 緊接最後交易日（包括該日）前10個交易日於聯交所所報之平均收市價約每股股份2.76港元折讓約20.23%"
 
   - label: "未受干擾日前10日均价"
+    anchor: "undisturbed"
+    window: "10d"
     benchmark: "2.61"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -160,6 +172,8 @@ price_comparisons:
     quote: "6. 緊接未受干擾日（包括該日）前10個交易日於聯交所所報之平均收市價約每股股份2.61港元折讓約15.64%"
 
   - label: "最後交易日前30日均价"
+    anchor: "last_trading_day"
+    window: "30d"
     benchmark: "2.67"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -169,6 +183,8 @@ price_comparisons:
     quote: "7. 緊接最後交易日（包括該日）前30個交易日於聯交所所報之平均收市價約每股股份2.67港元折讓約17.50%"
 
   - label: "未受干擾日前30日均价"
+    anchor: "undisturbed"
+    window: "30d"
     benchmark: "2.60"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -178,6 +194,8 @@ price_comparisons:
     quote: "8. 緊接未受干擾日（包括該日）前30個交易日於聯交所所報之平均收市價約每股股份2.60港元折讓約15.45%"
 
   - label: "最後交易日前180日均价"
+    anchor: "last_trading_day"
+    window: "180d"
     benchmark: "1.83"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -187,6 +205,8 @@ price_comparisons:
     quote: "9. 緊接最後交易日（包括該日）前180個交易日於聯交所所報之平均收市價約每股股份1.83港元溢價約19.90%"
 
   - label: "未受干擾日前180日均价"
+    anchor: "undisturbed"
+    window: "180d"
     benchmark: "1.82"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -196,6 +216,8 @@ price_comparisons:
     quote: "10. 緊接未受干擾日（包括該日）前180個交易日於聯交所所報之平均收市價約每股股份1.82港元溢價約20.91%"
 
   - label: "2025-12-31 每股经审核股东应占合并净资产"
+    anchor: "nav"
+    window: "nav"
     benchmark: "3.73"
     benchmark_decimals: 2
     benchmark_is_exact: false
@@ -222,7 +244,9 @@ deal_size_candidates:
     page: 5
     quote: "出售待售股份之代價合共為734,168,670.40港元"
   - key: "offer_max_cash"
-    value: 1905849908.60
+    value: 1905849908.60         # ← 你的人工答案取此值
+    value_recomputed: 1905849908.60
+    printed_is_rounded: false    # 公告印的就是精确值
     role: "要约悉数接纳时最高现金（72.19%）"
     page: 12
     quote: "假設自本聯合公告日期起至要約截止為止，本公司已發行股本概無變動，要約人就悉數接納要約而應付之最高現金金額為1,905,849,908.60港元。"
@@ -231,7 +255,14 @@ deal_size_candidates:
     role: "100% 股本隐含估值 = 上两项之和（精确闭合）"
     page: null
 
-deal_size_primary: null   # ⛔ 待附录 A 的「主值选取口径」
+# ---- 人工答案（你提供）----
+human_answer:
+  first_announcement_date: "2026-05-18"
+  offer_type: "VGO"
+  premium_pct: "-15.45"
+  premium_basis: "未受干擾日前30日均价"      # ★ 不是最後交易日前30日（那项是 -17.50%）
+  deal_size: 1905849908.6
+  deal_size_note: "与公告印出值及复算精确值三者完全一致。"
 
 # ---- 多情境（附录 D-4）：这单是真的有多情境 ----
 scenarios:

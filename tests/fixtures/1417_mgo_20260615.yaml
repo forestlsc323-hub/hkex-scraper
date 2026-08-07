@@ -85,6 +85,8 @@ numbers:
 # ---- 价值比较（p11）：6 项，基准全部印为精确值 ----
 price_comparisons:
   - label: "3.7公告前最后交易日 2026-05-15 收市价"
+    anchor: "pre_rule37"
+    window: "spot"
     benchmark: "0.840"
     benchmark_decimals: 3
     benchmark_is_exact: true
@@ -94,6 +96,8 @@ price_comparisons:
     quote: "(i) 本公司根據收購守則規則3.7於2026年5月18日發佈公告前的最後一個交易日2026年5月15日在聯交所所報價的收市價每股0.840港元折讓約38.21%"
 
   - label: "最后交易日 2026-06-12 收市价"
+    anchor: "last_trading_day"
+    window: "spot"
     benchmark: "1.870"
     benchmark_decimals: 3
     benchmark_is_exact: true
@@ -103,6 +107,8 @@ price_comparisons:
     quote: "(ii) 股份於最後交易日在聯交所所報收市價每股1.870港元折讓約72.25%"
 
   - label: "前5个交易日平均收市价"
+    anchor: "last_trading_day"
+    window: "5d"
     benchmark: "1.914"
     benchmark_decimals: 3
     benchmark_is_exact: true
@@ -112,6 +118,8 @@ price_comparisons:
     quote: "(iii) 股份於緊接最後交易日（包括該日）前五(5)個連續交易日在聯交所所報平均收市價每股1.914港元折讓約72.88%"
 
   - label: "前10个交易日平均收市价"
+    anchor: "last_trading_day"
+    window: "10d"
     benchmark: "1.849"
     benchmark_decimals: 3
     benchmark_is_exact: true
@@ -121,6 +129,8 @@ price_comparisons:
     quote: "(iv) 股份於緊接最後交易日（包括該日）前十(10)個連續交易日在聯交所所報平均收市價每股1.849港元折讓約71.93%"
 
   - label: "前30个交易日平均收市价"
+    anchor: "last_trading_day"
+    window: "30d"
     benchmark: "1.168"
     benchmark_decimals: 3
     benchmark_is_exact: false     # 原文写「約1.168港元」
@@ -130,6 +140,8 @@ price_comparisons:
     quote: "(v) 股份於緊接最後交易日（包括該日）前三十(30)個連續交易日在聯交所所報平均收市價每股約1.168港元折讓約55.57%"
 
   - label: "2025-12-31 每股经审计合并净资产"
+    anchor: "nav"
+    window: "nav"
     benchmark: "0.348"
     benchmark_decimals: 3
     benchmark_is_exact: false
@@ -163,15 +175,29 @@ deal_size_candidates:
     page: 8
     quote: "出售股份的代價總額為155,643,703港元（或每股出售股份約0.519港元）"
   - key: "offer_max_cash"
-    value: 54406770
-    role: "MGO 项下最高现金代价（25.88%），公告写「約5,440萬」"
+    value: 54400000              # 公告印出值「約5,440萬港元」← 你的人工答案取此值
+    value_recomputed: 54406770   # 104,830,000 × 0.519 的精确值
+    printed_is_rounded: true     # ⚠️ 三单中仅此单印的是约整值
+    role: "MGO 项下最高现金代价（25.88%）"
     page: 12
+    quote: "股份（相當於於本聯合公告日期本公司已發行股本總額的約25.88%）（包括由股份獎勵計劃受託人持有的8,218,000股股份），按每股要約股份0.519港元的要約價計算，要約人於要約項下須支付的最高現金代價約為5,440萬港元。"
   - key: "implied_equity_value"
     value: 210195000
     role: "100% 股本隐含估值，公告写「約2.102億」"
     page: 12
 
-deal_size_primary: null   # ⛔ 待附录 A 的「主值选取口径」
+# ---- 人工答案（你提供）----
+human_answer:
+  first_announcement_date: "2026-06-15"
+  offer_type: "MGO"
+  premium_pct: "-55.57"
+  premium_basis: "前30个交易日平均收市价"
+  deal_size: 54400000
+  deal_size_note: >
+    ⚠️ 你取的是公告印出的「約5,440萬」= 54,400,000。
+    按 104,830,000 × 0.519 复算的精确值是 54,406,770，差 6,770（0.0124%）。
+    另两单公告印的就是精确值，故只有这单存在此分歧。
+    口径待附录 A 定：以公告披露值为准，还是以复算精确值为准。
 
 # ---- 多情境 / 名义vs实付（附录 D-4、D-5）----
 scenarios:

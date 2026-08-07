@@ -60,9 +60,13 @@ def test_every_field_carries_a_source_quote(fx):
     assert fx["six_month_range"]["quote"].strip()
 
 
-def test_primary_deal_size_stays_null_until_rules_arrive(fx):
-    """附录 A 未到手，主值口径未定 —— 不许有人偷偷填一个上去。"""
-    assert fx["deal_size_primary"] is None
+def test_rules_version_stays_null_until_appendix_a_arrives(fx):
+    """主值口径现在是从三单人工答案反推的，不是附录 A。
+
+    rules_version 必须保持 null，直到附录 A 到手并逐条核对过。
+    一旦有人填上版本号，就意味着声称「这套规则有权威出处」——
+    在此之前那是假的。
+    """
     assert fx["meta"]["rules_version"] is None
 
 
