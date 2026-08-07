@@ -9,7 +9,7 @@
 import logging
 import sys
 
-from hkexdb import config, console, listing, logsetup
+from hkexdb import config, console, pipeline, listing, logsetup
 
 
 def main() -> int:
@@ -38,7 +38,7 @@ def main() -> int:
 
     print(f"\nraw 表：{csv_path}（{count} 行）")
     print("这是未清洗的原始列表。分类与抽取是阶段二、三的事。")
-    print("下一步：python run_screening.py")
+    print(pipeline.format_status(pipeline.status(cfg)))
     return 0
 
 

@@ -16,7 +16,7 @@ import csv
 import sys
 from pathlib import Path
 
-from hkexdb import config, console, logsetup, screening as S
+from hkexdb import config, console, pipeline, logsetup, screening as S
 
 
 # 演示样本：三条是真实公告标题（1417 / 3336 / 00195，已人工核对），
@@ -217,6 +217,7 @@ def main(argv: list[str]) -> int:
     print(f"数量校验：{console.OK + ' 平' if report.reconciled else console.FAIL + ' 不平'}")
     print(f"矛盾行 {len(report.contradictions)} 条、"
           f"人工复核桶 {report.counts.get(S.MANUAL, 0)} 条 —— 先看完再进抽取（铁律二）")
+    print(pipeline.format_status(pipeline.status(cfg)))
     return 0
 
 
