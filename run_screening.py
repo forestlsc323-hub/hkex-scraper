@@ -19,6 +19,34 @@ from pathlib import Path
 from hkexdb import config, logsetup, screening as S
 
 
+# 演示样本：三条是真实公告标题（1417 / 3336 / 00195，已人工核对），
+# 其余是按手册十三个坑构造的，用来演示报告长什么样。
+# ⚠️ 绝不是真实的披露易检索结果。
+DEMO_ROWS = [
+    ("2026-06-15", "1417", "浦江中國", "聯合公告 (1) 完成出售及購買浦江中國控股有限公司擬出售股份 (2) 由力高證券有限公司為並代表YOMI.SUN HOLDING LIMITED作出強制性無條件現金要約 及 (3) 恢復股份買賣", "真实"),
+    ("2026-05-18", "3336", "巨騰國際", "聯合公告 (1)有關本公司已發行股份總數約27.81%的買賣協議 (2)具有前置條件之自願性有條件全面現金要約 (3)須予披露交易 及 (4)復牌", "真实"),
+    ("2026-05-18", "6613", "藍思科技", "聯合公告 (1)有關本公司已發行股份總數約27.81%的買賣協議 (2)具有前置條件之自願性有條件全面現金要約 (3)須予披露交易 及 (4)復牌", "真实-镜像"),
+    ("2026-06-15", "00195", "綠科科技", "公告 由華富建業企業融資有限公司代表YELLOWSTONE INTERNATIONAL LIMITED提出附帶先決條件的自願現金部分收購要約", "真实"),
+    ("2026-06-20", "1417", "浦江中國", "寄發綜合文件", "构造"),
+    ("2026-06-25", "1417", "浦江中國", "強制性無條件現金要約之要約結果", "构造"),
+    ("2026-07-01", "0002", "乙公司", "每月最新資料", "构造-坑③"),
+    ("2026-07-02", "00195", "綠科科技", "達成先決條件之公告", "构造-坑④"),
+    ("2026-07-03", "0005", "戊公司", "建議以協議安排方式將公司私有化及撤銷上市地位", "构造-坑②⑬"),
+    ("2026-07-04", "0006", "己公司", "延遲寄發綜合文件－訂立買賣協議之後續安排", "构造-矛盾行"),
+    ("2026-07-05", "0007", "庚公司", "董事會會議日期", "构造-人工桶"),
+    ("2026-07-06", "0008", "辛公司", "就要約委任獨立財務顧問", "构造-坑④"),
+    ("2026-07-07", "0009", "壬公司", "聯合公告 - 可能強制性無條件現金要約及恢復買賣 (取消－標題已被取代及更換)", "构造-坑⑫"),
+    ("2026-07-07", "0009", "壬公司", "聯合公告 - 可能強制性無條件現金要約及恢復買賣 (修改後標題)", "构造-坑⑫"),
+    ("2026-07-08", "0010", "癸公司", "有關強制收購剩餘股份之公告", "构造-坑②"),
+]
+
+
+def demo_records() -> list[dict]:
+    return [{"row_id": f"demo{i}", "date": d, "code": c, "name": n,
+             "title": t, "pdf_url": "", "file_info": "", "_origin": o}
+            for i, (d, c, n, t, o) in enumerate(DEMO_ROWS)]
+
+
 def load_csv(path: Path) -> list[dict]:
     with path.open(encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.DictReader(fh))
@@ -38,11 +66,23 @@ def load_csv(path: Path) -> list[dict]:
 
 
 def write_report(report: S.QualityReport, rules: S.Rules, out_dir: Path,
-                 records: list[dict]) -> Path:
-    lines = [
-        "# T0 Screening 质控报告",
-        "",
-        f"规则版本：`{rules.version}`　样本 {len(records)} 条",
+                 records: list[dict], *, is_demo: bool = False,
+                 source: str = "") -> Path:
+    lines = ["# T0 Screening 质控报告", ""]
+    if is_demo:
+        lines += [
+            "> # ⚠️ 演示数据，不是真实检索结果",
+            ">",
+            "> 本报告由 `run_screening.py --demo` 生成，用于演示报告格式。",
+            "> 15 条样本中只有 4 条是真实公告标题（1417 / 3336 / 6613 / 00195），",
+            "> 其余按手册十三个坑构造。**不得用于任何分析或对账。**",
+            ">",
+            "> 真实报告需先跑 `python run_listing.py` 抓到披露易的检索结果。",
+            "",
+        ]
+    lines += [
+        f"规则版本：`{rules.version}`　样本 {len(records)} 条"
+        + (f"　数据源：`{source}`" if source else ""),
         "",
         "## 判定桶分布",
         "",
@@ -128,13 +168,24 @@ def main(argv: list[str]) -> int:
     cfg.ensure_dirs()
     logsetup.setup(cfg.log_dir, cfg.log_level, run_name="screening")
 
-    src = Path(argv[0]) if argv else cfg.raw_dir / "listing_raw.csv"
-    if not src.exists():
-        print(f"找不到 {src}，先跑 run_listing.py")
-        return 1
-
     rules = S.load_rules("screening_rules.yaml")
-    records = load_csv(src)
+    is_demo = "--demo" in argv
+    argv = [a for a in argv if not a.startswith("--")]
+
+    if is_demo:
+        records = demo_records()
+        source = "演示数据（非真实）"
+        print("⚠️ 演示模式：15 条样本中仅 4 条为真实公告标题，其余为构造样本。\n")
+    else:
+        src = Path(argv[0]) if argv else cfg.raw_dir / "listing_raw.csv"
+        if not src.exists():
+            print(f"找不到 {src}")
+            print("先跑：python run_listing.py")
+            print("只想看报告长什么样：python run_screening.py --demo")
+            return 1
+        records = load_csv(src)
+        source = str(src)
+
     report = S.screen(records, rules)
 
     out_dir = cfg.data_dir / "screening"
@@ -154,7 +205,8 @@ def main(argv: list[str]) -> int:
                         "；".join(v.manual_flags), "；".join(v.reasons),
                         r["title"], r["pdf_url"], rules.version])
 
-    path = write_report(report, rules, out_dir, records)
+    path = write_report(report, rules, out_dir, records,
+                        is_demo=is_demo, source=source)
     print(f"\n全量结果：{out_dir / 'screened.csv'}（{len(records)} 行，软删除，一行不少）")
     print(f"质控报告：{path}")
     print(f"\n判定桶：{report.counts}")
