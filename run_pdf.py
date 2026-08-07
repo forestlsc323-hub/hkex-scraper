@@ -11,8 +11,8 @@
 import logging
 import sys
 
-from hkexdb import config, console, logsetup
-from hkexdb.pdf_source import open_pdf
+from hkexdb import config, console, listing, logsetup
+from hkexdb.pdf_source import full_url, open_pdf
 
 # 要在公告里定位的锚点。命中即打印页码和原文行 —— 铁律三要的 page 出处。
 ANCHORS = [
@@ -40,12 +40,18 @@ def main(argv: list[str]) -> int:
     from pathlib import Path
     cache_dir = Path(pdf_cfg.get("cache_dir", "data/cache/pdf"))
 
-    for url in argv:
+    # 与检索共用一个会话：PDF 路径可能依赖检索页种下的 cookie
+    session = listing.make_session(cfg)
+    listing.warm_up_session(session)
+
+    for raw_link in argv:
+        url = full_url(raw_link)     # 直接粘 FILE_LINK 相对路径也认
         print("=" * 78)
         print(url)
         print("=" * 78)
         try:
-            doc = open_pdf(url, cache_dir, user_agent=cfg.user_agent,
+            doc = open_pdf(url, cache_dir, session=session.session,
+                           user_agent=cfg.user_agent,
                            max_pages=int(pdf_cfg.get("max_pages", 0)))
         except Exception as exc:
             log.error("打不开：%s", exc)

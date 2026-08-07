@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,27 @@ from pathlib import Path
 import requests
 
 log = logging.getLogger(__name__)
+
+
+class RateLimiter:
+    """跨线程速率限制器：保证任意两次真实请求间隔不小于 min_interval 秒。
+
+    照搬实战客户端的 `_RateLimiter`。并发抓取时**必须共享同一个实例** ——
+    并发的目的是让网络延迟重叠，不是提高对服务器的请求频率。
+    每个线程各自限速等于把总频率乘以线程数，那是对方会讨厌的行为。
+    """
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            elapsed = time.monotonic() - self._last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self._last = time.monotonic()
 
 
 @dataclass
@@ -52,7 +74,7 @@ class PoliteSession:
     def __init__(self, *, user_agent: str, cache_dir: Path,
                  min_interval_seconds: float = 1.5, timeout_seconds: int = 60,
                  max_retries: int = 4, backoff_base_seconds: float = 2.0,
-                 cache_enabled: bool = True):
+                 cache_enabled: bool = True, rate_limiter: "RateLimiter | None" = None):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": user_agent,
@@ -65,8 +87,15 @@ class PoliteSession:
         self.backoff_base = backoff_base_seconds
         self.cache_enabled = cache_enabled
 
+        # 传入共享限速器时用它（并发场景）；否则用本实例的间隔控制
+        self.rate_limiter = rate_limiter
         self._last_request_at = 0.0
+        self._stats_lock = threading.Lock()
         self.stats = {"network": 0, "cache": 0, "retries": 0}
+
+    def _bump(self, key: str) -> None:
+        with self._stats_lock:
+            self.stats[key] += 1
 
     # ---------- 缓存读写 ----------
 
@@ -89,18 +118,24 @@ class PoliteSession:
 
     def _write_cache(self, key: str, resp: Response) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._cache_path(key).write_text(
+        # 先写临时文件再原子改名：并发或中断时不会留下半截 JSON
+        tmp = self._cache_path(key).with_suffix(".tmp")
+        tmp.write_text(
             json.dumps({
                 "url": resp.url, "params": resp.params, "status": resp.status,
                 "fetched_at": resp.fetched_at, "text": resp.text,
             }, ensure_ascii=False),
             encoding="utf-8",
         )
+        tmp.replace(self._cache_path(key))
 
     # ---------- 限速 ----------
 
     def _throttle(self) -> None:
         """确保两次真实网络请求之间至少隔 min_interval 秒。"""
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire()
+            return
         elapsed = time.monotonic() - self._last_request_at
         if elapsed < self.min_interval:
             time.sleep(self.min_interval - elapsed)
@@ -116,7 +151,7 @@ class PoliteSession:
         if self.cache_enabled and use_cache:
             cached = self._read_cache(key)
             if cached is not None:
-                self.stats["cache"] += 1
+                self._bump("cache")
                 log.debug("缓存命中 %s params=%s", url, params)
                 return cached
 
@@ -126,7 +161,7 @@ class PoliteSession:
             try:
                 raw = self.session.get(url, params=params, headers=headers,
                                        timeout=self.timeout)
-                self.stats["network"] += 1
+                self._bump("network")
 
                 # 429 / 5xx 属于"稍后可能就好了"，值得重试
                 if raw.status_code == 429 or raw.status_code >= 500:
@@ -158,7 +193,7 @@ class PoliteSession:
 
             if attempt < self.max_retries:
                 wait = self.backoff_base * (2 ** attempt)   # 2s, 4s, 8s, 16s
-                self.stats["retries"] += 1
+                self._bump("retries")
                 log.warning("第 %d 次失败（%s），%.0f 秒后重试：%s",
                             attempt + 1, last_error, wait, url)
                 time.sleep(wait)

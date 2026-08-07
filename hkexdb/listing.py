@@ -36,16 +36,28 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
 import json
 import logging
+import threading
 from html import unescape
 
+from . import stocks
 from .config import Config
-from .http_client import PoliteSession
+from .http_client import PoliteSession, RateLimiter
 from .storage import RawStore, row_uid
 
 log = logging.getLogger(__name__)
+
+
+class Cancelled(Exception):
+    """用户主动停止。GUI 的「停止」按钮靠它中断长任务。"""
+
+
+def _check_cancel(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled("任务已被用户停止")
 
 BASE = "https://www1.hkexnews.hk"
 SEARCH_PAGE = f"{BASE}/search/titlesearch.xhtml"
@@ -139,7 +151,7 @@ def warm_up_session(session: PoliteSession) -> None:
 
 
 def fetch_day(session: PoliteSession, store: RawStore, cfg: Config,
-              day: dt.date) -> int:
+              day: dt.date, cancel_event=None) -> int:
     """抓单日全部公告。返回本日去重后的记录数。
 
     翻页靠加大 rowRange 重查，按 NEWS_ID 去重 —— 见模块头的说明。
@@ -153,6 +165,7 @@ def fetch_day(session: PoliteSession, store: RawStore, cfg: Config,
     row_range = cfg.row_range_step
 
     for round_no in range(1, cfg.max_rounds_per_day + 1):
+        _check_cancel(cancel_event)
         params = _build_params(cfg, day, day, row_range)
         resp = session.get(SERVLET, params=params)
 
@@ -239,9 +252,20 @@ def fetch_category_crosscheck(session: PoliteSession, cfg: Config,
     return list(results.values())
 
 
-def run(cfg: Config):
-    """按配置抓完日期范围内每一天，生成 raw CSV。"""
-    session = PoliteSession(
+def segment_days(days: list, n: int) -> list[list]:
+    """把天数切成最多 n 个**连续**段，供并发使用。
+
+    切成连续段而非轮流分配，是为了让每个线程的抓取区间在时间上聚集，
+    日志读起来是连贯的，中断后也好判断哪一段没做完。
+    """
+    if not days or n <= 1:
+        return [days] if days else []
+    size = max(1, (len(days) + n - 1) // n)
+    return [days[i:i + size] for i in range(0, len(days), size)]
+
+
+def make_session(cfg: Config, rate_limiter: RateLimiter | None = None) -> PoliteSession:
+    return PoliteSession(
         user_agent=cfg.user_agent,
         cache_dir=cfg.cache_dir,
         min_interval_seconds=cfg.min_interval_seconds,
@@ -249,21 +273,153 @@ def run(cfg: Config):
         max_retries=cfg.max_retries,
         backoff_base_seconds=cfg.backoff_base_seconds,
         cache_enabled=cfg.cache_enabled,
+        rate_limiter=rate_limiter,
     )
-    warm_up_session(session)
 
-    store = RawStore(cfg.raw_dir)
+
+def run(cfg: Config, *, max_workers: int = 1, progress_cb=None, cancel_event=None):
+    """按配置抓完日期范围内每一天，生成 raw CSV。
+
+    max_workers > 1 时按天切成若干连续段并发抓，**共享一个速率限制器**，
+    总请求频率与单线程一致 —— 并发是为了让网络延迟重叠，不是为了压榨服务器。
+
+    progress_cb(已完成天数, 总天数, 累计条数) 每完成一天调用一次（任意线程）。
+    cancel_event 是 threading.Event，置位后长任务会尽快抛 Cancelled 退出。
+    """
     days = day_chunks(cfg.date_from, cfg.date_to)
-    log.info("日期范围 %s ~ %s，共 %d 天（按天抓取全量公告，不带标题关键词）",
-             cfg.date_from, cfg.date_to, len(days))
+    store = RawStore(cfg.raw_dir)
+    max_workers = max(1, max_workers)
+    log.info("日期范围 %s ~ %s，共 %d 天（按天抓全量公告，不带标题关键词）；线程 %d",
+             cfg.date_from, cfg.date_to, len(days), max_workers)
 
+    done_days = 0
     grand_total = 0
-    for i, (d1, _) in enumerate(days, 1):
-        grand_total += fetch_day(session, store, cfg, d1)
-        if i % 10 == 0 or i == len(days):
-            log.info("进度 %d/%d 天，累计新增 %d 条", i, len(days), grand_total)
+    lock = threading.Lock()
 
+    def report(day: dt.date) -> None:
+        nonlocal done_days
+        with lock:
+            done_days += 1
+            if done_days % 10 == 0 or done_days == len(days):
+                log.info("进度 %d/%d 天，累计新增 %d 条", done_days, len(days), grand_total)
+            if progress_cb:
+                try:
+                    progress_cb(done_days, len(days), grand_total)
+                except Exception:      # 回调是外部代码，不能让它拖垮抓取
+                    log.debug("progress_cb 抛异常，已忽略", exc_info=True)
+
+    if max_workers == 1:
+        session = make_session(cfg)
+        warm_up_session(session)
+        for d1, _ in days:
+            _check_cancel(cancel_event)
+            n = fetch_day(session, store, cfg, d1, cancel_event)
+            with lock:
+                grand_total += n
+            report(d1)
+        sessions = [session]
+    else:
+        limiter = RateLimiter(cfg.min_interval_seconds)
+        sessions = []
+
+        def work(segment):
+            nonlocal grand_total
+            sess = make_session(cfg, rate_limiter=limiter)
+            warm_up_session(sess)
+            with lock:
+                sessions.append(sess)
+            for d1, _ in segment:
+                _check_cancel(cancel_event)
+                n = fetch_day(sess, store, cfg, d1, cancel_event)
+                with lock:
+                    grand_total += n
+                report(d1)
+
+        segments = segment_days(days, max_workers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(segments)) as pool:
+            futures = [pool.submit(work, seg) for seg in segments]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+            except BaseException:
+                # 一个段炸了就让其余段尽快停下，别继续对服务器发请求
+                if cancel_event is not None:
+                    cancel_event.set()
+                for future in futures:
+                    future.cancel()
+                raise
+
+    net = sum(s.stats["network"] for s in sessions)
+    hit = sum(s.stats["cache"] for s in sessions)
+    retry = sum(s.stats["retries"] for s in sessions)
     log.info("本次新增 %d 条；网络请求 %d 次，缓存命中 %d 次，重试 %d 次",
-             grand_total, session.stats["network"], session.stats["cache"],
-             session.stats["retries"])
+             grand_total, net, hit, retry)
     return store.rebuild_csv()
+
+
+# ---------------------------------------------------------------- 按代码检索
+
+def fetch_ticker_history(session: PoliteSession, cfg: Config, ticker: str,
+                         stock_map: dict[str, tuple[str, str]],
+                         date_from: dt.date | None = None,
+                         date_to: dt.date | None = None,
+                         cancel_event=None, progress_cb=None) -> list[dict]:
+    """按股票代码检索全历史公告（含已除牌证券）。
+
+    移植自实战客户端的 `search_by_ticker`。翻页机制与按天抓取相同：
+    加大 rowRange 重查 + 按 NEWS_ID 去重。
+
+    **这是手册第 2 层「公司级完备性对账」的取数入口** ——
+    对某家公司，把它的全部公告拉出来，才能确认它的 T0 落在
+    「主清单／窗口前／特殊品种／流产案」四个桶的哪一个。
+    """
+    stock_id, category = stocks.resolve(ticker, stock_map)
+    d1 = date_from or dt.date(1999, 1, 1)
+    d2 = date_to or dt.date.today()
+    log.info("按代码检索 %s（stockId=%s, category=%s）%s ~ %s",
+             ticker, stock_id, category, d1, d2)
+
+    results: dict[str, dict] = {}
+    row_range = cfg.row_range_step
+    total = None
+
+    for round_no in range(1, cfg.max_rounds_per_day + 1):
+        _check_cancel(cancel_event)
+        params = _build_params(cfg, d1, d2, row_range,
+                               search_type="0", t1code="-2", t2code="-2",
+                               category=category, stock_id=str(stock_id))
+        resp = session.get(SERVLET, params=params)
+        recs, loaded, has_next, record_cnt = parse_payload(resp.text)
+        if total is None:
+            total = record_cnt
+
+        before = len(results)
+        for rec in recs:
+            news_id = str(rec.get("NEWS_ID", "")).strip()
+            if not news_id or news_id in results:
+                continue
+            record = dict(rec)
+            for field in _HTML_FIELDS:
+                if field in record:
+                    record[f"{field}_CLEAN"] = clean_text(str(record[field]))
+            results[news_id] = record
+
+        log.info("%s 第 %d 轮：rowRange=%s，返回 %s 条，新增 %s 条，累计 %s/%s",
+                 ticker, round_no, row_range, loaded,
+                 len(results) - before, len(results), total)
+        if progress_cb:
+            try:
+                progress_cb(len(results), total or 0)
+            except Exception:
+                log.debug("progress_cb 抛异常，已忽略", exc_info=True)
+
+        if loaded >= SERVER_RECORD_CAP:
+            log.warning("%s 公告数达服务端上限 %s，可能截断！需按年份分段重抓。",
+                        ticker, SERVER_RECORD_CAP)
+        if not has_next:
+            break
+        row_range += cfg.row_range_step
+
+    out = list(results.values())
+    out.sort(key=lambda r: str(r.get("DATE_TIME", "")), reverse=True)
+    return out

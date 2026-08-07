@@ -30,6 +30,22 @@ log = logging.getLogger(__name__)
 
 HEADERS = {"Accept": "application/pdf,*/*"}
 
+BASE = "https://www1.hkexnews.hk"
+
+
+def full_url(file_link: str) -> str:
+    """把 raw 表的 `FILE_LINK` 拼成可下载的完整地址。
+
+    接口给的是相对路径，形如 `/listedco/listconews/sehk/2026/0615/2026061500123.pdf`。
+    移植自实战客户端的 `full_url`。
+    """
+    link = (file_link or "").strip()
+    if not link:
+        raise ValueError("FILE_LINK 为空，无法拼出 PDF 地址")
+    if link.startswith("http"):
+        return link
+    return BASE + ("" if link.startswith("/") else "/") + link
+
 
 @dataclass
 class PdfDoc:
@@ -70,13 +86,22 @@ def fetch_bytes(url: str, cache_dir: Path, *,
                 session: requests.Session | None = None,
                 user_agent: str = "hkex-precedent-db/0.1",
                 timeout: int = 180) -> tuple[bytes, bool]:
-    """取 PDF 字节。返回 (内容, 是否来自本地副本)。"""
+    """取 PDF 字节。返回 (内容, 是否来自本地副本)。
+
+    ⚠️ `session` 应当传入**已访问过检索页的那个会话**。
+    实战客户端的 `download_pdf` 用的就是 `self.session` —— 和检索共用一个，
+    带着检索页种下的 cookie。这里如果新建一个裸 session，
+    在需要 cookie 的路径上会拿不到文件，而表现可能只是一个 403 或一段 HTML。
+    """
     path = _cache_path(cache_dir, url)
     if path.exists():
         log.debug("PDF 副本命中 %s", url)
         return path.read_bytes(), True
 
-    session = session or requests.Session()
+    if session is None:
+        log.warning("未传入已建立会话的 session，改用裸会话下载 %s —— "
+                    "若失败请传入检索时用的那个 session", url)
+        session = requests.Session()
     headers = dict(HEADERS, **{"User-Agent": user_agent})
     resp = session.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()

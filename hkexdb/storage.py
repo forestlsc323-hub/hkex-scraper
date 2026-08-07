@@ -16,6 +16,7 @@ import csv
 import hashlib
 import json
 import logging
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,9 @@ def row_uid(query_name: str, chunk_from: str, page_no: int,
 
 class RawStore:
     def __init__(self, raw_dir: Path):
+        # checkpoint 是「读-改-写」，append 是共享句柄；并发抓取时都要串行化，
+        # 否则两个线程同时标记完成会丢掉其中一天的记录。
+        self._lock = threading.Lock()
         self.raw_dir = Path(raw_dir)
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.rows_path = self.raw_dir / "listing_rows.jsonl"
@@ -66,13 +70,17 @@ class RawStore:
             return set()
 
     def is_done(self, unit: str) -> bool:
-        return unit in self._load_checkpoint()
+        with self._lock:
+            return unit in self._load_checkpoint()
 
     def mark_done(self, unit: str) -> None:
-        done = self._load_checkpoint()
-        done.add(unit)
-        self.checkpoint_path.write_text(
-            json.dumps(sorted(done), ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            done = self._load_checkpoint()
+            done.add(unit)
+            tmp = self.checkpoint_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(done), ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            tmp.replace(self.checkpoint_path)      # 原子替换，中断不留半截文件
 
     # ---------- 写入 ----------
 
@@ -84,7 +92,7 @@ class RawStore:
             text, encoding="utf-8")
 
     def append_rows(self, rows: list[dict]) -> None:
-        with self.rows_path.open("a", encoding="utf-8") as fh:
+        with self._lock, self.rows_path.open("a", encoding="utf-8") as fh:
             for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
