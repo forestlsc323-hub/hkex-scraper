@@ -133,7 +133,12 @@ hkexdb/
   listing.py           列表抓取逻辑
   storage.py           raw 层存储（原样落盘 + 断点续跑 + 幂等）
 
+  validators.py        V3~V8 校验器（铁律一在这里落地：所有算术由 Python 做）
+
 docs/01-数据源勘察.md   问题 1、2 的回答，含置信度标注
+docs/02-两单实测-字段陷阱清单.md
+                       1417 MGO 与 3336 VGO 实测出的字段陷阱
+tests/fixtures/        两单真实公告的人工基准（含 source_quote + page）
 tests/                 离线测试，不联网
 prototype/             早期原型，不可用于正式库，见其 README
 data/                  运行产物（不进 git）
@@ -182,7 +187,14 @@ raw 是所有下游的地基，在这里「顺手清理」，后面发现清错�
 .venv/bin/python -m pytest tests -q
 ```
 
-17 个测试，全部离线（网络层被替换成假的），几秒跑完。
+36 个测试，全部离线（网络层被替换成假的），几秒跑完。分两类：
+
+- `test_listing.py`（17）—— 阶段一抓取：切块、分页、断点续跑、幂等
+- `test_validators.py`（19）—— 两单真实公告的回归基准 + 附录 D 五个案例
+
+其中最关键的一条是 `test_equality_check_would_false_flag_the_vgo`：
+3336 那单把均价印作「約 X.XX」，若 V4 用等式检验，11 项里有 8 项会被误报为
+错误，真错误就会淹没在假警报里。详见 `docs/02`。
 
 ---
 

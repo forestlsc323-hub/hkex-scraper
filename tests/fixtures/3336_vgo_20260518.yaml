@@ -1,0 +1,277 @@
+# ============================================================
+# 回归测试基准：巨騰國際控股（3336）具有前置條件之自願性有條件全面現金要約
+# 要约人：藍思科技（6613，本身也在联交所上市 —— 股票代码干扰值）
+#
+# 这单是溢价率字段的压力测试：11 个比较基准、两套日期锚点
+#（最後交易日 + 未受干擾日），且均价全部印成「約 X.XX」。
+#
+# 状态：Claude 摘录 + Python 复算通过；**人工终审待办**。
+# ============================================================
+
+meta:
+  fixture_id: "3336_vgo_20260518"
+  source_pdf: "b12f8098-_____vgo__.pdf"
+  total_pages: 30
+  has_text_layer: true
+  numeral_style: "chinese"      # ⚠️ 日期全用中文数字「二零二六年五月十八日」
+  rules_version: null
+  human_verified: false
+
+deal:
+  target_stock_code: "3336"
+  target_name: "巨騰國際控股有限公司"
+  target_board: "主板"
+  offeror: "藍思科技股份有限公司"
+  offeror_stock_code: "6613"    # ⚠️ 干扰值：要约人本身也是上市公司
+
+  # ⚠️ p1 同时出现两个股份代號，且要约人（6613）印在目标（3336）左侧。
+  # 取「第一个股份代號」的规则会抓错公司。
+  stock_code_trap:
+    page: 1
+    quote: "（股份代號：6613） （股份代號：3336）"
+    correct: "3336"
+    naive_wrong: "6613"
+
+  offer_type: "VGO"
+  offer_type_evidence:
+    page: 1
+    quote: "中信里昂證券有限公司代表藍思科技股份有限公司就收購巨騰國際控股有限公司全部已發行股份（藍思科技股份有限公司及其一致行動人士已擁有或同意收購之股份除外）提出具有前置條件之自願性有條件全面現金要約"
+
+  # 「前置條件」是要约成立前的不可豁免条件，与「先決條件」（购股协议项下）不同层
+  pre_condition:
+    page: 28
+    quote: "「前置條件」 指 要約之不可豁免先決條件，即完成購股協議，該條件必須在提出要約前達成"
+    satisfied_at_announcement: false
+    evidence_page: 4
+    evidence_quote: "要約的提出須待購股協議完成（此為不可豁免的條件）後方可作實，而於本聯合公告日期，該項前置條件尚未達成。"
+
+  first_announcement_date: "2026-05-18"
+  first_announcement_evidence:
+    page: 29
+    quote: "「購股協議」 指 要約人與賣方於二零二六年五月十八日就買賣待售股"
+  first_announcement_note: "购股协议签订日与本联合公告日同为 2026-05-18。全文 0 处提及规则 3.7，未见更早的商谈公告。"
+
+  decoy_dates:
+    - date: "2026-04-21"
+      what: "未受干擾日（异常成交前的最后交易日）"
+      page: 29
+      quote: "「未受干擾日」 指 二零二六年四月二十一日，即於出現股份交易量異常"
+    - date: "2026-04-22"
+      what: "最後交易日（亦为六个月最高收市价当日）"
+      page: 27
+    - date: "2026-04-23"
+      what: "短暫停牌日"
+      page: 4
+      quote: "應本公司要求，股份已自二零二六年四月二十三日上午九時正起在聯交所短暫停止買賣，以待刊發本聯合公告。"
+    - date: "2026-05-19"
+      what: "復牌日"
+      page: 4
+    - date: "2026-06-08"
+      what: "综合文件寄发截止日（21日内），因前置条件未达成将申请延期"
+      page: 4
+    - date: "2026-09-18"
+      what: "购股协议最后截止日（自协议日起四个月）"
+      page: 10
+
+  offer_price: "2.20"
+  offer_price_currency: "HKD"
+  offer_price_evidence:
+    page: 27
+    quote: "「要約價」 指 提出要約所按之價格，即每股要約股份2.20港元"
+
+share_capital:
+  total_issued_evidence:
+    page: 10
+    quote: "截至本聯合公告日期，本公司已發行1,200,008,445股股份（包括臺灣存託憑證所代表之144,288,000股股份）"
+  sale_shares_evidence:
+    page: 5
+    quote: "333,713,032股股份（佔本聯合公告日期已發行股份總數約27.81%），總代價為734,168,670.40港元（相當於每股待售股份約2.20港元）。"
+  offer_shares_evidence:
+    page: 11
+    quote: "假設本公司已發行股本概無變動，且根據要約價每股要約股份2.2港元計算，866,295,413"
+
+numbers:
+  total_issued_shares: 1200008445
+  tdr_shares: 144288000              # 臺灣存託憑證所代表的股份，已含在已发行股份内
+  sale_shares: 333713032
+  offer_shares: 866295413
+  sale_consideration: 734168670.40
+  offer_max_cash: 1905849908.60
+  audited_nav_total: 4475770000
+  share_award_trustee_shares: 354345774
+  max_new_awards: 72000000
+
+# ---- 价值比较（p11-p12）：11 项，两套锚点 × 5 个窗口 + 每股净资产 ----
+# ⚠️ 除 1、2 两项收市价外，其余基准原文均写「約 X.XX」，
+#    公告百分比是用未取整的真实均价算的 → V4 必须做区间检验。
+price_comparisons:
+  - label: "最後交易日 2026-04-22 收市价"
+    benchmark: "4.05"
+    benchmark_decimals: 2
+    benchmark_is_exact: true
+    stated_pct: "45.68"
+    stated_direction: "discount"
+    page: 11
+    quote: "1. 最後交易日於聯交所所報之收市價每股股份4.05港元折讓約45.68%"
+
+  - label: "未受干擾日 2026-04-21 收市价"
+    benchmark: "3.18"
+    benchmark_decimals: 2
+    benchmark_is_exact: true
+    stated_pct: "30.82"
+    stated_direction: "discount"
+    page: 11
+    quote: "2. 未受干擾日於聯交所所報之收市價每股股份3.18港元折讓約為30.82%"
+
+  - label: "最後交易日前5日均价"
+    benchmark: "3.18"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "30.73"
+    stated_direction: "discount"
+    page: 11
+    quote: "3. 緊接最後交易日（包括該日）前5個交易日於聯交所所報之平均收市價約每股股份3.18港元折讓約30.73%"
+
+  - label: "未受干擾日前5日均价"
+    benchmark: "2.89"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "23.82"
+    stated_direction: "discount"
+    page: 11
+    quote: "4. 緊接未受干擾日（包括該日）前5個交易日於聯交所所報之平均收市價約每股股份2.89港元折讓約23.82%"
+
+  - label: "最後交易日前10日均价"
+    benchmark: "2.76"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "20.23"
+    stated_direction: "discount"
+    page: 11
+    quote: "5. 緊接最後交易日（包括該日）前10個交易日於聯交所所報之平均收市價約每股股份2.76港元折讓約20.23%"
+
+  - label: "未受干擾日前10日均价"
+    benchmark: "2.61"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "15.64"
+    stated_direction: "discount"
+    page: 11
+    quote: "6. 緊接未受干擾日（包括該日）前10個交易日於聯交所所報之平均收市價約每股股份2.61港元折讓約15.64%"
+
+  - label: "最後交易日前30日均价"
+    benchmark: "2.67"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "17.50"
+    stated_direction: "discount"
+    page: 11
+    quote: "7. 緊接最後交易日（包括該日）前30個交易日於聯交所所報之平均收市價約每股股份2.67港元折讓約17.50%"
+
+  - label: "未受干擾日前30日均价"
+    benchmark: "2.60"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "15.45"
+    stated_direction: "discount"
+    page: 12
+    quote: "8. 緊接未受干擾日（包括該日）前30個交易日於聯交所所報之平均收市價約每股股份2.60港元折讓約15.45%"
+
+  - label: "最後交易日前180日均价"
+    benchmark: "1.83"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "19.90"
+    stated_direction: "premium"
+    page: 12
+    quote: "9. 緊接最後交易日（包括該日）前180個交易日於聯交所所報之平均收市價約每股股份1.83港元溢價約19.90%"
+
+  - label: "未受干擾日前180日均价"
+    benchmark: "1.82"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "20.91"
+    stated_direction: "premium"
+    page: 12
+    quote: "10. 緊接未受干擾日（包括該日）前180個交易日於聯交所所報之平均收市價約每股股份1.82港元溢價約20.91%"
+
+  - label: "2025-12-31 每股经审核股东应占合并净资产"
+    benchmark: "3.73"
+    benchmark_decimals: 2
+    benchmark_is_exact: false
+    stated_pct: "41.02"
+    stated_direction: "discount"
+    page: 12
+    quote: "11. 本集團於二零二五年十二月三十一日每股約3.73港元的經審核之股東應佔綜合淨資產（按(i)於本聯合公告日期合共1,200,008,445股股份及(ii)本集團於二零二五年十二月三十一日經審核之股東應佔綜合淨資產約4,475,770,000港元計算）折讓約41.02%。"
+
+nonmarket_labels:
+  - "2025-12-31 每股经审核股东应占合并净资产"
+  # 180 日窗口 ≈ 8.5 个月，长于六个月区间，理论上可落在区间外；
+  # 本单实际落在区间内，故仍参与 V6。若将来 FAIL，需人工判断而非直接改数。
+
+six_month_range:
+  low: "1.62"
+  high: "4.05"
+  page: 12
+  quote: "於緊接要約期間開始前六個月期間內及直至最後交易日，股份在聯交所所報最高收市價為於二零二六年四月二十二日的每股4.05港元，股份在聯交所所報最低收市價為於二零二五年十二月十一日的每股1.62港元。"
+
+deal_size_candidates:
+  - key: "sale_consideration"
+    value: 734168670.40
+    role: "购股协议对价（27.81%）"
+    page: 5
+    quote: "出售待售股份之代價合共為734,168,670.40港元"
+  - key: "offer_max_cash"
+    value: 1905849908.60
+    role: "要约悉数接纳时最高现金（72.19%）"
+    page: 12
+    quote: "假設自本聯合公告日期起至要約截止為止，本公司已發行股本概無變動，要約人就悉數接納要約而應付之最高現金金額為1,905,849,908.60港元。"
+  - key: "implied_equity_value"
+    value: 2640018579.00
+    role: "100% 股本隐含估值 = 上两项之和（精确闭合）"
+    page: null
+
+deal_size_primary: null   # ⛔ 待附录 A 的「主值选取口径」
+
+# ---- 多情境（附录 D-4）：这单是真的有多情境 ----
+scenarios:
+  multi_scenario: true
+  reason: >
+    先決條件(3) 允许公司在完成前授出不超过 72,000,000 股奖励股份；
+    先決條件(2) 中股份奖励计划受托人对其所持股份作出不可撤销接纳承诺，
+    但「上述股份獎勵項下的股份除外」。
+    故受托人实际承诺接纳的股数取决于最终授出量，介于
+    354,345,774（未授出）与 282,345,774（足额授出 72,000,000）之间。
+  page: 7
+  quote: "3. 本公司已根據股份獎勵計劃完成向其僱員及其他合資格參與者授出不超過72,000,000股股份"
+  note: >
+    该情境影响「已承诺接纳股数」，不影响要约最高现金
+    （1,905,849,908.60 已按全部要约股份计算，为各情境上限）。
+    按附录 D-4「取各情境合计最大者」，主值仍为 1,905,849,908.60。
+
+# ---- 不可撤销承诺（附录 D-5 检测点）----
+irrevocable_undertakings:
+  exists: true
+  page: 7
+  quote: "2. 除下文條件(3)所述根據股份獎勵計劃授出的股份獎勵外，股份獎勵計劃的受託人已無條件且不可撤銷地同意並承諾，在收到獨立董事委員會建議接納要約的推薦建議後五個營業日內，其將就股份獎勵計劃項下的所有股份（上述股份獎勵項下的股份除外）接納要約，且股份獎勵計劃受託人已進一步承諾不會撤回該接納"
+  reduces_payable: false
+  note: >
+    与附录 D-5 不同：受托人承诺的是「接纳」而非「不接纳」，
+    要约人仍需以现金支付这部分股份，故不产生名义/实付缺口。
+    财务资源确认额 1,905,849,908.60 == 要约最高现金，无缺口。
+    ⚠️ 但这提高了要约的实际成交确定性，属于交易实质的重要信息，
+    抽取时应作为独立字段记录，不可与「名义要约价值」混同。
+
+expected_findings:
+  v3_all_pass: true
+  v4_all_pass: true
+  v4_would_fail_under_equality_check: 8   # ⚠️ 11 项中有 8 项
+  v5_all_pass: true
+  v6_all_pass: true
+  v8_all_pass: true
+  v10_note: >
+    标题「具有前置條件之自願性有條件全面現金要約」与正文一致。
+    全文 11 处「無條件」中，多数是警示语「要約未必會成為或獲宣佈為無條件要約」，
+    以及受托人承诺的「無條件且不可撤銷」—— 均非要约类型描述。
+    ⚠️ 简单统计「無條件」词频会把这单误判为无条件要约（附录 D-3 型风险）。
+  v11_note: "股份代號 3336；p26 载「已發行股份於聯交所主板上市」；全文 0 处 GEM/創業板。一致。"

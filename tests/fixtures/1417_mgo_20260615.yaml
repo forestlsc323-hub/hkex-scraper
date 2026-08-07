@@ -1,0 +1,197 @@
+# ============================================================
+# 回归测试基准：浦江中國控股（1417）強制性無條件現金要約
+#
+# 每个字段都带 source_quote + page（铁律三）。
+# 所有百分比、乘积、加总由 hkexdb/validators.py 复算，本文件只记录原文。
+#
+# 状态：Claude 摘录 + Python 复算通过；**人工终审待办**。
+# ============================================================
+
+meta:
+  fixture_id: "1417_mgo_20260615"
+  source_pdf: "6a6dd11a-_____mgo__.pdf"
+  total_pages: 30
+  has_text_layer: true          # 30/30 页可提取，无需 OCR
+  numeral_style: "arabic"       # 日期用阿拉伯数字（对比 3336 用中文数字）
+  rules_version: null           # 附录 A 未提供
+  human_verified: false
+
+deal:
+  target_stock_code: "1417"
+  target_name: "浦江中國控股有限公司"
+  target_board: "主板"
+  offeror: "Yomi.sun Holding Limited"
+
+  offer_type: "MGO"
+  offer_type_evidence:
+    page: 2
+    quote: "根據收購守則規則26.1，要約人須就本公司已發行股本中所有股份（不包括要約人及其一致行動人士已擁有及╱或同意將予收購的股份）提出強制性無條件現金要約。"
+
+  # ---- 首次公告日期（铁律二的核心陷阱，见 docs/02）----
+  first_announcement_date: "2026-06-15"
+  first_announcement_evidence:
+    page: 7
+    quote: "日期： 2026年6月15日"
+  first_announcement_note: >
+    本公告同时是「买卖协议完成公告」和「MGO 的规则 3.5 公告」。
+    标题以「完成出售及購買」开头 —— 按「标题含『完成』即归为完成公告」
+    的规则会把这单的 T0 整个丢掉。
+
+  # 这三个日期都会被误当成 T0，必须区分
+  decoy_dates:
+    - date: "2026-05-18"
+      what: "要約期開始日 = 收購守則規則 3.7 商談公告日"
+      page: 11
+      quote: "本公司根據收購守則規則3.7於2026年5月18日發佈公告前的最後一個交易日2026年5月15日"
+      why_not_t0: "铁律二明列：3.7 商谈公告不是 T0"
+    - date: "2026-06-12"
+      what: "最後交易日"
+      page: 26
+      quote: "「最後交易日」 2026年6月12日，即本聯合公告刊發前，股份自2026年6月15日上午九時起暫停買賣生效前在聯交所最後的一個股份交易日"
+    - date: "2026-06-16"
+      what: "復牌日"
+      page: 7
+
+  offer_price: "0.519"
+  offer_price_currency: "HKD"
+  offer_price_evidence:
+    page: 27
+    quote: "「要約價」 應付現金金額每股要約股份0.519港元"
+
+# 精确数值统一放 numbers 节，本节只记出处（铁律三）
+share_capital:
+  total_issued_evidence:
+    page: 3
+    quote: "於本聯合公告日期，本公司擁有405,000,000股已發行股份。"
+  concert_party_evidence:
+    page: 2
+    quote: "緊隨完成後且於本聯合公告日期，要約人及其一致行動人士合共持有300,170,000股股份（其中要約人持有222,890,000股股份，Lucky Yang持有77,280,000股股份），佔本公司已發行股本總額的約74.12%。"
+  offer_shares_evidence:
+    page: 5
+    quote: "要約人就代價應付的最高現金金額約為5,440萬港元（按每股要約股份要約價為0.519港元及要約股份總數為104,830,000股計算）"
+
+numbers:
+  total_issued_shares: 405000000
+  spa1_shares: 222890000
+  spa2_shares: 77280000
+  concert_party_shares: 300170000
+  offer_shares: 104830000
+  spa1_consideration: 115572592
+  spa2_consideration: 40071111
+  spa_total_consideration: 155643703
+  offer_max_cash_stated: 54400000        # 公告写「約5,440萬」
+  implied_equity_value_stated: 210200000 # 公告写「約2.102億」
+
+# ---- 价值比较（p11）：6 项，基准全部印为精确值 ----
+price_comparisons:
+  - label: "3.7公告前最后交易日 2026-05-15 收市价"
+    benchmark: "0.840"
+    benchmark_decimals: 3
+    benchmark_is_exact: true
+    stated_pct: "38.21"
+    stated_direction: "discount"
+    page: 11
+    quote: "(i) 本公司根據收購守則規則3.7於2026年5月18日發佈公告前的最後一個交易日2026年5月15日在聯交所所報價的收市價每股0.840港元折讓約38.21%"
+
+  - label: "最后交易日 2026-06-12 收市价"
+    benchmark: "1.870"
+    benchmark_decimals: 3
+    benchmark_is_exact: true
+    stated_pct: "72.25"
+    stated_direction: "discount"
+    page: 11
+    quote: "(ii) 股份於最後交易日在聯交所所報收市價每股1.870港元折讓約72.25%"
+
+  - label: "前5个交易日平均收市价"
+    benchmark: "1.914"
+    benchmark_decimals: 3
+    benchmark_is_exact: true
+    stated_pct: "72.88"
+    stated_direction: "discount"
+    page: 11
+    quote: "(iii) 股份於緊接最後交易日（包括該日）前五(5)個連續交易日在聯交所所報平均收市價每股1.914港元折讓約72.88%"
+
+  - label: "前10个交易日平均收市价"
+    benchmark: "1.849"
+    benchmark_decimals: 3
+    benchmark_is_exact: true
+    stated_pct: "71.93"
+    stated_direction: "discount"
+    page: 11
+    quote: "(iv) 股份於緊接最後交易日（包括該日）前十(10)個連續交易日在聯交所所報平均收市價每股1.849港元折讓約71.93%"
+
+  - label: "前30个交易日平均收市价"
+    benchmark: "1.168"
+    benchmark_decimals: 3
+    benchmark_is_exact: false     # 原文写「約1.168港元」
+    stated_pct: "55.57"
+    stated_direction: "discount"
+    page: 11
+    quote: "(v) 股份於緊接最後交易日（包括該日）前三十(30)個連續交易日在聯交所所報平均收市價每股約1.168港元折讓約55.57%"
+
+  - label: "2025-12-31 每股经审计合并净资产"
+    benchmark: "0.348"
+    benchmark_decimals: 3
+    benchmark_is_exact: false
+    stated_pct: "49.14"
+    stated_direction: "premium"
+    page: 11
+    quote: "(vi) 本公司於2025年12月31日的每股經審計合併淨資產價值約0.348的港元溢價約49.14%"
+
+nonmarket_labels:
+  - "2025-12-31 每股经审计合并净资产"
+
+six_month_range:
+  low: "0.200"
+  high: "1.980"
+  page: 11
+  quote: "緊接要約期開始日2026年5月18日前六個月期間（定義見收購守則）至本聯合公告日期（包括該日）為止，股份在聯交所所報最高收市價為於2026年6月8日的每股1.980港元，及股份在聯交所所報最低收市價為於2026年3月31日至2026年5月4日及於2026年5月8日、11日及12日的每股0.200港元。"
+
+# ---- 交易规模：5 个候选值，主值口径待附录 A 定 ----
+deal_size_candidates:
+  - key: "spa1_consideration"
+    value: 115572592
+    role: "分项-干扰值"
+    page: 2
+  - key: "spa2_consideration"
+    value: 40071111
+    role: "分项-干扰值"
+    page: 2
+  - key: "spa_total_consideration"
+    value: 155643703
+    role: "控股权转让对价（74.12%）"
+    page: 8
+    quote: "出售股份的代價總額為155,643,703港元（或每股出售股份約0.519港元）"
+  - key: "offer_max_cash"
+    value: 54406770
+    role: "MGO 项下最高现金代价（25.88%），公告写「約5,440萬」"
+    page: 12
+  - key: "implied_equity_value"
+    value: 210195000
+    role: "100% 股本隐含估值，公告写「約2.102億」"
+    page: 12
+
+deal_size_primary: null   # ⛔ 待附录 A 的「主值选取口径」
+
+# ---- 多情境 / 名义vs实付（附录 D-4、D-5）----
+scenarios:
+  multi_scenario: false
+  reason: "购股权计划自采纳以来未授出；股份奖励计划受托人所持 8,218,000 股已计入已发行股份且含在要约股份内。单一情境。"
+  page: 12
+  quote: "本公司於2017年11月15日採納購股權計劃。於本聯合公告日期，自採納以來未"
+
+irrevocable_undertakings:
+  exists: false
+  page: 4
+  quote: "截至本聯合公告日期，尚未落實或實施任何安排。"
+  note: "财务资源确认额 5,440万 == 要约最高代价，无附录 D-5 式名义/实付缺口。"
+
+# ---- 一致性检查的期望结果 ----
+expected_findings:
+  v3_all_pass: true
+  v4_all_pass: true
+  v5_all_pass: true
+  v6_all_pass: true
+  v8_all_pass: true
+  v10_note: "标题、正文、定义节全部作「無條件」，另有 3 处「不設任何條件」佐证；唯一的「有條件」出现在购股权计划的采纳，与要约类型无关。一致。"
+  v11_note: "股份代號 1417；p24 明载「已發行股份於聯交所主板上市」；全文 0 处 GEM/創業板。一致。注意 p18 的代號 2013 是要约人实益拥有人任职的另一家公司（微盟），是干扰值。"
