@@ -62,6 +62,35 @@ class Section:
         self.lines.append(line)
 
 
+_CAUSE_HINTS = (
+    ("Tunnel connection failed", "连不上：代理拒绝 CONNECT（出网被拦）"),
+    ("Name or service not known", "连不上：域名解析失败"),
+    ("Connection refused", "连不上：连接被拒"),
+    ("timed out", "连不上：超时"),
+    ("Max retries exceeded", "连不上：重试用尽"),
+)
+
+
+def _brief(exc: BaseException) -> str:
+    """把又臭又长的异常压成一句话。完整堆栈在日志里，报告要能读。
+
+    根因通常埋在 __cause__ 链的底部 —— http_client 把网络异常包成
+    RuntimeError 再抛，只看最外层那句会得到「请求失败：<url>」，
+    等于什么都没说。所以要顺着链往下找。
+    """
+    seen: list[str] = []
+    node: BaseException | None = exc
+    while node is not None and len(seen) < 6:
+        seen.append(str(node))
+        node = node.__cause__ or node.__context__
+
+    joined = " | ".join(seen)
+    for needle, short in _CAUSE_HINTS:
+        if needle in joined:
+            return short
+    return seen[0].split("params=")[0].strip()[:160]
+
+
 def _save(probe_dir: Path, name: str, content: str) -> Path:
     probe_dir.mkdir(parents=True, exist_ok=True)
     path = probe_dir / name
@@ -77,7 +106,7 @@ def check_robots(session: PoliteSession, probe_dir: Path) -> Section:
     try:
         resp = session.get(ROBOTS)
     except Exception as exc:
-        sec.add(f"- 抓取失败：{exc}")
+        sec.add(f"- 抓取失败：{_brief(exc)}")
         sec.add("- **无法确认 robots 规则，请手工在浏览器打开 " + ROBOTS + " 确认后再继续。**")
         return sec
 
@@ -115,7 +144,7 @@ def check_search_page(session: PoliteSession, probe_dir: Path) -> tuple[Section,
     try:
         resp = session.get(SEARCH_PAGE, params={"lang": "zh"})
     except Exception as exc:
-        sec.add(f"- 抓取失败：{exc}")
+        sec.add(f"- 抓取失败：{_brief(exc)}")
         return sec, ""
 
     html = resp.text
@@ -172,6 +201,7 @@ def check_servlet(session: PoliteSession, probe_dir: Path,
     sec.add("")
 
     working = []
+    reached_server = False
     for servlet in SERVLET_CANDIDATES:
         for from_key, to_key in DATE_PARAM_VARIANTS:
             params = {
@@ -200,9 +230,10 @@ def check_servlet(session: PoliteSession, probe_dir: Path,
                     "Accept": "application/json, text/javascript, */*; q=0.01",
                 })
             except Exception as exc:
-                sec.add(f"- ❌ `{label}` → 请求失败：{exc}")
+                sec.add(f"- ❌ `{label}` → {_brief(exc)}")
                 continue
 
+            reached_server = True
             try:
                 payload = json.loads(resp.text)
             except json.JSONDecodeError:
@@ -236,10 +267,14 @@ def check_servlet(session: PoliteSession, probe_dir: Path,
         servlet, from_key, to_key = working[0]
         sec.add(f"**结论：使用 `{servlet}`，日期参数名为 `{from_key}` / `{to_key}`。**")
         sec.add(f"→ 把这两个名字填进 `hkexdb/listing.py` 顶部的 `DATE_PARAM_NAMES`。")
-    else:
-        sec.add("**结论：没有任何组合返回数据。**")
-        sec.add("→ 请在浏览器打开检索页，按 F12 → Network → 手工搜一次，"
+    elif reached_server:
+        sec.add("**结论：请求到达了服务器，但没有任何组合返回数据。**")
+        sec.add("→ 说明接口地址或参数名与当前站点结构不符。"
+                "请在浏览器打开检索页，按 F12 → Network → 手工搜一次，"
                 "把那条 XHR 请求的完整 URL 复制给我，我照实际情况改。")
+    else:
+        sec.add("**结论：全部请求在连接阶段就失败了，本节什么也没测出来。**")
+        sec.add("→ 这**不能**说明接口地址或参数名有问题 —— 先解决网络再重跑。")
     return sec
 
 
@@ -257,7 +292,7 @@ def check_categories(session: PoliteSession, probe_dir: Path, html: str) -> Sect
         try:
             resp = session.get(url)
         except Exception as exc:
-            sec.add(f"- ❌ `{url}` → {exc}")
+            sec.add(f"- ❌ `{url}` → {_brief(exc)}")
             continue
         try:
             payload = json.loads(resp.text)
@@ -333,9 +368,30 @@ def run(session: PoliteSession, probe_dir: Path,
     sections.append(check_servlet(session, probe_dir, date_from, date_to))
     sections.append(check_categories(session, probe_dir, html))
 
+    # 一个请求都没到达服务器 —— 这次勘察什么也没测出来。
+    # 必须说清楚，否则「没有任何组合返回数据」会被误读成「接口不可用」，
+    # 让人白跑去 F12 抓包。
+    offline = session.stats["network"] == 0
+
     lines = [
         "# HKEXnews 数据源勘察报告",
         "",
+    ]
+    if offline:
+        lines += [
+            "> # ⛔ 本次勘察无效：一个请求都没有发出去",
+            ">",
+            f"> {session.stats['retries']} 次重试全部在连接阶段就失败，"
+            "**没有任何一个请求到达披露易的服务器**。",
+            ">",
+            "> 所以下面每一节的「失败」都只说明本机连不上，"
+            "**不能说明接口地址、参数名或分类代码有任何问题**。",
+            ">",
+            "> 先解决网络（本机代理 / 公司网络白名单 / 云端沙箱出网限制），",
+            "> 再重跑 `python run_probe.py`。缓存里没有半成品，重跑是干净的。",
+            "",
+        ]
+    lines += [
         "由 `run_probe.py` 自动生成。每一条结论都来自真实响应，不含推测。",
         "原始 HTML / JSON 与本报告同目录，可随时复核。",
         "",
