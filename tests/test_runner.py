@@ -261,8 +261,33 @@ def test_launcher_keeps_a_console_for_errors():
     assert any("python.exe app.py" in ln for ln in live)
 
 
-def test_launcher_uses_crlf_line_endings():
+@pytest.mark.parametrize("name", ["RUN.bat", "一键运行.bat", "一键更新.bat"])
+def test_every_bat_uses_crlf_line_endings(name):
     """LF 换行会让 Windows cmd 解析崩掉，双击后闪一下就关（真踩过）。"""
-    raw = (runner.Path(__file__).parent.parent / "RUN.bat").read_bytes()
+    raw = (runner.Path(__file__).parent.parent / name).read_bytes()
     assert b"\r\n" in raw
-    assert raw.count(b"\n") == raw.count(b"\r\n"), "存在裸 LF 换行"
+    assert raw.count(b"\n") == raw.count(b"\r\n"), f"{name} 里有裸 LF 换行"
+
+
+def test_updater_never_overwrites_what_the_user_produced():
+    """更新脚本必须跳过 data\\ 和 logs\\ —— 覆盖了就是把跑出来的结果删了。
+
+    .venv 也要跳过，否则每次更新都得重装依赖，用户会以为程序坏了。
+    """
+    bat = (runner.Path(__file__).parent.parent / "一键更新.bat"
+           ).read_bytes().decode("utf-8")
+    copy_line = next(ln for ln in bat.splitlines() if "robocopy" in ln)
+    for protected in ("data", "logs", ".venv"):
+        assert protected in copy_line.split("/XD")[1], f"更新会覆盖 {protected}"
+
+
+def test_updater_points_at_the_branch_we_actually_push_to():
+    """分支名写错的话，用户点了更新会一直拿到旧代码，而且毫无提示。"""
+    root = runner.Path(__file__).parent.parent
+    bat = (root / "一键更新.bat").read_bytes().decode("utf-8")
+    branch = next(ln for ln in bat.splitlines() if ln.startswith('set "BRANCH='))
+    branch = branch.split("=", 1)[1].rstrip('"')
+    # 解压出来的顶层目录名 = 仓库名 + "-" + 分支名里的 / 换成 -
+    folder = next(ln for ln in bat.splitlines() if ln.startswith('set "FOLDER='))
+    folder = folder.split("=", 1)[1].rstrip('"')
+    assert folder == "hkex-scraper-" + branch.replace("/", "-")
