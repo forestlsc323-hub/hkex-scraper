@@ -31,7 +31,7 @@ from pathlib import Path
 
 # 抽取器版本。**改了抽取/校验逻辑就要改这个号**，否则旧结果会被当成
 # 新结果复用，而你根本看不出来 —— 那正是铁律二说的静默污染。
-EXTRACTOR_VERSION = "2026-08-C"
+EXTRACTOR_VERSION = "2026-08-D"   # D：公告日期改成 ISO，旧存档里那些 DD/MM/YYYY 必须重建
 
 STORE_DIR = "data/store"
 LISTING_FILE = "listing.csv"
@@ -39,8 +39,44 @@ COVERAGE_FILE = "coverage.json"
 DEALS_FILE = "deals.csv"
 EVIDENCE_FILE = "evidence.json"
 
-LISTING_COLUMNS = ["NEWS_ID", "DATE_TIME", "STOCK_CODE", "STOCK_NAME",
-                   "TITLE", "FILE_LINK", "FIRST_SEEN"]
+# DATE_ISO 是**加工层**：原始的 DATE_TIME 一字不动地留着，另开一列存
+# 规范化后的日期。原始层不动、加工层另开 —— 你手册里那条铁律。
+LISTING_COLUMNS = ["NEWS_ID", "DATE_TIME", "DATE_ISO", "STOCK_CODE",
+                   "STOCK_NAME", "TITLE", "FILE_LINK", "FIRST_SEEN"]
+
+
+def normalise_date(value: str) -> str:
+    """披露易的日期 → ISO（YYYY-MM-DD）。认不出就返回空字符串。
+
+    ⚠️ 接口给的是 **DD/MM/YYYY**（界面上显示的「04/06/2026」就是它），
+    不是 ISO。我当初直接把斜杠换成横杠就拿去比大小 ——
+    「04-06-2026」按字符串排在「2026-01-01」前面，于是 2594 条公告
+    一条都过不了日期筛子，抓得好好的数据被全部丢掉，日志上还显示
+    「新增 2594 条进存档」，只有下一行的「本次范围内共 0 条」露了馅。
+
+    日期格式这种东西绝不能靠字符串替换糊弄，必须真解析。
+    """
+    text = str(value or "").split()[0].strip() if value else ""
+    if not text:
+        return ""
+    text = text.replace(".", "/").replace("-", "/")
+    parts = [p for p in text.split("/") if p]
+    if len(parts) != 3:
+        return ""
+    try:
+        if len(parts[0]) == 4:                     # YYYY/MM/DD
+            y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        else:                                       # DD/MM/YYYY（披露易用这个）
+            d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        return dt.date(y, m, d).isoformat()
+    except (ValueError, TypeError):
+        return ""
+
+
+def row_date(row: dict) -> str:
+    """一行公告的 ISO 日期。老存档没有 DATE_ISO 列，就现算。"""
+    return (row.get("DATE_ISO") or "").strip() or normalise_date(
+        row.get("DATE_TIME", ""))
 
 
 def _dir(root: Path) -> Path:
@@ -140,7 +176,8 @@ def merge_listing(root: Path, records: list[dict]) -> tuple[int, int]:
             continue
         store[nid] = {
             "NEWS_ID": nid,
-            "DATE_TIME": rec.get("DATE_TIME", ""),
+            "DATE_TIME": rec.get("DATE_TIME", ""),      # 原始层：一字不动
+            "DATE_ISO": normalise_date(rec.get("DATE_TIME", "")),
             "STOCK_CODE": rec.get("STOCK_CODE", ""),
             "STOCK_NAME": rec.get("STOCK_NAME", ""),
             "TITLE": rec.get("TITLE", ""),
@@ -162,12 +199,9 @@ def merge_listing(root: Path, records: list[dict]) -> tuple[int, int]:
 def listing_between(root: Path, d1: dt.date, d2: dt.date) -> list[dict]:
     """从存档里取这段日期的公告，格式和刚抓回来的一模一样。"""
     lo, hi = d1.isoformat(), d2.isoformat()
-    out = []
-    for row in load_listing(root).values():
-        day = (row.get("DATE_TIME") or "").split()[0].replace("/", "-")
-        if lo <= day <= hi:
-            out.append(row)
-    out.sort(key=lambda r: r.get("DATE_TIME", ""), reverse=True)
+    out = [row for row in load_listing(root).values()
+           if lo <= row_date(row) <= hi]
+    out.sort(key=row_date, reverse=True)
     return out
 
 

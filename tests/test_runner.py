@@ -16,7 +16,15 @@ from hkexdb import runner
 
 
 def fake_records(n: int, day: str = "2026-06-01") -> list[dict]:
-    """混进真实标题，好让筛查层有东西可判。"""
+    """混进真实标题，好让筛查层有东西可判。
+
+    ⚠️ DATE_TIME 一律用披露易**真实的** DD/MM/YYYY 格式。
+    夹具当初写成 ISO，结果日期解析的 bug 一个测试都没碰到 ——
+    2594 条公告被日期筛子全部丢掉，而 387 个测试全绿。
+    夹具的格式必须和真实接口一致，否则测的是另一个系统。
+    """
+    d = dt.date.fromisoformat(day)
+    stamp = f"{d.day:02d}/{d.month:02d}/{d.year}"
     titles = [
         "聯合公告 (1) 完成出售及購買 (2) 作出強制性無條件現金要約 及 (3) 恢復股份買賣",
         "寄發綜合文件",
@@ -26,7 +34,7 @@ def fake_records(n: int, day: str = "2026-06-01") -> list[dict]:
     ]
     return [{
         "NEWS_ID": f"n{i}",
-        "DATE_TIME": f"{day} 08:{i % 60:02d}",
+        "DATE_TIME": f"{stamp} 08:{i % 60:02d}",
         "STOCK_CODE": f"{i % 9 + 1:05d}",
         "STOCK_NAME": f"公司{i}",
         "TITLE": titles[i % len(titles)],

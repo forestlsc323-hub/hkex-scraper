@@ -278,6 +278,10 @@ def main() -> int:
     btn_stop = ttk.Button(top, text="停止", state="disabled")
     btn_stop.grid(row=0, column=5, padx=4)
 
+    force_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(top, text="忽略存档，重新抓取", variable=force_var).grid(
+        row=0, column=6, padx=(14, 0))
+
     ttk.Label(top, text="格式 2026-06-01　·　第一次建议先抓一周试试",
               foreground="#888").grid(row=1, column=0, columnspan=6,
                                       sticky="w", pady=(6, 0))
@@ -406,7 +410,7 @@ def main() -> int:
                 d1, d2,
                 on_log=lambda t: msgs.put(("log", t)),
                 on_step=lambda i, f: msgs.put(("step", (i, f))),
-                cancel_event=cancel)
+                cancel_event=cancel, force_refetch=force_var.get())
             msgs.put(("done", result))
 
         threading.Thread(target=work, daemon=True).start()

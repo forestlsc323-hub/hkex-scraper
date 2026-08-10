@@ -82,7 +82,10 @@ def test_corrupt_coverage_file_is_treated_as_empty(tmp_path):
 # ---------------------------------------------------------------- 公告列表
 
 def _rec(nid, day="2026-06-01", code="03336"):
-    return {"NEWS_ID": nid, "DATE_TIME": f"{day} 08:00", "STOCK_CODE": code,
+    # 披露易给的是 DD/MM/YYYY，夹具必须照它来
+    d = dt.date.fromisoformat(day)
+    stamp = f"{d.day:02d}/{d.month:02d}/{d.year}"
+    return {"NEWS_ID": nid, "DATE_TIME": f"{stamp} 08:00", "STOCK_CODE": code,
             "STOCK_NAME": "巨騰國際", "TITLE": "全面現金要約",
             "FILE_LINK": f"/x/{nid}.pdf"}
 
@@ -259,3 +262,93 @@ def test_a_new_extractor_version_forces_a_re_extract(isolated, monkeypatch):
     runner.run(D(2026, 6, 1), D(2026, 6, 7),
                fetch=lambda *a: fake_records(10), open_pdf=opener)
     assert opened, "换了抽取器版本却还在复用旧结果 —— 静默污染"
+
+
+# ---------------------------------------------------------------- 日期格式
+
+@pytest.mark.parametrize("raw,want", [
+    ("04/06/2026 16:35", "2026-06-04"),     # 披露易真实格式 DD/MM/YYYY
+    ("26/03/2026", "2026-03-26"),
+    ("01/01/2026 09:00", "2026-01-01"),
+    ("2026-06-04 16:35", "2026-06-04"),     # ISO 也要认
+    ("2026/06/04", "2026-06-04"),
+    ("", ""),
+    ("看不懂", ""),
+    ("32/13/2026", ""),                      # 非法日期不许瞎猜
+])
+def test_hkex_dates_are_really_parsed_not_string_swapped(raw, want):
+    """披露易给的是 DD/MM/YYYY，不是 ISO。
+
+    我当初只把斜杠换成横杠就拿去比大小 ——「04-06-2026」按字符串
+    排在「2026-01-01」前面，2594 条公告一条都过不了日期筛子，
+    日志上还写着「新增 2594 条进存档」。日期绝不能靠字符串替换糊弄。
+    """
+    assert store.normalise_date(raw) == want
+
+
+def test_a_real_hkex_date_range_filter_keeps_the_rows(tmp_path):
+    """这条就是那次 0 条事故的最小复现。"""
+    store.merge_listing(tmp_path, [
+        {"NEWS_ID": "a", "DATE_TIME": "04/06/2026 16:35", "STOCK_CODE": "01657",
+         "STOCK_NAME": "樺欣控股", "TITLE": "要約", "FILE_LINK": "/x/a.pdf"},
+        {"NEWS_ID": "b", "DATE_TIME": "18/05/2026 08:00", "STOCK_CODE": "03336",
+         "STOCK_NAME": "巨騰國際", "TITLE": "要約", "FILE_LINK": "/x/b.pdf"},
+        {"NEWS_ID": "c", "DATE_TIME": "15/11/2025 08:00", "STOCK_CODE": "00001",
+         "STOCK_NAME": "範圍外", "TITLE": "要約", "FILE_LINK": "/x/c.pdf"},
+    ])
+    rows = store.listing_between(tmp_path, D(2026, 1, 1), D(2026, 6, 7))
+    assert [r["NEWS_ID"] for r in rows] == ["a", "b"], "日期筛子又把数据丢了"
+
+
+def test_the_iso_column_is_derived_not_overwriting_the_raw_one():
+    """原始层不动，加工层另开 —— DATE_TIME 一字不改，另存 DATE_ISO。"""
+    assert "DATE_TIME" in store.LISTING_COLUMNS
+    assert "DATE_ISO" in store.LISTING_COLUMNS
+
+
+def test_an_old_store_without_the_iso_column_still_filters(tmp_path):
+    """上一版存下来的 listing.csv 没有 DATE_ISO，不能因此读不出来。"""
+    d = tmp_path / store.STORE_DIR
+    d.mkdir(parents=True)
+    (d / store.LISTING_FILE).write_text(
+        "NEWS_ID,DATE_TIME,STOCK_CODE,STOCK_NAME,TITLE,FILE_LINK,FIRST_SEEN\n"
+        "a,04/06/2026 16:35,01657,樺欣控股,要約,/x/a.pdf,2026-08-10\n",
+        encoding="utf-8-sig")
+    rows = store.listing_between(tmp_path, D(2026, 1, 1), D(2026, 6, 7))
+    assert [r["NEWS_ID"] for r in rows] == ["a"]
+
+
+def test_fetching_rows_but_keeping_none_is_a_loud_failure(isolated):
+    """抓到 2594 条、筛完剩 0 条 —— 上一版就这么无声地把数据丢了。
+
+    这在逻辑上说不通，只可能是日期解析错了，所以必须炸，
+    不能安安静静地交出一张空表还显示「完成」。
+    """
+    bad = [{"NEWS_ID": "a", "DATE_TIME": "日期格式坏了", "STOCK_CODE": "01",
+            "STOCK_NAME": "甲", "TITLE": "要約", "FILE_LINK": "/x/a.pdf"}]
+    result = runner.run(D(2026, 1, 1), D(2026, 6, 7),
+                        fetch=lambda *a: bad, open_pdf=lambda u: None)
+    assert not result.ok
+    assert "日期解析对不上" in result.error
+
+
+def test_force_refetch_ignores_the_archive(isolated):
+    """存档说「抓过了」但结果不对时，得有一条退路能强制重来。"""
+    from tests.test_runner import fake_open_pdf, fake_records
+
+    calls = []
+
+    def fetch(d1, d2, log, on_step, cancel_event):
+        calls.append((d1, d2))
+        return fake_records(6)
+
+    runner.run(D(2026, 6, 1), D(2026, 6, 7), fetch=fetch, open_pdf=fake_open_pdf)
+    calls.clear()
+
+    runner.run(D(2026, 6, 1), D(2026, 6, 7), fetch=fetch,
+               open_pdf=fake_open_pdf)
+    assert calls == [], "没勾强制时不该重抓"
+
+    runner.run(D(2026, 6, 1), D(2026, 6, 7), fetch=fetch,
+               open_pdf=fake_open_pdf, force_refetch=True)
+    assert calls == [(D(2026, 6, 1), D(2026, 6, 7))], "勾了强制却没重抓"

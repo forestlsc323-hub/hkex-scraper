@@ -245,6 +245,10 @@ def _fetch_by_keyword(client, vendor_config, keywords: list[str],
     return found
 
 
+class DateFilterBug(RuntimeError):
+    """抓回来一堆、按日期筛完一条不剩。这只可能是解析错了，必须炸。"""
+
+
 class KeywordModeUnusable(RuntimeError):
     """关键词模式看着不对劲。宁可退回慢的全量抓取，也不能静默漏掉公告。"""
 
@@ -521,7 +525,7 @@ def score_against_answer_key(on_log=None) -> str:
 
 
 def _fetch_incrementally(d1: dt.date, d2: dt.date, log, on_step,
-                         cancel_event, fetch) -> list[dict]:
+                         cancel_event, fetch, force: bool = False) -> list[dict]:
     """只抓存档里还没有的那些天，其余直接从存档取。
 
     你说的那个用法：抓过 2026 全年之后再要 2025-01-01 到今天，
@@ -534,8 +538,12 @@ def _fetch_incrementally(d1: dt.date, d2: dt.date, log, on_step,
 
     _step, _workers, mode, keywords = _speed_settings()
     key = store.coverage_key(mode, keywords)
-    missing = store.missing_days(ROOT, d1, d2, key)
     total_days = (d2 - d1).days + 1
+    if force:
+        log("已勾选「忽略存档重新抓取」—— 这段日期全部重抓。")
+        missing = store._days(d1, d2)
+    else:
+        missing = store.missing_days(ROOT, d1, d2, key)
 
     if not missing:
         rows = store.listing_between(ROOT, d1, d2)
@@ -568,6 +576,14 @@ def _fetch_incrementally(d1: dt.date, d2: dt.date, log, on_step,
     log(f"\n新增 {added} 条公告进存档，存档现有 {total} 条。")
 
     rows = store.listing_between(ROOT, d1, d2)
+    if fetched and not rows:
+        # 抓回来一堆、按日期一筛却一条不剩 —— 这在逻辑上说不通，
+        # 只可能是日期解析错了。上一版就是这么无声丢掉 2594 条的：
+        # 日志上写着「新增 2594 条进存档」，下一行才是「本次范围内共 0 条」。
+        sample = [r.get("DATE_TIME", "") for r in fetched[:3]]
+        raise DateFilterBug(
+            f"抓到 {len(fetched)} 条，按 {d1} ~ {d2} 一筛却剩 0 条 —— "
+            f"日期解析对不上。接口给的样子：{sample}")
     log(f"本次范围内共 {len(rows)} 条（存档 + 新抓）。")
     on_step(0, 1.0)
     return rows
@@ -596,7 +612,7 @@ def _write_listing(records: list[dict], log) -> Path:
 
 def run(date_from: dt.date, date_to: dt.date, *,
         on_log=None, on_step=None, cancel_event: threading.Event | None = None,
-        fetch=_fetch, open_pdf=None) -> Result:
+        fetch=_fetch, open_pdf=None, force_refetch: bool = False) -> Result:
     """跑完整条流水线。
 
     `fetch` 和 `open_pdf` 都可替换 —— 测试里换成假的，就不会真的联网。
@@ -621,7 +637,7 @@ def run(date_from: dt.date, date_to: dt.date, *,
         step(0)
         log(f"\n【1/5】{STEPS[0]}")
         records = _fetch_incrementally(date_from, date_to, log, step,
-                                       cancel_event, fetch)
+                                       cancel_event, fetch, force=force_refetch)
         result.fetched = len(records)
         csv_path = _write_listing(records, log)
         log(f"抓到 {len(records)} 条")
@@ -675,10 +691,14 @@ def _screen(records, result: Result, log):
     """标题层筛选。返回 (行, 规则)。"""
     from . import screening as S
 
+    from . import store as store_mod
+
     rules = S.load_rules("screening_rules.yaml")
     recs = [{
         "row_id": r.get("NEWS_ID", f"r{i}"),
-        "date": (r.get("DATE_TIME") or "").split()[0],
+        # 规范成 ISO —— 表里、答案表里、存档里全用同一种写法，
+        # 否则「04/06/2026」和「2026-06-04」永远对不上。
+        "date": store_mod.row_date(r),
         "code": r.get("STOCK_CODE", ""),
         "name": r.get("STOCK_NAME", ""),
         "title": r.get("TITLE", ""),
