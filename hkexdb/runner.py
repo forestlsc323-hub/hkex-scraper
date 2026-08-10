@@ -331,6 +331,97 @@ def self_check(d1: dt.date, d2: dt.date, *, on_log=None,
     return str(out)
 
 
+def probe_categories(on_log=None, fetch_html=None) -> str:
+    """勘察披露易的公告分类码。
+
+    你 asso 的 search_by_category 把架子搭好了，缺的就是 t2code 的值。
+    拿到它，服务端就能直接给你「收購及合併」类的公告，连关键词模式
+    带回来的那 113 条/月普通交易公告都不会回来。
+
+    只读不写：读到什么报什么，读不到就说读不到并给出手工拿码的步骤。
+    绝不猜一个码填进去 —— 猜错是静默漏掉整类公告。
+    """
+    from . import categories
+
+    lines: list[str] = []
+
+    def log(text: str = "") -> None:
+        lines.append(str(text))
+        if on_log:
+            on_log(str(text))
+
+    if fetch_html is None:
+        import sys
+        sys.path.insert(0, str(ROOT / "vendor"))
+        import config as vendor_config          # noqa: E402
+        from hkex_client import HKEXClient      # noqa: E402
+
+        client = HKEXClient()                   # 建会话，拿 cookie
+
+        def fetch_html(url):
+            resp = client.session.get(url, timeout=vendor_config.REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.text
+
+    log("正在读检索页的分类树…")
+    cats, hits, report = categories.probe(fetch_html)
+    for line in report.splitlines():
+        log(line)
+
+    out = ROOT / "类别勘察.txt"
+    detail = list(lines)
+    if cats:
+        detail += ["", "=" * 56, "读到的全部分类", "=" * 56]
+        detail += [f"  {c}" for c in cats]
+    out.write_text("\n".join(detail), encoding="utf-8")
+    log("")
+    log(f"完整清单已写入 {out.name}")
+    return str(out)
+
+
+CACHE_DIR = "data/cache/pdf"
+
+
+def cache_info() -> tuple[int, int]:
+    """公告原件副本占了多少地方。返回 (份数, 字节数)。
+
+    这些副本不是「顺手存的」，是你工程要求里那条「原始文件永久保留，
+    解析与抽取幂等可重跑」—— 公告一旦被替换或撤下，没有副本就再也
+    复现不出当初抽的数字，审计链断在这里。
+
+    实测每份 700 KB 上下：年初至今约 90 MB，2024-2026 三年约 280 MB。
+    占的是硬盘不是内存；跑的时候同时只有并发数那么几份在内存里。
+    """
+    path = ROOT / CACHE_DIR
+    if not path.exists():
+        return 0, 0
+    files = [f for f in path.iterdir() if f.is_file()]
+    return len(files), sum(f.stat().st_size for f in files)
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def clear_cache() -> tuple[int, int]:
+    """删掉公告原件副本，腾地方。返回 (删了几份, 腾出多少字节)。
+
+    删了不影响已经抽出来的 deals.csv —— 但重跑时要重新下载，
+    而且如果哪份公告已经被披露易换掉，那一单就再也复现不了原样。
+    """
+    count, size = cache_info()
+    path = ROOT / CACHE_DIR
+    if path.exists():
+        for f in path.iterdir():
+            if f.is_file():
+                f.unlink()
+    return count, size
+
+
 def score_against_answer_key(on_log=None) -> str:
     """拿 data/deals.csv 和 data/answer_key.csv 逐字段对，出准确率报告。
 
@@ -568,6 +659,11 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
 
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
+
+    n, size = cache_info()
+    if n:
+        log(f"  公告原件副本：{n} 份，占 {human_size(size)}"
+            f"（{CACHE_DIR}，用于幂等重跑与审计追溯）")
     return deals
 
 

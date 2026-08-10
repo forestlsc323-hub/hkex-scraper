@@ -300,6 +300,10 @@ def main() -> int:
     btn_folder.pack(side="left", padx=8)
     btn_check = ttk.Button(bottom, text="自检（对比两种抓法）")
     btn_check.pack(side="right", padx=8)
+    btn_cat = ttk.Button(bottom, text="勘察类别码")
+    btn_cat.pack(side="right", padx=4)
+    btn_cache = ttk.Button(bottom, text="原件副本…")
+    btn_cache.pack(side="right", padx=4)
 
     # ---------------- 消息泵 ----------------
     def append(text: str) -> None:
@@ -431,7 +435,47 @@ def main() -> int:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def probe_categories() -> None:
+        """把披露易自己的公告分类树读出来。拿到「收購及合併」那个码，
+        服务端就能直接给要约公告，关键词模式带回的普通交易公告就没了。"""
+        if state["running"]:
+            return
+        append("正在勘察分类码…")
+
+        def work() -> None:
+            try:
+                path = runner.probe_categories(
+                    on_log=lambda t: msgs.put(("log", t)))
+                msgs.put(("log", f"报告：{path}"))
+            except Exception as exc:
+                msgs.put(("log", f"勘察失败：{type(exc).__name__}: {exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def manage_cache() -> None:
+        """公告原件副本占多少地方，要不要删。
+
+        删了不影响已经抽出来的 deals.csv，但重跑要重新下载；而且某份
+        公告若已被披露易换掉，那一单就再也复现不了原样（审计链断在这里）。
+        """
+        from tkinter import messagebox
+        n, size = runner.cache_info()
+        if not n:
+            messagebox.showinfo("原件副本", "还没有副本。")
+            return
+        if messagebox.askyesno(
+                "原件副本",
+                f"公告原件副本 {n} 份，占 {runner.human_size(size)}。\n"
+                f"位置：{ROOT / runner.CACHE_DIR}\n\n"
+                "留着它才能不重新下载就重跑，也才能在公告被换掉后\n"
+                "复现当初抽出的数字（审计追溯）。\n\n"
+                "要现在删掉腾地方吗？"):
+            gone, freed = runner.clear_cache()
+            append(f"已删除 {gone} 份副本，腾出 {runner.human_size(freed)}")
+
     btn_run.configure(command=start)
+    btn_cat.configure(command=probe_categories)
+    btn_cache.configure(command=manage_cache)
     btn_check.configure(command=start_self_check)
     btn_stop.configure(command=lambda: (cancel.set(), append("正在停止…")))
     btn_report.configure(
