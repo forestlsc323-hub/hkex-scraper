@@ -165,8 +165,54 @@ def _row_from_csv(rec: dict) -> dict:
     }
 
 
+def _deals_table(deals) -> str:
+    """要约结果表 —— 这是你真正要的东西，放在页面最上面。"""
+    if not deals:
+        return ('<div class="warn">这一批里没有抽到要约公告。'
+                '可能是该时段确实没有，也可能是筛查词表漏了新措辞 —— '
+                '看下面「人工复核」桶里有没有像要约的标题。</div>')
+
+    head = ("<tr><th>代码</th><th>公司</th><th>日期</th><th>类型</th>"
+            "<th>要约价<br>HKD</th><th>溢价率</th><th>基准</th>"
+            "<th>交易规模<br>HKD</th><th>复算校验</th><th>原文</th></tr>")
+    body = []
+    for d in deals:
+        pct = d.premium_pct
+        color = ("#1f7a4d" if pct and not pct.startswith("-")
+                 else "#b91c1c" if pct else "var(--muted)")
+        size = ""
+        if d.deal_size:
+            try:
+                size = f"{float(d.deal_size):,.0f}"
+            except ValueError:
+                size = d.deal_size
+        flag = "" if d.confidence == "high" else \
+            f'<span class="tag" style="background:#a86400">{d.confidence}</span>'
+        pdf = (f'<a href="{html.escape(d.pdf_url)}" target="_blank" '
+               f'rel="noopener">PDF</a>' if d.pdf_url else "")
+        body.append(
+            f"<tr><td><code>{html.escape(d.code)}</code></td>"
+            f"<td>{html.escape(d.name)}</td><td>{html.escape(d.date)}</td>"
+            f"<td><b>{html.escape(d.offer_type)}</b> {flag}</td>"
+            f"<td>{html.escape(d.offer_price)}</td>"
+            f'<td style="color:{color};font-weight:600">'
+            f"{html.escape(pct)}{'%' if pct else ''}</td>"
+            f'<td style="font-size:12px">{html.escape(d.premium_basis)}</td>'
+            f"<td>{size}</td>"
+            f'<td style="font-size:12px">{html.escape(d.checks)}</td>'
+            f"<td>{pdf}</td></tr>")
+        if d.notes:
+            body.append(f'<tr><td colspan="10" style="color:#a86400;'
+                        f'font-size:12px">{html.escape(d.notes)}</td></tr>')
+
+    return (f'<h2 style="margin:24px 0 8px">要约明细（{len(deals)} 单）</h2>'
+            f'<div class="wrap"><table><thead>{head}</thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>')
+
+
 def build_html(records: list[dict], *, rules_version: str = "",
-               source: str = "", notes: list[str] | None = None) -> str:
+               source: str = "", notes: list[str] | None = None,
+               deals=None) -> str:
     """生成自包含 HTML。records 是 screened.csv 读出来的行。"""
     rows = [_row_from_csv(r) for r in records]
     counts: dict[str, int] = {}
@@ -204,6 +250,8 @@ def build_html(records: list[dict], *, rules_version: str = "",
   　·　生成于 {datetime.now().strftime("%Y-%m-%d %H:%M")}
 </div>
 {warn}
+{_deals_table(deals or [])}
+<h2 style="margin:28px 0 8px">全部公告（筛查结果）</h2>
 <div class="cards">{''.join(cards)}</div>
 <div class="bar">
   <input id="q" type="search" placeholder="搜索代码 / 名称 / 标题 / 判定依据…">

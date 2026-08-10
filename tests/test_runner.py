@@ -33,6 +33,25 @@ def fake_records(n: int, day: str = "2026-06-01") -> list[dict]:
     } for i in range(n)]
 
 
+class FakeDoc:
+    """假 PDF：直接给页文本，不联网。"""
+
+    def __init__(self, pages, has_text=True):
+        self.pages, self.has_text_layer = pages, has_text
+
+
+def fake_open_pdf(url):
+    """留存桶里的公告都会走到这里 —— 给一份带完整要约字段的假公告。"""
+    return FakeDoc({1: "「要約價」 指 每股要約股份0.519港元",
+                    2: "價值比較每股要約價為每股0.519港元，較："
+                       "(i) 股份於最後交易日在聯交所所報收市價每股1.870港元折讓約72.25%；"
+                       "(ii) 股份於緊接最後交易日（包括該日）前三十(30)個連續交易日"
+                       "在聯交所所報平均收市價每股約1.168港元折讓約55.57%。"
+                       "最高與最低股價股份在聯交所所報最高收市價為每股1.980港元，"
+                       "及股份在聯交所所報最低收市價為每股0.200港元。"
+                       "要約人於要約項下須支付的最高現金代價約為5,440萬港元。"})
+
+
 def make_fetch(records, *, calls=None):
     def fetch(d1, d2, log, on_step, cancel_event):
         if calls is not None:
@@ -57,7 +76,7 @@ def _isolate(tmp_path, monkeypatch):
 
 def test_full_run_produces_every_artifact(_isolate):
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 7),
-                        fetch=make_fetch(fake_records(20)))
+                        open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(20)))
 
     assert result.ok
     assert result.fetched == 20
@@ -71,14 +90,14 @@ def test_full_run_produces_every_artifact(_isolate):
 def test_buckets_are_reported_back_to_the_ui(_isolate):
     """界面顶部要显示桶分布，所以 Result 必须带回来。"""
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
-                        fetch=make_fetch(fake_records(20)))
+                        open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(20)))
     assert sum(result.buckets.values()) == 20
     assert "retained" in result.buckets and "excluded" in result.buckets
 
 
 def test_report_html_is_self_contained(_isolate):
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
-                        fetch=make_fetch(fake_records(10)))
+                        open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(10)))
     html = result.report_path.read_text(encoding="utf-8")
     assert "<link" not in html and "cdn." not in html
 
@@ -86,7 +105,7 @@ def test_report_html_is_self_contained(_isolate):
 def test_dates_are_passed_through_untouched(_isolate):
     calls = []
     runner.run(dt.date(2026, 3, 4), dt.date(2026, 3, 9),
-               fetch=make_fetch(fake_records(3), calls=calls))
+               open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(3), calls=calls))
     assert calls == [(dt.date(2026, 3, 4), dt.date(2026, 3, 9))]
 
 
@@ -96,10 +115,10 @@ def test_log_and_step_callbacks_fire(_isolate):
     logs, steps = [], []
     runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
                on_log=logs.append, on_step=lambda i, f: steps.append((i, f)),
-               fetch=make_fetch(fake_records(5)))
+               open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(5)))
 
     assert logs, "界面靠 on_log 显示日志，一条都没有就是瞎的"
-    assert {i for i, _ in steps} == {0, 1, 2, 3}, "四个步骤都要报进度"
+    assert {i for i, _ in steps} == set(range(len(runner.STEPS))), "每个步骤都要报进度"
 
 
 def test_step_index_stays_in_range(_isolate):
@@ -107,7 +126,7 @@ def test_step_index_stays_in_range(_isolate):
     steps = []
     runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
                on_step=lambda i, f: steps.append(i),
-               fetch=make_fetch(fake_records(3)))
+               open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(3)))
     assert all(0 <= i < len(runner.STEPS) for i in steps)
 
 
@@ -117,7 +136,7 @@ def test_a_broken_callback_does_not_kill_the_run(_isolate):
         raise RuntimeError("界面没了")
 
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
-                        on_step=boom, fetch=make_fetch(fake_records(3)))
+                        on_step=boom, open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(3)))
     # on_step 抛异常会被 run() 的兜底捕获，但日志和诊断仍要留下
     assert result.log_path.exists()
     assert result.diagnostic_path is not None
@@ -128,7 +147,7 @@ def test_a_broken_callback_does_not_kill_the_run(_isolate):
 def test_zero_records_skips_downstream_but_still_writes_diagnostic(_isolate):
     """抓到 0 条不是崩溃，但也不能假装成功。"""
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
-                        fetch=make_fetch([]))
+                        open_pdf=fake_open_pdf, fetch=make_fetch([]))
     assert not result.ok
     assert result.fetched == 0
     assert result.report_path is None
@@ -140,7 +159,7 @@ def test_fetch_failure_is_captured_not_raised(_isolate):
     def boom(*_args):
         raise ConnectionError("连不上披露易")
 
-    result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1), fetch=boom)
+    result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1), fetch=boom, open_pdf=fake_open_pdf)
     assert not result.ok
     assert "ConnectionError" in result.error
     assert "连不上披露易" in result.error
@@ -159,7 +178,7 @@ def test_cancel_stops_the_run(_isolate):
         return fake_records(5)
 
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
-                        cancel_event=event, fetch=fetch)
+                        cancel_event=event, fetch=fetch, open_pdf=fake_open_pdf)
     assert not result.ok
     assert result.error == "用户停止"
 
@@ -168,7 +187,7 @@ def test_cancel_stops_the_run(_isolate):
 
 def test_diagnostic_contains_what_i_need_to_debug(_isolate):
     result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1),
-                        fetch=make_fetch(fake_records(8)))
+                        open_pdf=fake_open_pdf, fetch=make_fetch(fake_records(8)))
     text = result.diagnostic_path.read_text(encoding="utf-8")
     for needle in ("环境", "Python：", "抓到：8 条", "判定桶", "运行日志"):
         assert needle in text, f"诊断文件里缺 {needle}"
@@ -179,7 +198,7 @@ def test_diagnostic_written_even_when_fetch_dies(_isolate):
     def boom(*_args):
         raise TimeoutError("超时")
 
-    result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1), fetch=boom)
+    result = runner.run(dt.date(2026, 6, 1), dt.date(2026, 6, 1), fetch=boom, open_pdf=fake_open_pdf)
     assert result.diagnostic_path.exists()
     assert "TimeoutError" in result.diagnostic_path.read_text(encoding="utf-8")
 

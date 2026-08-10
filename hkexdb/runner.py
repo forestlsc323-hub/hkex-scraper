@@ -21,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-STEPS = ["抓取公告列表", "质控筛查", "生成网页", "打包诊断"]
+STEPS = ["抓取公告列表", "质控筛查", "抽取要约字段", "生成网页", "打包诊断"]
 
 
 class Cancelled(Exception):
@@ -29,10 +29,31 @@ class Cancelled(Exception):
 
 
 @dataclass
+class Deal:
+    """一单要约的最终结果 —— 这就是你要的那张表的一行。"""
+
+    code: str = ""
+    name: str = ""
+    date: str = ""
+    offer_type: str = ""
+    offer_price: str = ""
+    premium_pct: str = ""
+    premium_basis: str = ""
+    deal_size: str = ""
+    confidence: str = ""
+    checks: str = ""
+    pdf_url: str = ""
+    title: str = ""
+    notes: str = ""
+    evidence: dict = field(default_factory=dict)
+
+
+@dataclass
 class Result:
     ok: bool = False
     fetched: int = 0
     screened: int = 0
+    deals: list = field(default_factory=list)
     report_path: Path | None = None
     diagnostic_path: Path | None = None
     log_path: Path | None = None
@@ -89,8 +110,11 @@ def _write_listing(records: list[dict], log) -> Path:
 
 def run(date_from: dt.date, date_to: dt.date, *,
         on_log=None, on_step=None, cancel_event: threading.Event | None = None,
-        fetch=_fetch) -> Result:
-    """跑完整条流水线。`fetch` 可替换，方便离线测试。"""
+        fetch=_fetch, open_pdf=None) -> Result:
+    """跑完整条流水线。
+
+    `fetch` 和 `open_pdf` 都可替换 —— 测试里换成假的，就不会真的联网。
+    """
     lines: list[str] = []
 
     def log(text: str = "") -> None:
@@ -109,7 +133,7 @@ def run(date_from: dt.date, date_to: dt.date, *,
 
     try:
         step(0)
-        log(f"\n【1/4】{STEPS[0]}")
+        log(f"\n【1/5】{STEPS[0]}")
         records = fetch(date_from, date_to, log, step, cancel_event)
         result.fetched = len(records)
         csv_path = _write_listing(records, log)
@@ -117,63 +141,30 @@ def run(date_from: dt.date, date_to: dt.date, *,
 
         if records:
             step(1, 0.0)
-            log(f"\n【2/4】{STEPS[1]}")
-            from . import screening as S
-            rules = S.load_rules("screening_rules.yaml")
-            recs = [{
-                "row_id": r.get("NEWS_ID", f"r{i}"),
-                "date": (r.get("DATE_TIME") or "").split()[0],
-                "code": r.get("STOCK_CODE", ""),
-                "name": r.get("STOCK_NAME", ""),
-                "title": r.get("TITLE", ""),
-                "pdf_url": r.get("FILE_LINK", ""),
-            } for i, r in enumerate(records)]
-            report_obj = S.screen(recs, rules)
-            result.buckets = dict(report_obj.counts)
-            result.screened = len(recs)
-
-            scr_dir = ROOT / "data" / "screening"
-            scr_dir.mkdir(parents=True, exist_ok=True)
-            with (scr_dir / "screened.csv").open(
-                    "w", newline="", encoding="utf-8-sig") as fh:
-                w = csv.writer(fh)
-                w.writerow(["row_id", "date", "code", "name", "bucket", "species",
-                            "matched_exclude", "matched_retain", "manual_flags",
-                            "reasons", "title", "pdf_url", "rules_version"])
-                for r in recs:
-                    v = r["verdict"]
-                    w.writerow([r["row_id"], r["date"], r["code"], r["name"],
-                                v.bucket, v.species, "／".join(v.matched_exclude),
-                                "／".join(v.matched_retain), "；".join(v.manual_flags),
-                                "；".join(v.reasons), r["title"], r["pdf_url"],
-                                rules.version])
-            for bucket, n in sorted(result.buckets.items(), key=lambda kv: -kv[1]):
-                log(f"  {bucket}: {n}")
-            log(f"数量校验：{'平' if report_obj.reconciled else '不平 —— 需人工检查'}")
+            log(f"\n【2/5】{STEPS[1]}")
+            rows, rules = _screen(records, result, log)
             step(1, 1.0)
 
             step(2, 0.0)
-            log(f"\n【3/4】{STEPS[2]}")
-            from . import report as R
-            with (scr_dir / "screened.csv").open(encoding="utf-8-sig", newline="") as fh:
-                rows = list(csv.DictReader(fh))
-            manual = sum(1 for r in rows if r.get("bucket") == "manual")
-            notes = [f"人工复核桶有 {manual} 条，必须逐条看完再进抽取（铁律二）。"] \
-                if manual else []
-            result.report_path = R.write_report(
-                rows, scr_dir / "report.html",
-                rules_version=rules.version, source=str(csv_path), notes=notes)
-            log(f"已生成 {result.report_path.name}")
+            log(f"\n【3/5】{STEPS[2]}")
+            result.deals = _extract_deals(rows, log, step, cancel_event,
+                                          open_pdf=open_pdf)
+            _write_deals(result.deals, log)
             step(2, 1.0)
+
+            step(3, 0.0)
+            log(f"\n【4/5】{STEPS[3]}")
+            result.report_path = _write_report(rows, result, rules, csv_path, log)
+            step(3, 1.0)
             result.ok = True
         else:
-            log("\n抓到 0 条，跳过筛查与网页。")
+            log("\n抓到 0 条，后面几步跳过。")
 
-        step(3, 0.0)
-        log(f"\n【4/4】{STEPS[3]}")
+        step(4, 0.0)
+        log(f"\n【5/5】{STEPS[4]}")
         result.diagnostic_path = _write_diagnostic(lines, result)
         log(f"已生成 {result.diagnostic_path.name}")
-        step(3, 1.0)
+        step(4, 1.0)
 
     except Cancelled:
         log("\n已停止。")
@@ -191,6 +182,166 @@ def run(date_from: dt.date, date_to: dt.date, *,
     log_path.write_text("\n".join(lines), encoding="utf-8")
     result.log_path = log_path
     return result
+
+
+def _screen(records, result: Result, log):
+    """标题层筛选。返回 (行, 规则)。"""
+    from . import screening as S
+
+    rules = S.load_rules("screening_rules.yaml")
+    recs = [{
+        "row_id": r.get("NEWS_ID", f"r{i}"),
+        "date": (r.get("DATE_TIME") or "").split()[0],
+        "code": r.get("STOCK_CODE", ""),
+        "name": r.get("STOCK_NAME", ""),
+        "title": r.get("TITLE", ""),
+        "pdf_url": r.get("FILE_LINK", ""),
+    } for i, r in enumerate(records)]
+
+    report_obj = S.screen(recs, rules)
+    result.buckets = dict(report_obj.counts)
+    result.screened = len(recs)
+
+    scr_dir = ROOT / "data" / "screening"
+    scr_dir.mkdir(parents=True, exist_ok=True)
+    with (scr_dir / "screened.csv").open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(["row_id", "date", "code", "name", "bucket", "species",
+                    "matched_exclude", "matched_retain", "manual_flags",
+                    "reasons", "title", "pdf_url", "rules_version"])
+        for r in recs:
+            v = r["verdict"]
+            w.writerow([r["row_id"], r["date"], r["code"], r["name"], v.bucket,
+                        v.species, "／".join(v.matched_exclude),
+                        "／".join(v.matched_retain), "；".join(v.manual_flags),
+                        "；".join(v.reasons), r["title"], r["pdf_url"], rules.version])
+
+    for bucket, n in sorted(result.buckets.items(), key=lambda kv: -kv[1]):
+        log(f"  {bucket}: {n}")
+    log(f"数量校验：{'平' if report_obj.reconciled else '不平 —— 需人工检查'}")
+    return recs, rules
+
+
+def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal]:
+    """对留存桶里的公告逐份打开 PDF，抽要约字段。
+
+    这一步才产出你真正要的东西：要约类型、要约价、溢价率、交易规模。
+    留存桶通常只有十几条，所以逐份下载 PDF 是划算的。
+    """
+    from . import extractor, pdf_source, selectors, validators
+
+    targets = [r for r in rows if r["verdict"].bucket == "retained"]
+    if not targets:
+        log("  留存桶为空，没有要抽的公告。")
+        return []
+
+    log(f"  留存桶 {len(targets)} 条，逐份打开 PDF…")
+    cache = ROOT / "data" / "cache" / "pdf"
+    opener = open_pdf or (lambda url: pdf_source.open_pdf(url, cache))
+    deals: list[Deal] = []
+
+    for i, row in enumerate(targets, 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+        on_step(2, i / len(targets))
+
+        deal = Deal(code=row["code"], name=row["name"], date=row["date"],
+                    title=row["title"], pdf_url=pdf_source.full_url(row["pdf_url"]))
+        try:
+            doc = opener(deal.pdf_url)
+            if not doc.has_text_layer:
+                deal.notes = "扫描件无文本层，需 OCR 并人工复核"
+                deal.confidence = "low"
+                deals.append(deal)
+                log(f"    [{i}/{len(targets)}] {deal.code} 扫描件，跳过")
+                continue
+
+            ex = extractor.extract(row["title"], doc.pages)
+            deal.offer_type = ex.offer_type
+            deal.offer_price = ex.offer_price
+            deal.deal_size = ex.deal_size
+            deal.confidence = ex.confidence
+            deal.notes = "；".join(ex.notes)
+
+            comps = [{"anchor": c.anchor, "window": c.window, "label": c.label,
+                      "stated_pct": c.stated_pct,
+                      "stated_direction": c.stated_direction,
+                      "page": c.page, "quote": c.quote} for c in ex.comparisons]
+            pick = selectors.select_primary_premium(comps)
+            if pick:
+                deal.premium_pct = str(pick.signed_pct)
+                deal.premium_basis = pick.label
+
+            deal.checks = _run_checks(ex, validators)
+            deal.evidence = {
+                "要约类型": [ex.offer_type_evidence.page, ex.offer_type_evidence.quote],
+                "要约价": [ex.offer_price_evidence.page, ex.offer_price_evidence.quote],
+                "交易规模": [ex.deal_size_evidence.page, ex.deal_size_evidence.quote],
+                "溢价率": [pick.page, pick.source_quote] if pick else [0, ""],
+            }
+            log(f"    [{i}/{len(targets)}] {deal.code} {deal.name}　"
+                f"{deal.offer_type}　{deal.offer_price}　"
+                f"{deal.premium_pct}%　{deal.deal_size}")
+        except Exception as exc:
+            deal.notes = f"抽取失败：{type(exc).__name__}: {exc}"
+            deal.confidence = "low"
+            log(f"    [{i}/{len(targets)}] {deal.code} 失败：{exc}")
+        deals.append(deal)
+    return deals
+
+
+def _run_checks(ex, validators) -> str:
+    """跑 V4/V5/V6，把结果压成一行。铁律一：算术全在这里，不在抽取层。"""
+    from decimal import Decimal
+
+    if not ex.comparisons or not ex.offer_price:
+        return ""
+    offer = Decimal(ex.offer_price)
+    comparisons = [validators.PriceComparison(
+        label=c.label, benchmark=Decimal(c.benchmark),
+        benchmark_decimals=c.benchmark_decimals,
+        benchmark_is_exact=c.benchmark_is_exact,
+        stated_pct=Decimal(c.stated_pct), stated_direction=c.stated_direction,
+        page=c.page, source_quote=c.quote) for c in ex.comparisons]
+
+    low = Decimal(ex.six_month_low) if ex.six_month_low else Decimal(0)
+    high = Decimal(ex.six_month_high) if ex.six_month_high else Decimal("9" * 12)
+    nonmarket = frozenset(c.label for c in ex.comparisons if c.anchor == "nav")
+    findings = validators.run_price_comparisons(offer, comparisons, low, high,
+                                                nonmarket_labels=nonmarket)
+    failed = [f"{f.code}:{f.subject}" for f in findings if not f.passed]
+    return "全部通过" if not failed else "未通过 " + "；".join(failed[:3])
+
+
+def _write_deals(deals: list[Deal], log) -> None:
+    if not deals:
+        return
+    out = ROOT / "data" / "deals.csv"
+    with out.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(["股票代码", "公司名称", "公告日期", "要约类型", "要约价(HKD)",
+                    "溢价率(%)", "溢价率基准", "交易规模(HKD)", "置信度",
+                    "复算校验", "备注", "公告标题", "PDF链接"])
+        for d in deals:
+            w.writerow([d.code, d.name, d.date, d.offer_type, d.offer_price,
+                        d.premium_pct, d.premium_basis, d.deal_size,
+                        d.confidence, d.checks, d.notes, d.title, d.pdf_url])
+    log(f"  已保存 {out.name}（{len(deals)} 单）")
+
+
+def _write_report(rows, result: Result, rules, csv_path, log) -> Path:
+    from . import report as R
+
+    scr_dir = ROOT / "data" / "screening"
+    with (scr_dir / "screened.csv").open(encoding="utf-8-sig", newline="") as fh:
+        table = list(csv.DictReader(fh))
+    manual = sum(1 for r in table if r.get("bucket") == "manual")
+    notes = [f"人工复核桶有 {manual} 条，须逐条看完（铁律二）。"] if manual else []
+    path = R.write_report(table, scr_dir / "report.html",
+                          rules_version=rules.version, source=str(csv_path),
+                          notes=notes, deals=result.deals)
+    log(f"已生成 {path.name}")
+    return path
 
 
 def _write_diagnostic(lines: list[str], result: Result) -> Path:
