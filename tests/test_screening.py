@@ -510,3 +510,50 @@ def test_but_bundled_into_a_t0_joint_announcement_it_is_harmless():
     v = S.classify_title(title, RULES)
     assert v.is_bundled
     assert v.bucket == S.RETAINED
+
+
+# ================================================================
+# ★ 要约类型短语＝T0 签名（漏检最大的单一来源）
+# ================================================================
+
+@pytest.mark.parametrize("title", [
+    "聯合公告 - 強制性無條件現金要約",
+    "聯合公告 (1) 買賣協議 及 (2) 強制性無條件現金要約",
+    "自願性有條件全面現金要約",
+    "聯合公告 有關強制性全面現金要約",
+    "部分收購要約",
+    "聯合公告 - 自願性現金部分要約",
+])
+def test_a_bare_offer_type_title_is_a_t0_signature(title):
+    """最常见的 T0 标题就是这个形态：只有类型短语，别的什么都没有。
+
+    它没有「訂立/提出/作出」，没有「可能」，没有「復牌」—— 原来那几条
+    保留正则一条都命中不了，于是掉进 1923 条的人工桶里等于没人看。
+    实测年初至今，人工核出来的 24 单里 7 单就是这么漏的。
+    """
+    assert bucket(title) == S.RETAINED, f"T0 签名没留住：{title}"
+
+
+@pytest.mark.parametrize("title", [
+    "強制性無條件現金要約之要約結果",
+    "寄發綜合文件 - 強制性無條件現金要約",
+    "強制性無條件現金要約之接納程度",
+    "有關強制性無條件現金要約之每月最新資料",
+    "強制性無條件現金要約已成為無條件",
+    "有關強制性無條件現金要約之獨立財務顧問意見",
+])
+def test_type_phrase_retains_t0_but_not_followups(title):
+    """加了类型短语之后最大的风险是把后续公告一起留住。
+
+    保住不出事的是**顺序**：排除层先跑，这些标题在第一步就被灰掉，
+    根本到不了保留层。这条测试钉死的就是这个前后关系。
+    """
+    assert bucket(title) == S.EXCLUDED, f"后续公告被误留：{title}"
+
+
+def test_the_type_phrase_does_not_drag_in_market_noise():
+    """留存桶每多一条就多下一份 PDF，不能因为放宽而把噪音带进来。"""
+    for title in ["翌日披露報表", "盈利警告", "董事會會議日期",
+                  "須予披露交易 - 收購目標公司股權", "主要交易 - 收購物業",
+                  "恢復買賣", "復牌"]:
+        assert bucket(title) != S.RETAINED, title

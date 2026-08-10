@@ -152,6 +152,16 @@ def _speed_settings() -> tuple[int, int, str, list[str]]:
     return step, workers, mode, keywords
 
 
+def _keep_raw_files() -> bool:
+    """要不要把公告原件在本地留一份。默认留 —— 那是审计链的底座。"""
+    try:
+        import yaml
+        cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+        return bool((cfg.get("listing", {}) or {}).get("keep_raw_files", True))
+    except Exception:
+        return True
+
+
 def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
     """按月切段。照抄你 asso 那份文件 search_by_category 的做法，
     连理由都一样：「类别筛选后记录数远小于上限，无需按天」。
@@ -687,9 +697,18 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
         client = HKEXClient()
         limiter = pdf_source.RateLimiter(vendor_config.SLEEP_BETWEEN_REQUESTS)
 
+        keep = _keep_raw_files()
+        if not keep:
+            log("  （config.yaml 里 keep_raw_files=false：原件用完即弃，不留副本）")
+
         def opener(url):
-            return pdf_source.open_pdf(url, cache, session=client.session,
-                                       limiter=limiter)
+            doc = pdf_source.open_pdf(url, cache, session=client.session,
+                                      limiter=limiter)
+            if not keep:
+                # 用完即弃 —— asso 那份客户端的 download_pdf 就是这么做的
+                # （`return r.content`，从不落盘）。省地方，但审计追溯断了。
+                pdf_source.discard_cached(url, cache)
+            return doc
     else:
         opener = open_pdf
 

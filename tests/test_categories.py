@@ -123,3 +123,31 @@ def test_human_size_is_readable():
     assert runner.human_size(1500).endswith("KB")
     assert runner.human_size(90 * 1024 * 1024).startswith("90")
     assert runner.human_size(90 * 1024 * 1024).endswith("MB")
+
+
+def test_keep_raw_defaults_to_true(tmp_path, monkeypatch):
+    """默认留副本 —— 那是「原始文件永久保留、幂等重跑」的底座。"""
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    assert runner._keep_raw_files() is True
+
+
+def test_keep_raw_can_be_turned_off(tmp_path, monkeypatch):
+    """想省地方就关掉，跟 asso 的 download_pdf 一样用完即弃。"""
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "listing:\n  keep_raw_files: false\n", encoding="utf-8")
+    assert runner._keep_raw_files() is False
+
+
+def test_discarding_a_copy_leaves_the_rest_alone(tmp_path):
+    from hkexdb import pdf_source
+    cache = tmp_path / "pdf"
+    cache.mkdir()
+    a, b = "https://x/a.pdf", "https://x/b.pdf"
+    for url in (a, b):
+        pdf_source._cache_path(cache, url).write_bytes(b"%PDF-x")
+
+    assert pdf_source.discard_cached(a, cache) is True
+    assert not pdf_source._cache_path(cache, a).exists()
+    assert pdf_source._cache_path(cache, b).exists()
+    assert pdf_source.discard_cached(a, cache) is False   # 删过了不报错

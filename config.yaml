@@ -87,6 +87,19 @@ listing:
   # NEWS_ID，把关键词模式漏掉的列出来。换季度、换年份前跑一次。
   mode: "keyword"
 
+  # 抓回来的公告原件要不要在本地留一份副本。
+  #
+  #   true （默认）—— 留。这是你工程要求里那条「原始文件永久保留，
+  #                    解析与抽取幂等可重跑」：重跑不用重下，而且公告
+  #                    被替换或撤下之后，还能复现当初抽出的数字。
+  #                    实测每份约 700 KB：年初至今约 90 MB。
+  #   false        —— 不留，用完即弃。asso 那份客户端的 download_pdf
+  #                    就是这么做的（`return r.content`，从不落盘）。
+  #                    省地方，但重跑要全部重下，审计追溯也断了。
+  #
+  # 界面「抓取」页有「原件副本…」按钮，随时能看占多少、一键删。
+  keep_raw_files: true
+
   # 关键词取并集，命中任一即收。
   # screening_rules.yaml 里那六条已核实的真实 T0 标题必须条条命中至少
   # 一个，测试 test_fast_mode_keywords_cover_every_verified_t0_title 守着。

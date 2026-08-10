@@ -187,6 +187,16 @@ def fetch_bytes(url: str, cache_dir: Path, *,
     return content, False
 
 
+def discard_cached(url: str, cache_dir: Path) -> bool:
+    """删掉某个链接的本地副本。用完即弃模式下由调用方在解析完成后调用。"""
+    path = _cache_path(cache_dir, url)
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------- HTML 公告
 
 # 换页符：披露易的 .htm 公告用它分页，正好对应 PDF 的页码
