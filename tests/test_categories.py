@@ -125,18 +125,21 @@ def test_human_size_is_readable():
     assert runner.human_size(90 * 1024 * 1024).endswith("MB")
 
 
-def test_keep_raw_defaults_to_true(tmp_path, monkeypatch):
-    """默认留副本 —— 那是「原始文件永久保留、幂等重跑」的底座。"""
+def test_keep_raw_defaults_to_off(tmp_path, monkeypatch):
+    """默认用完即弃，跟 asso 的 download_pdf 一样（`return r.content`）。
+
+    审计链靠的不是 PDF 本身，而是「每个数字出自第几页哪句话」——
+    那些引文存在 store/evidence.json 里，永远留着。
+    """
     monkeypatch.setattr(runner, "ROOT", tmp_path)
-    assert runner._keep_raw_files() is True
+    assert runner._keep_raw_files() is False
 
 
-def test_keep_raw_can_be_turned_off(tmp_path, monkeypatch):
-    """想省地方就关掉，跟 asso 的 download_pdf 一样用完即弃。"""
+def test_keep_raw_can_be_turned_on(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     (tmp_path / "config.yaml").write_text(
-        "listing:\n  keep_raw_files: false\n", encoding="utf-8")
-    assert runner._keep_raw_files() is False
+        "listing:\n  keep_raw_files: true\n", encoding="utf-8")
+    assert runner._keep_raw_files() is True
 
 
 def test_discarding_a_copy_leaves_the_rest_alone(tmp_path):

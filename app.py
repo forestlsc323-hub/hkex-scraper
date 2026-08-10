@@ -195,9 +195,19 @@ def main() -> int:
         refresh_tree()
 
     def load_deals() -> None:
-        dstate["rows"] = dealsview.load_rows(ROOT / "data" / "deals.csv")
-        dstate["evidence"] = dealsview.load_evidence(
-            ROOT / "data" / "deals_evidence.json")
+        """优先读跨次运行的存档 —— 那是一个会长大的库，本次跑的只是其中一段。
+
+        存档为空（第一次用）才退回单次产物 data/deals.csv。
+        """
+        from hkexdb import store
+        archived = store.load_deals(ROOT)
+        if archived:
+            dstate["rows"] = list(archived.values())
+            dstate["evidence"] = store.load_evidence(ROOT)
+        else:
+            dstate["rows"] = dealsview.load_rows(ROOT / "data" / "deals.csv")
+            dstate["evidence"] = dealsview.load_evidence(
+                ROOT / "data" / "deals_evidence.json")
         refresh_tree()
 
     def _selected() -> dict:

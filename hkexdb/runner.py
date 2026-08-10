@@ -78,6 +78,7 @@ def mark_mirror_filings(deals: list) -> int:
 class Deal:
     """一单要约的最终结果 —— 这就是你要的那张表的一行。"""
 
+    news_id: str = ""                 # 披露易的公告号，存档的主键
     # 正文层判定：标题层留下来的，未必真是要约（实跑 15 条里只有 2 条是）
     verdict: str = "unclear"
     verdict_reason: str = ""
@@ -157,9 +158,9 @@ def _keep_raw_files() -> bool:
     try:
         import yaml
         cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-        return bool((cfg.get("listing", {}) or {}).get("keep_raw_files", True))
+        return bool((cfg.get("listing", {}) or {}).get("keep_raw_files", False))
     except Exception:
-        return True
+        return False
 
 
 def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
@@ -489,7 +490,10 @@ def score_against_answer_key(on_log=None) -> str:
         if on_log:
             on_log(str(text))
 
-    got = dealsview.load_rows(ROOT / "data" / "deals.csv")
+    from . import store
+    archived = store.load_deals(ROOT)
+    got = (list(archived.values()) if archived
+           else dealsview.load_rows(ROOT / "data" / "deals.csv"))
     key_path = ROOT / "data" / "answer_key.csv"
     if not key_path.exists():
         tpl = scoring.write_template(DEAL_COLUMNS,
@@ -514,6 +518,59 @@ def score_against_answer_key(on_log=None) -> str:
     out = ROOT / "准确率报告.txt"
     out.write_text("\n".join(lines), encoding="utf-8")
     return str(out)
+
+
+def _fetch_incrementally(d1: dt.date, d2: dt.date, log, on_step,
+                         cancel_event, fetch) -> list[dict]:
+    """只抓存档里还没有的那些天，其余直接从存档取。
+
+    你说的那个用法：抓过 2026 全年之后再要 2025-01-01 到今天，
+    2026 那段一个请求都不发，只补 2025 和最近这几天。
+
+    存档按「抓取方式＋关键词」分开记覆盖范围 —— 关键词模式抓过的
+    日子不等于全量模式也抓过，口径不同混在一起会造成静默漏检。
+    """
+    from . import store
+
+    _step, _workers, mode, keywords = _speed_settings()
+    key = store.coverage_key(mode, keywords)
+    missing = store.missing_days(ROOT, d1, d2, key)
+    total_days = (d2 - d1).days + 1
+
+    if not missing:
+        rows = store.listing_between(ROOT, d1, d2)
+        log(f"这段日期（{total_days} 天）存档里全都有，一个请求都不用发。")
+        log(f"从存档取回 {len(rows)} 条公告。")
+        log("（想强制重抓，把 data/store/coverage.json 删掉再跑）")
+        on_step(0, 1.0)
+        return rows
+
+    ranges = store.to_ranges(missing)
+    cached = total_days - len(missing)
+    if cached:
+        log(f"这段共 {total_days} 天，其中 {cached} 天存档里已有，"
+            f"只需补抓 {len(missing)} 天（{len(ranges)} 段）。")
+    else:
+        log(f"这段 {total_days} 天存档里都没有，全抓。")
+
+    fetched: list[dict] = []
+    for i, (r1, r2) in enumerate(ranges, 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+        log(f"\n补抓第 {i}/{len(ranges)} 段：{r1} ~ {r2}")
+        fetched += fetch(r1, r2, log,
+                         lambda _i, f, i=i: on_step(0, (i - 1 + f) / len(ranges)),
+                         cancel_event)
+        # 一段抓完就记一段 —— 中途失败也不用从头再来
+        store.mark_covered(ROOT, r1, r2, key)
+
+    added, total = store.merge_listing(ROOT, fetched)
+    log(f"\n新增 {added} 条公告进存档，存档现有 {total} 条。")
+
+    rows = store.listing_between(ROOT, d1, d2)
+    log(f"本次范围内共 {len(rows)} 条（存档 + 新抓）。")
+    on_step(0, 1.0)
+    return rows
 
 
 def _write_listing(records: list[dict], log) -> Path:
@@ -563,7 +620,8 @@ def run(date_from: dt.date, date_to: dt.date, *,
     try:
         step(0)
         log(f"\n【1/5】{STEPS[0]}")
-        records = fetch(date_from, date_to, log, step, cancel_event)
+        records = _fetch_incrementally(date_from, date_to, log, step,
+                                       cancel_event, fetch)
         result.fetched = len(records)
         csv_path = _write_listing(records, log)
         log(f"抓到 {len(records)} 条")
@@ -712,7 +770,28 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
     else:
         opener = open_pdf
 
-    log(f"  留存桶 {len(targets)} 条，{workers} 路并发打开 PDF"
+    # 存档里已经抽过、而且抽取器版本一致的，直接复用 —— PDF 都不用打开。
+    # 版本对不上就重抽：我改了正则却拿旧结果冒充新结果，表面一切正常，
+    # 数字却是旧逻辑抽的，那正是铁律二说的静默污染。
+    from . import store
+    archived = store.load_deals(ROOT)
+    reused_rows, todo = [], []
+    for row in targets:
+        old_row = archived.get(row["row_id"])
+        if old_row and store.reusable(old_row):
+            reused_rows.append(old_row)
+        else:
+            todo.append(row)
+
+    if reused_rows:
+        log(f"  留存桶 {len(targets)} 条，其中 {len(reused_rows)} 条存档里已抽过"
+            f"（版本 {store.EXTRACTOR_VERSION}），直接复用。")
+    if not todo:
+        log("  没有需要新抽的公告，一份 PDF 都不用下。")
+        return [_deal_from_row(r) for r in reused_rows]
+
+    targets = todo
+    log(f"  需要新抽 {len(targets)} 条，{workers} 路并发打开 PDF"
         f"（共用会话与限速闸，失败自动重试）…")
 
     done = [0]
@@ -747,6 +826,18 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
 
+    # 新抽的并进存档，下次同一段日期就不用再下 PDF 了
+    fresh = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
+              **dict(zip(DEAL_COLUMNS, _deal_row(d)))}
+             for d in deals if d.news_id]
+    if fresh:
+        total = store.merge_deals(ROOT, fresh, DEAL_COLUMNS)
+        store.merge_evidence(ROOT, {d.pdf_url: d.evidence
+                                    for d in deals if d.pdf_url and d.evidence})
+        log(f"  已存档 {len(fresh)} 条抽取结果，存档现有 {total} 条。")
+
+    deals = [_deal_from_row(r) for r in reused_rows] + deals
+
     mirrors = mark_mirror_filings(deals)
     if mirrors:
         log(f"  发现 {mirrors} 条镜像归档（要约方自己那一边），已标出不重复计数")
@@ -756,6 +847,48 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
         log(f"  公告原件副本：{n} 份，占 {human_size(size)}"
             f"（{CACHE_DIR}，用于幂等重跑与审计追溯）")
     return deals
+
+
+# 列名 → Deal 上的字段名。溢价梯子那几列不在这里 ——
+# 它们由 premium_ladder 展开，单独还原。
+#
+# ⚠️ 这张表和 _deal_row 必须一一对应，任何一边加了列而另一边忘了，
+# 存档读回来就会静默丢字段。test_a_deal_survives_a_round_trip_through_the_store
+# 拿一个字段全填满的 Deal 走一遍存盘再读回，逐字段比对，专门守这个。
+_FROM_ROW = {
+    "判定理由": "verdict_reason",
+    "交易性质(待确认)": "nature", "性质依据": "nature_reasons",
+    "公告日期": "date", "股票代码": "code", "板块": "board",
+    "受要约方": "name", "受要约方全称": "target_full",
+    "要约方": "offeror", "要约方财务顾问": "offeror_fa",
+    "要约类型": "offer_type", "条件": "is_conditional",
+    "对价形式": "consideration",
+    "要约价(HKD)": "offer_price", "主值溢价率(%)": "premium_pct",
+    "主值口径": "premium_basis",
+    "六个月最低": "six_month_low", "六个月最高": "six_month_high",
+    "泄露涨幅(%)": "runup_pct",
+    "每股NAV": "nav_per_share", "市净率P/B": "pb_ratio",
+    "隐含股权价值(HKD)": "implied_equity_value", "已发行股数": "total_shares",
+    "交易规模(HKD)": "deal_size", "上市地位意向": "listing_intent",
+    "停牌前最后交易日": "last_trading_day",
+    "置信度": "confidence", "复算校验": "checks", "备注": "notes",
+    "公告标题": "title", "PDF链接": "pdf_url",
+}
+
+_LABEL_TO_VERDICT = {v: k for k, v in VERDICT_LABEL.items()}
+
+
+def _deal_from_row(row: dict) -> Deal:
+    """存档里的一行 → Deal。存档复用这条路，所以它必须是无损的。"""
+    deal = Deal(news_id=str(row.get("NEWS_ID", "")))
+    for col, attr in _FROM_ROW.items():
+        if col in row:
+            setattr(deal, attr, row[col] or "")
+    deal.verdict = _LABEL_TO_VERDICT.get(row.get("判定", ""), "unclear")
+    deal.premium_ladder = {
+        col[1:-len("(%)")]: row[col] for col in row
+        if col.startswith("较") and col.endswith("(%)") and str(row[col]).strip()}
+    return deal
 
 
 def _extract_one(row, opener, cancel_event, extractor, pdf_source,
@@ -769,7 +902,8 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
     link = row["pdf_url"] or ""
     board = "GEM" if "/gem/" in link.lower() else (
         "主板" if "/sehk/" in link.lower() else "")
-    deal = Deal(code=row["code"], name=row["name"], date=row["date"],
+    deal = Deal(news_id=row.get("row_id", ""),
+                code=row["code"], name=row["name"], date=row["date"],
                 board=board,
                 title=row["title"], pdf_url=pdf_source.full_url(row["pdf_url"]))
     if True:
