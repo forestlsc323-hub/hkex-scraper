@@ -162,9 +162,16 @@ def main() -> int:
         if result.error:
             status.configure(text=f"结束：{result.error}")
         else:
-            parts = [f"抓到 {result.fetched} 条"]
+            # 用户要的是「几单要约」，公告条数只是过程量 —— 所以它排第一
+            with_price = sum(1 for d in result.deals if d.offer_price)
+            parts = [f"抓到要约 {len(result.deals)} 单（其中 {with_price} 单抽到要约价）",
+                     f"公告 {result.fetched} 条"]
+            names = {"retained": "留存", "manual": "待人工看", "excluded": "已灰",
+                     "special": "特殊品种", "superseded": "被取代",
+                     "irrelevant": "题材无关"}
             if result.buckets:
-                parts.append("　".join(f"{k} {v}" for k, v in result.buckets.items()))
+                parts.append("　".join(f"{names.get(k, k)} {v}"
+                                       for k, v in result.buckets.items()))
             status.configure(text="完成　" + "　·　".join(parts))
         if result.report_path:
             btn_report.configure(state="normal")
