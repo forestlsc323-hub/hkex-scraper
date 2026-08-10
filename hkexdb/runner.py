@@ -59,6 +59,7 @@ class Result:
     log_path: Path | None = None
     error: str = ""
     buckets: dict = field(default_factory=dict)
+    qc_notes: list = field(default_factory=list)
 
 
 def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
@@ -200,6 +201,7 @@ def _screen(records, result: Result, log):
 
     report_obj = S.screen(recs, rules)
     result.buckets = dict(report_obj.counts)
+    result.qc_notes = list(report_obj.notes)
     result.screened = len(recs)
 
     scr_dir = ROOT / "data" / "screening"
@@ -216,9 +218,14 @@ def _screen(records, result: Result, log):
                         "／".join(v.matched_retain), "；".join(v.manual_flags),
                         "；".join(v.reasons), r["title"], r["pdf_url"], rules.version])
 
+    labels = {S.RETAINED: "留存（进抽取）", S.MANUAL: "人工复核",
+              S.EXCLUDED: "已灰（后续/程序公告）", S.SPECIAL: "特殊品种",
+              S.SUPERSEDED: "被取代", S.IRRELEVANT: "题材无关"}
     for bucket, n in sorted(result.buckets.items(), key=lambda kv: -kv[1]):
-        log(f"  {bucket}: {n}")
+        log(f"  {labels.get(bucket, bucket)}: {n}")
     log(f"数量校验：{'平' if report_obj.reconciled else '不平 —— 需人工检查'}")
+    for note in report_obj.notes:
+        log(f"  · {note}")
     return recs, rules
 
 
@@ -337,6 +344,7 @@ def _write_report(rows, result: Result, rules, csv_path, log) -> Path:
         table = list(csv.DictReader(fh))
     manual = sum(1 for r in table if r.get("bucket") == "manual")
     notes = [f"人工复核桶有 {manual} 条，须逐条看完（铁律二）。"] if manual else []
+    notes += list(result.qc_notes)
     path = R.write_report(table, scr_dir / "report.html",
                           rules_version=rules.version, source=str(csv_path),
                           notes=notes, deals=result.deals)

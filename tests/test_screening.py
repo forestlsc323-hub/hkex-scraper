@@ -325,7 +325,8 @@ def test_screen_produces_all_four_layers():
     assert report.counts[S.RETAINED] >= 3      # 三单真实 T0 都留住了
     assert report.counts[S.EXCLUDED] >= 4
     assert report.counts[S.SPECIAL] == 1
-    assert report.counts[S.MANUAL] >= 1        # 「董事會會議日期」两层都没中
+    # 「董事會會議日期」两层都没中，且不含任何要约题材词 → 判为无关，不占人工桶
+    assert report.counts[S.IRRELEVANT] == 1
 
 
 def test_contradiction_check_catches_a_possible_misfire():
@@ -341,17 +342,79 @@ def test_contradiction_check_catches_a_possible_misfire():
     assert any("訂立" in t for t in titles)
 
 
-def test_count_reconciliation_fails_loudly_on_missing_code():
-    """底部数量校验：记录数＝代号数＝简称数＝标题行数＝判定桶合计。
+def test_missing_code_is_counted_and_reported_but_does_not_block():
+    """缺代号要数出来、写进报告，但不再判「不平」。
 
-    归属继承列是防错位的命根子 —— 少一个代号就要立刻报不平。
+    手册那条等式针对的是手工表：代号靠合并单元格向下继承，断一格就是
+    行错位。披露易接口没有继承可断，却**本来就**会返回没有股票代号的行
+    （交易所自身公告等）。真跑全市场时这条等式恒不成立，
+    「数量校验：不平」每次都亮 —— 永远在响的警报等于没有警报。
     """
     records = _sample_records()
-    records[0]["code"] = ""            # 模拟归属继承断了
-    S.screen(records, RULES)
+    records[0]["code"] = ""
+    report = S.screen(records, RULES)
     counts, ok = S.reconcile_counts(records)
-    assert not ok
+
+    assert ok, "缺代号不该阻断流程"
     assert counts["有代号数"] == counts["记录数"] - 1
+    assert any("没有股票代号" in n for n in report.notes), "但必须摆在报告里"
+
+
+def test_reconciliation_still_fails_when_a_row_loses_its_verdict():
+    """真正该报警的是丢行／漏判 —— 那条硬校验必须还在。"""
+    records = _sample_records()
+    S.screen(records, RULES)
+    records.append({"row_id": "rX", "date": "2026-06-15", "code": "9999",
+                    "name": "漏判公司", "title": ""})
+    records[-1]["verdict"] = S.Verdict(bucket=S.MANUAL)
+    _, ok = S.reconcile_counts(records)
+    assert not ok, "有记录没有标题，说明列表层丢了东西"
+
+
+# ---------------------------------------------------------------- 相关性闸门
+
+def test_market_noise_goes_to_irrelevant_not_to_the_manual_pile():
+    """真跑一次 2026 年至今是 6993 条，人工桶曾经是 6740 条（96%）。
+
+    人工桶里 96% 是盈利警告、翌日披露報表这种和要约毫无关系的东西，
+    等于把人工桶废掉 —— 该看的十几条全淹了。
+    """
+    noise = ["翌日披露報表", "盈利警告", "股份發行人的證券變動月報表",
+             "更改公司秘書", "須予披露交易", "末期業績公告"]
+    for title in noise:
+        v = S.classify_title(title, RULES)
+        assert v.bucket == S.IRRELEVANT, f"「{title}」不该进人工桶：{v.reasons}"
+
+
+def test_offerish_titles_still_reach_the_manual_pile():
+    """闸门只关无关的。沾了要约/收购的边，仍旧交人工看。"""
+    for title in ["有關收購事項的最新情況", "股東權益變動", "控制權可能變動之公告"]:
+        v = S.classify_title(title, RULES)
+        assert v.bucket == S.MANUAL, f"「{title}」被误判成无关：{v.reasons}"
+
+
+def test_the_gate_never_touches_a_verified_t0_title():
+    """闸门自己就是漏检源，所以拿已核实的真实 T0 标题机器反测。"""
+    for title in RULES.t0_corpus:
+        v = S.classify_title(title, RULES)
+        assert v.bucket != S.IRRELEVANT, f"真实 T0 被闸门灰掉：{title[:60]}"
+
+
+def test_irrelevant_rows_are_soft_deleted_and_still_audited():
+    """铁律：软删除。无关行照样留着、照样进矛盾行自检与随机抽查。"""
+    v = S.classify_title("翌日披露報表", RULES)
+    assert v.is_grey and v.reasons
+
+
+def test_audit_samples_both_strata_so_noise_cannot_crowd_out_misfires():
+    """irrelevant 动辄几千条，混在一起抽会把最可能误杀的那几十条挤没。"""
+    records = [{"row_id": f"n{i}", "date": "2026-06-15", "code": "0001",
+                "name": "甲", "title": "翌日披露報表"} for i in range(500)]
+    records += [{"row_id": f"e{i}", "date": "2026-06-15", "code": "0002",
+                 "name": "乙", "title": "寄發綜合文件"} for i in range(3)]
+    S.screen(records, RULES)
+    picked = {r["verdict"].bucket for r in S.random_audit(records, RULES)}
+    assert S.EXCLUDED in picked and S.IRRELEVANT in picked
 
 
 def test_random_audit_is_reproducible():

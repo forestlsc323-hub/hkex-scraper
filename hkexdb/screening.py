@@ -24,8 +24,9 @@ from .config import resolve_file
 EXCLUDED = "excluded"        # 灰：后续/程序公告
 RETAINED = "retained"        # 留：命中 T0 特征
 SPECIAL = "special"          # 非三种要约的品种，剔除但可分辨
-MANUAL = "manual"            # 两层都没命中，逐条人工看
+MANUAL = "manual"            # 两层都没命中、但题材相关，逐条人工看
 SUPERSEDED = "superseded"    # 被取代的旧标题行（坑⑫）
+IRRELEVANT = "irrelevant"    # 标题与要约/收购毫无关系，不属于本课题
 
 # 多编号联合公告的编号形式："(1)" "（1）" "(i)" 等
 _NUMBERED = re.compile(r"[(（]\s*(?:\d{1,2}|[ivxIVX]{1,4})\s*[)）]")
@@ -47,6 +48,7 @@ class Rules:
     retain_terms: list[str]
     retain_patterns: list[tuple[re.Pattern, str]]
     special_species: list[dict]
+    domain_terms: list[str]
     manual_flags: list[dict]
     superseded_marker: str
     replacement_marker: str
@@ -62,7 +64,15 @@ class Rules:
            「要約結果」含「要約」但合法，裸词「強制」才是地雷（坑②）。
         2) 语料反测 —— 排除词不得命中任何一条已核实的真实 T0 标题。
            这是「词表按真实数据迭代」的机器化版本，比人肉护栏可靠得多。
+        3) 相关性闸门反测 —— 每一条真实 T0 标题都必须命中至少一个
+           题材词，否则闸门自己会变成漏检源。
         """
+        for t0 in self.t0_corpus:
+            if self.domain_terms and not any(t in t0 for t in self.domain_terms):
+                raise RuleError(
+                    "题材词表覆盖不到已核实的真实 T0 标题，闸门会把它判成"
+                    f"「与要约无关」：\n  {t0[:80]}…")
+
         for term in self.exclude_terms:
             if term in self.never_exclude:
                 raise RuleError(
@@ -96,6 +106,7 @@ def load_rules(path: str | Path = "screening_rules.yaml") -> Rules:
         retain_patterns=[(re.compile(p["pattern"]), p["label"])
                          for p in raw.get("retain_patterns", [])],
         special_species=raw.get("special_species", []),
+        domain_terms=raw.get("offer_domain_terms", []),
         manual_flags=raw.get("manual_review_flags", []),
         superseded_marker=markers.get("superseded", ""),
         replacement_marker=markers.get("replacement", ""),
@@ -122,7 +133,7 @@ class Verdict:
     @property
     def is_grey(self) -> bool:
         """软删除 —— 灰掉但不删除，还要参与矛盾行自检。"""
-        return self.bucket in (EXCLUDED, SPECIAL, SUPERSEDED)
+        return self.bucket in (EXCLUDED, SPECIAL, SUPERSEDED, IRRELEVANT)
 
 
 def is_bundled_announcement(title: str) -> bool:
@@ -200,8 +211,20 @@ def classify_title(title: str, rules: Rules) -> Verdict:
         v.reasons.append(f"保留层命中 {v.matched_retain}")
         return v
 
-    # 第三步：两层都没命中 → 逐条人工看
-    v.reasons.append("排除层与保留层均未命中，转人工复核（手册第三步）")
+    # 第三步：两层都没命中 → 看题材相关性再分流
+    #
+    # 手册的输入是「已经筛过一遍的要约相关表」，所以第三步直接转人工。
+    # 我们的输入是全市场公告，得先把「盈利警告」「翌日披露報表」这类
+    # 与要约毫无关系的分出去，否则人工桶会被 96% 的噪音淹掉。
+    hits = [t for t in rules.domain_terms if t in title]
+    if rules.domain_terms and not hits:
+        v.bucket = IRRELEVANT
+        v.reasons.append("标题不含任何要约/收购题材词，判为与本课题无关")
+        return v
+
+    v.reasons.append(
+        f"排除层与保留层均未命中，但含题材词 {hits}，转人工复核（手册第三步）"
+        if hits else "排除层与保留层均未命中，转人工复核（手册第三步）")
     return v
 
 
@@ -307,30 +330,52 @@ def contradiction_check(records: list[dict], rules: Rules) -> list[dict]:
 
 
 def reconcile_counts(records: list[dict]) -> tuple[dict[str, int], bool]:
-    """底部数量校验：记录数＝代号数＝简称数＝标题行数＝判定桶合计。
+    """底部数量校验：每条记录都有归属，一条都不许丢。
 
-    代号/简称按「非空计数」而非「去重计数」—— 手册要的是
-    每条记录都有归属，不是有多少家不同公司。
+    手册原文要求「记录数＝代号数＝简称数＝标题行数＝判定桶合计」，
+    那是针对手工表的：代号靠合并单元格向下继承，少一个代号就说明
+    继承断了、行错位了，必须立刻停。
+
+    披露易接口没有合并单元格，也就没有继承可断；但它确实会返回
+    **本来就没有股票代号**的行（交易所自身公告、部分债务证券发行人）。
+    真跑一次全市场，这类行让原来的等式恒不成立，于是「数量校验：不平」
+    每次都亮 —— 一个永远在响的警报等于没有警报。
+
+    所以拆成两级：
+      硬校验（决定 ok）—— 判定桶合计＝记录数，且每条都有标题。
+        这两项一旦不等，就是流程真的丢了行或分类漏判，必须停。
+      软缺口（只记数，见 screen() 的 notes）—— 缺代号／缺简称。
+        照样逐条数出来摆在报告里，但不阻断流程。
     """
     buckets = Counter(r["verdict"].bucket for r in records)
+    total = len(records)
     counts = {
-        "记录数": len(records),
+        "记录数": total,
         "有代号数": sum(1 for r in records if str(r.get("code", "")).strip()),
         "有简称数": sum(1 for r in records if str(r.get("name", "")).strip()),
         "有标题数": sum(1 for r in records if str(r.get("title", "")).strip()),
         "判定桶合计": sum(buckets.values()),
     }
-    ok = len(set(counts.values())) == 1
+    ok = counts["判定桶合计"] == total and counts["有标题数"] == total
     return {**counts, **{f"桶:{k}": v for k, v in sorted(buckets.items())}}, ok
 
 
 def random_audit(records: list[dict], rules: Rules) -> list[dict]:
-    """第 4 层：从灰堆里随机抽 N 条复核。种子固定，抽查结果可复现。"""
-    grey = [r for r in records if r["verdict"].is_grey]
-    if not grey:
-        return []
+    """第 4 层：从灰堆里随机抽 N 条复核。种子固定，抽查结果可复现。
+
+    分层抽：irrelevant 桶动辄几千条，混在一起抽会把「被排除词灰掉的」
+    那几十条挤没 —— 而那几十条才是最可能误杀的。所以两层各抽 N 条。
+    """
     rng = random.Random(rules.audit_seed)
-    return rng.sample(grey, min(rules.audit_sample_size, len(grey)))
+    out = []
+    for stratum in (
+        [r for r in records if r["verdict"].is_grey
+         and r["verdict"].bucket != IRRELEVANT],
+        [r for r in records if r["verdict"].bucket == IRRELEVANT],
+    ):
+        if stratum:
+            out += rng.sample(stratum, min(rules.audit_sample_size, len(stratum)))
+    return out
 
 
 def screen(records: list[dict], rules: Rules) -> QualityReport:
@@ -353,6 +398,16 @@ def screen(records: list[dict], rules: Rules) -> QualityReport:
         report.notes.append(
             f"发现 {len(mirrors)} 组镜像归档（同日同标题、不同代码），"
             f"需人工指定受要约方后合并记一单（坑⑨）")
+
+    # 软缺口：不阻断，但必须摆出来 —— 缺代号的行没法归到某一单上
+    missing_code = [r for r in records if not str(r.get("code", "")).strip()]
+    if missing_code:
+        sample = "；".join(r.get("title", "")[:24] for r in missing_code[:3])
+        report.notes.append(
+            f"有 {len(missing_code)} 条记录没有股票代号（披露易本身就没给），"
+            f"无法归到具体一单上，已留在表内待人工看。例如：{sample}")
+
     if not ok:
-        report.notes.append("⚠️ 数量校验不平，先查勘误行与归属继承（坑⑫）再往下走")
+        report.notes.append("⚠️ 数量校验不平：有记录没进任何判定桶或没有标题，"
+                            "先查勘误行与分类漏判（坑⑫）再往下走")
     return report

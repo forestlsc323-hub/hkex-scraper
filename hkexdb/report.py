@@ -22,10 +22,12 @@ BUCKET_META = {
     "excluded": ("已灰", "后续／程序公告（软删除，行还在）", "#6b7280"),
     "special": ("特殊品种", "非三种要约，剔除但可分辨", "#7c3aed"),
     "superseded": ("被取代", "标题勘误的旧版本", "#9ca3af"),
+    "irrelevant": ("题材无关", "标题无任何要约/收购字眼", "#9ca3af"),
 }
 
-# 人工复核的优先顺序：要人看的排前面
-BUCKET_ORDER = ["manual", "retained", "special", "excluded", "superseded"]
+# 卡片顺序：留存（出数的那些）第一，人工复核第二，题材无关垫底
+BUCKET_ORDER = ["retained", "manual", "special", "excluded", "superseded",
+                "irrelevant"]
 
 _CSS = """
 :root{--bg:#ffffff;--fg:#1a1a1a;--muted:#6b7280;--line:#e5e7eb;--card:#f9fafb;--accent:#1d4ed8}

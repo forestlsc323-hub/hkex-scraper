@@ -70,12 +70,13 @@ def test_bucket_counts_appear_as_cards():
     assert "人工复核" in html and "留存" in html and "已灰" in html
 
 
-def test_manual_bucket_is_listed_first():
-    """要人看的排前面 —— 人工复核桶是铁律二要求的动作。"""
+def test_bucket_cards_are_ordered_by_what_needs_attention():
+    """留存（出数的那些）第一，人工复核第二；题材无关是噪音，垫底。"""
     assert pipeline is not None
     order = report.BUCKET_ORDER
-    assert order[0] == "manual"
+    assert order[:2] == ["retained", "manual"]
     assert order.index("manual") < order.index("excluded")
+    assert order[-1] == "irrelevant"
 
 
 def test_notes_render_as_a_warning_block():
