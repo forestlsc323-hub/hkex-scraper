@@ -35,13 +35,13 @@ def _open_file(path: Path) -> None:
 
 
 def default_dates() -> tuple[str, str]:
+    from hkexdb.config import section
+
+    rng = section("config.yaml", key="date_range", root=ROOT)
+    today = dt.date.today()
     try:
-        import yaml
-        cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-        rng = cfg["date_range"]
         return str(rng["from"]), str(rng["to"])
-    except Exception:
-        today = dt.date.today()
+    except KeyError:
         return str(today - dt.timedelta(days=6)), str(today)
 
 

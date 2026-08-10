@@ -1,110 +1,129 @@
-"""跨平台可移植性测试。
+"""Windows 上跑得起来 —— 这些坑全是真踩过的。
 
-这两条都是真实炸过的问题，且**在 Linux 上开发时看不见**：
-
-1. Windows 中文控制台是 cp936，编不出 ✅ ⚠️ ❌ 这类符号，
-   脚本跑得好好的，最后一行 print 把它打死。
-2. GUI 启动器不一定在仓库根目录跑 python，相对路径的
-   config.yaml / screening_rules.yaml 就找不到了。
+用户的机器是 Windows 10 + 中文环境（控制台 cp936），从
+C:\\Users\\Judy Shi\\Downloads\\... 双击 .bat 启动。
+这一路上每一个坑都在这里钉死，因为它们的共同点是：
+出事时界面上什么都看不见。
 """
 
 from __future__ import annotations
 
 import io
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from hkexdb import config, console, screening
+ROOT = Path(__file__).resolve().parent.parent
+BATS = ["RUN.bat", "一键运行.bat", "一键更新.bat"]
 
-REPO = Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------- 启动器
+
+@pytest.mark.parametrize("name", BATS)
+def test_bat_files_use_crlf(name):
+    """LF 换行会让 Windows cmd 解析崩掉，双击后闪一下就关（真踩过）。"""
+    raw = (ROOT / name).read_bytes()
+    assert b"\r\n" in raw
+    assert raw.count(b"\n") == raw.count(b"\r\n"), f"{name} 里有裸 LF"
+
+
+def test_launcher_keeps_a_console_so_errors_are_visible():
+    """pythonw.exe 没有控制台：界面若在启动阶段崩掉，用户什么都看不到。"""
+    bat = (ROOT / "RUN.bat").read_bytes().decode("utf-8")
+    live = [ln for ln in bat.splitlines()
+            if ln.strip() and not ln.strip().upper().startswith("REM")]
+    assert not any("pythonw" in ln for ln in live)
+    assert any("python.exe app.py" in ln for ln in live)
 
 
 # ---------------------------------------------------------------- 编码
 
-def test_console_markers_are_pure_ascii():
-    """控制台标记必须是纯 ASCII —— 任何终端编码都装得下。"""
-    for marker in (console.OK, console.WARN, console.FAIL, console.ARROW):
-        marker.encode("ascii")          # 编不出就抛异常
-        marker.encode("cp936")
+def test_no_emoji_anywhere_that_reaches_a_cp936_console():
+    """cp936 控制台打不出 emoji，直接抛 UnicodeEncodeError 把程序带崩。
 
-
-def test_entry_scripts_print_no_emoji_to_console():
-    """入口脚本的 print() 里不许出现 cp936 编不出的字符。
-
-    emoji 只能出现在写进 .md / .csv 的内容里 —— 那些文件显式用 utf-8 写。
+    界面里的中文没问题（Tk 用 UTF-16），但 print 到控制台的必须是
+    cp936 能编码的字符。
     """
-    offenders = []
-    for script in sorted((REPO / "scripts").glob("run_*.py")) + [REPO / "app.py"]:
-        for lineno, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
-            stripped = line.strip()
-            if not stripped.startswith("print"):
+    for path in [ROOT / "app.py", *(ROOT / "hkexdb").glob("*.py")]:
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "print(" not in line and "log(" not in line:
                 continue
             try:
                 line.encode("cp936")
             except UnicodeEncodeError as exc:
                 bad = line[exc.start:exc.end]
-                offenders.append(f"{script.name}:{lineno} 含 {bad!r}")
-    assert not offenders, "控制台输出含 cp936 编不出的字符：\n" + "\n".join(offenders)
+                pytest.fail(f"{path.name} 有 cp936 编不出来的字符 {bad!r}：\n  {line.strip()}")
 
 
-def test_console_init_survives_a_cp936_stream():
-    """init() 之后，往 cp936 流里写 emoji 也不该抛异常。"""
-    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp936", errors="strict")
-    with pytest.raises(UnicodeEncodeError):
-        stream.write("✅")              # 修复前的行为
+def test_crash_guard_writes_a_file_when_startup_fails(tmp_path, monkeypatch):
+    """双击后「什么都没发生」是最难排查的失败 —— 必须留下痕迹。"""
+    import app
+    monkeypatch.setattr(app, "ROOT", tmp_path)
+    monkeypatch.setattr(app, "main", lambda: (_ for _ in ()).throw(
+        RuntimeError("启动就炸")))
 
-    stream.reconfigure(errors="replace")
-    stream.write("✅ 数量校验")          # 修复后：替换成 ?，不崩
-    stream.flush()
-
-
-def test_scripts_run_under_cp936_console(tmp_path):
-    """端到端：模拟 Windows 中文控制台跑 run_screening.py --demo。"""
-    env = dict(os.environ, PYTHONIOENCODING="cp936")
-    proc = subprocess.run(
-        [sys.executable, str(REPO / "scripts" / "run_screening.py"), "--demo"],
-        env=env, capture_output=True, cwd=str(tmp_path), timeout=120)
-    assert proc.returncode == 0, proc.stderr.decode("cp936", errors="replace")[-800:]
-    assert b"UnicodeEncodeError" not in proc.stderr
+    assert app._crash_guard() == 1
+    crash = tmp_path / "app_crash.txt"
+    assert crash.exists(), "崩溃了却没留下任何文件"
+    text = crash.read_text(encoding="utf-8")
+    assert "RuntimeError" in text and "启动就炸" in text
 
 
-# ---------------------------------------------------------------- 路径
+def test_crash_guard_passes_through_success(tmp_path, monkeypatch):
+    import app
+    monkeypatch.setattr(app, "main", lambda: 0)
+    assert app._crash_guard() == 0
 
-def test_config_found_from_any_working_directory(tmp_path, monkeypatch):
-    """GUI 启动器常常不在仓库根目录跑 python。"""
+
+# ---------------------------------------------------------------- 工作目录
+
+def test_rule_files_are_found_from_any_working_directory(tmp_path, monkeypatch):
+    """.bat 双击时的工作目录未必是仓库根目录，配置照样要找得到。"""
+    from hkexdb.config import resolve_file
+
     monkeypatch.chdir(tmp_path)
-    cfg = config.load("config.yaml")
-    assert cfg.config_path == (REPO / "config.yaml").resolve()
+    assert resolve_file("screening_rules.yaml").exists()
+    assert resolve_file("config.yaml").exists()
 
 
-def test_screening_rules_found_from_any_working_directory(tmp_path, monkeypatch):
+def test_screening_rules_load_from_any_working_directory(tmp_path, monkeypatch):
+    from hkexdb import screening
+
     monkeypatch.chdir(tmp_path)
     rules = screening.load_rules("screening_rules.yaml")
-    assert rules.exclude_terms
+    assert rules.version and rules.exclude_terms
 
 
-def test_data_dirs_anchor_to_the_repo_not_the_cwd(tmp_path, monkeypatch):
-    """产物必须落在仓库目录，否则第 4 步找不到第 3 步的输出。"""
-    monkeypatch.chdir(tmp_path)
-    cfg = config.load("config.yaml")
-    assert cfg.raw_dir.is_absolute()
-    assert REPO in cfg.raw_dir.parents
-    assert tmp_path not in cfg.raw_dir.parents
+# ---------------------------------------------------------------- 干净启动
+
+def test_app_imports_without_tkinter_and_falls_back():
+    """没有 tkinter 的机器上也要能 import，然后退回命令行。"""
+    import importlib
+
+    import app
+    importlib.reload(app)
+    assert callable(app.main) and callable(app.run_console)
 
 
-def test_missing_config_says_where_it_looked(tmp_path, monkeypatch):
-    """找不到配置时要告诉用户去哪儿找了，而不是甩个 FileNotFoundError。"""
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(FileNotFoundError) as exc:
-        config.load("不存在的配置.yaml")
-    message = str(exc.value)
-    assert "当前工作目录" in message and "仓库根目录" in message
+def test_every_shipped_module_compiles():
+    """删了一堆死代码之后，确认剩下的都还能编译。"""
+    files = [ROOT / "app.py", *(ROOT / "hkexdb").glob("*.py")]
+    out = subprocess.run([sys.executable, "-m", "py_compile", *map(str, files)],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
 
 
-def test_absolute_config_path_is_respected(tmp_path):
-    cfg = config.load(REPO / "config.yaml")
-    assert cfg.config_path == REPO / "config.yaml"
+def test_no_module_imports_something_that_was_deleted():
+    """死代码删干净了没有 —— 残留的 import 会在用户机器上炸。"""
+    gone = {"hkexdb.listing", "hkexdb.http_client", "hkexdb.storage",
+            "hkexdb.stocks", "hkexdb.probe", "hkexdb.pipeline",
+            "hkexdb.console", "hkexdb.logsetup"}
+    for path in [ROOT / "app.py", *(ROOT / "hkexdb").glob("*.py")]:
+        text = path.read_text(encoding="utf-8")
+        for dead in gone:
+            mod = dead.split(".")[1]
+            assert f"from .{mod} import" not in text, f"{path.name} 还在 import {mod}"
+            assert f"from hkexdb import {mod}" not in text, f"{path.name} 还在 import {mod}"

@@ -137,30 +137,26 @@ class Result:
 DEFAULT_KEYWORDS = ["要約", "收購", "私有化"]
 
 
+def _listing_config() -> dict:
+    from .config import section
+    return section("config.yaml", root=ROOT)
+
+
 def _speed_settings() -> tuple[int, int, str, list[str]]:
     """从 config.yaml 读抓取旋钮。读不到就用实测过的默认值。"""
-    step, workers, mode, keywords = 4000, 4, "keyword", list(DEFAULT_KEYWORDS)
+    cfg = _listing_config()
     try:
-        import yaml
-        cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-        listing = cfg.get("listing", {}) or {}
-        step = int(listing.get("row_range_step", step))
-        workers = max(1, int(listing.get("max_workers", workers)))
-        mode = str(listing.get("mode", mode))
-        keywords = list(listing.get("title_keywords") or keywords)
-    except Exception:
-        pass
-    return step, workers, mode, keywords
+        return (int(cfg.get("row_range_step", 4000)),
+                max(1, int(cfg.get("max_workers", 4))),
+                str(cfg.get("mode", "keyword")),
+                list(cfg.get("title_keywords") or DEFAULT_KEYWORDS))
+    except (TypeError, ValueError):
+        return 4000, 4, "keyword", list(DEFAULT_KEYWORDS)
 
 
 def _keep_raw_files() -> bool:
-    """要不要把公告原件在本地留一份。默认留 —— 那是审计链的底座。"""
-    try:
-        import yaml
-        cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-        return bool((cfg.get("listing", {}) or {}).get("keep_raw_files", False))
-    except Exception:
-        return False
+    """要不要把公告原件在本地留一份。默认不留（用完即弃）。"""
+    return bool(_listing_config().get("keep_raw_files", False))
 
 
 def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
@@ -190,7 +186,7 @@ def _fetch_by_keyword(client, vendor_config, keywords: list[str],
     差距有多大：一周全量是 6993 条、7 次请求；按关键词是几十条、
     每个关键词一次请求。一年从约 250 次请求降到十几次。
 
-    ⚠️ 这是**漏检风险最高**的一处改动，所以：
+    【注意】这是**漏检风险最高**的一处改动，所以：
       · 关键词取并集，一条公告命中任一即收；
       · screening_rules.yaml 里那六条已核实的真实 T0 标题，
         必须条条命中至少一个关键词，否则测试直接不让跑；
@@ -293,7 +289,7 @@ def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
             if type(exc).__name__ == "CancelledError":
                 raise Cancelled() from exc
             # 宁可慢，不可漏 —— 关键词模式一有异常就退回全量
-            log(f"⚠️ 关键词模式不可用（{type(exc).__name__}: {exc}）")
+            log(f"【注意】关键词模式不可用（{type(exc).__name__}: {exc}）")
             log("   已自动退回全量抓取。慢，但不会漏。")
 
     log(f"抓取方式：全量（翻页步长 {step}，并发 {workers} 段，"
@@ -303,7 +299,7 @@ def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
     lock = threading.Lock()
 
     def progress(day, total_days, count):
-        # ⚠️ 并发时这个回调由多个线程调用，而且客户端把它包在
+        # 【注意】并发时这个回调由多个线程调用，而且客户端把它包在
         # try/except 里 —— 这里抛异常会被吞掉，所以停止不能靠抛异常，
         # 只能靠 cancel_event（客户端每天开头都会检查它）。
         with lock:
@@ -375,7 +371,7 @@ def self_check(d1: dt.date, d2: dt.date, *, on_log=None,
     if not risky:
         log("漏掉的全是筛查层本来就会剔除的公告 —— 关键词模式可以放心用。")
     else:
-        log(f"⚠️ 漏掉的里面有 {len(risky)} 条筛查层会留下来的，逐条列出：")
+        log(f"【注意】漏掉的里面有 {len(risky)} 条筛查层会留下来的，逐条列出：")
         for bucket, rec in risky[:50]:
             log(f"   [{bucket}] {rec.get('STOCK_CODE', '')} "
                 f"{rec.get('TITLE', '')[:70]}")
@@ -512,7 +508,7 @@ def score_against_answer_key(on_log=None) -> str:
     else:
         answers = scoring.load(key_path)
         for problem in scoring.sanity_check(answers):
-            log(f"⚠️ 答案表本身有问题：{problem}")
+            log(f"【注意】答案表本身有问题：{problem}")
         if scoring.sanity_check(answers):
             log("")
         report = scoring.score(got, answers)
@@ -825,12 +821,12 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
             n = done[0]
         on_step(2, n / len(targets))
         if deal.verdict == "offer":
-            log(f"    [{n}/{len(targets)}] ✓ {deal.code} {deal.name}　"
+            log(f"    [{n}/{len(targets)}] [OK] {deal.code} {deal.name}　"
                 f"← {deal.offeror or '要约方未识别'}　"
                 f"{deal.offer_type}　{deal.offer_price}　"
                 f"{deal.premium_pct}%　{deal.deal_size}")
         else:
-            log(f"    [{n}/{len(targets)}] － {deal.code} {deal.name}　"
+            log(f"    [{n}/{len(targets)}] [--] {deal.code} {deal.name}　"
                 f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}")
         return deal
 
@@ -872,7 +868,7 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
 # 列名 → Deal 上的字段名。溢价梯子那几列不在这里 ——
 # 它们由 premium_ladder 展开，单独还原。
 #
-# ⚠️ 这张表和 _deal_row 必须一一对应，任何一边加了列而另一边忘了，
+# 【注意】这张表和 _deal_row 必须一一对应，任何一边加了列而另一边忘了，
 # 存档读回来就会静默丢字段。test_a_deal_survives_a_round_trip_through_the_store
 # 拿一个字段全填满的 Deal 走一遍存盘再读回，逐字段比对，专门守这个。
 _FROM_ROW = {

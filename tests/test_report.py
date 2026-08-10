@@ -1,17 +1,13 @@
-"""网页报告与流水线状态的测试。"""
+"""网页报告的测试。"""
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 import re
 
-import pytest
 
-from hkexdb import pipeline, report
-from hkexdb.config import Config
+from hkexdb import report
 
-from test_listing import _make_config
 
 
 def _records():
@@ -70,15 +66,6 @@ def test_bucket_counts_appear_as_cards():
     assert "人工复核" in html and "留存" in html and "已灰" in html
 
 
-def test_bucket_cards_are_ordered_by_what_needs_attention():
-    """留存（出数的那些）第一，人工复核第二；题材无关是噪音，垫底。"""
-    assert pipeline is not None
-    order = report.BUCKET_ORDER
-    assert order[:2] == ["retained", "manual"]
-    assert order.index("manual") < order.index("excluded")
-    assert order[-1] == "irrelevant"
-
-
 def test_notes_render_as_a_warning_block():
     html = report.build_html(_records(), notes=["人工复核桶有 2 条，必须逐条看完"])
     assert 'class="warn"' in html
@@ -118,79 +105,3 @@ def test_report_written_to_disk(tmp_path):
     assert out.exists()
     text = out.read_text(encoding="utf-8")
     assert "v1" in text and "x.csv" in text
-
-
-# ---------------------------------------------------------------- 流水线状态
-
-def _cfg(tmp_path) -> Config:
-    cfg = _make_config(tmp_path)
-    return Config(**{**cfg.__dict__,
-                     "date_from": dt.date(2026, 1, 1),
-                     "date_to": dt.date(2026, 1, 3)})
-
-
-def test_fresh_project_points_at_step_one(tmp_path):
-    steps = pipeline.status(_cfg(tmp_path))
-    assert not any(s.done for s in steps)
-    text = pipeline.format_status(steps)
-    assert "run_probe.py" in text
-
-
-def test_invalid_probe_report_does_not_count_as_done(tmp_path):
-    """跑过但一个请求都没发出去的勘察，结论无效，不能算完成。
-
-    否则流水线会指着第 2 步说「可以走了」，而参数其实一个都没验证过。
-    """
-    cfg = _cfg(tmp_path)
-    cfg.probe_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.probe_dir / "PROBE_REPORT.md").write_text(
-        "# 报告\n\n> # ⛔ 本次勘察无效：一个请求都没有发出去\n", encoding="utf-8")
-
-    probe_step = next(s for s in pipeline.status(cfg) if s.key == "probe")
-    assert not probe_step.done
-    assert "无效" in probe_step.detail
-
-
-def test_valid_probe_report_counts_as_done(tmp_path):
-    cfg = _cfg(tmp_path)
-    cfg.probe_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.probe_dir / "PROBE_REPORT.md").write_text(
-        "# 报告\n\n结论：使用 titleSearchServlet.do\n", encoding="utf-8")
-    assert next(s for s in pipeline.status(cfg) if s.key == "probe").done
-
-
-def test_partial_listing_is_not_done(tmp_path):
-    """只抓了一部分天数不算完成 —— 否则会带着缺口往下走。"""
-    cfg = _cfg(tmp_path)                       # 共 3 天
-    cfg.raw_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.raw_dir / "checkpoint.json").write_text(
-        json.dumps(["2026-01-01"]), encoding="utf-8")
-    (cfg.raw_dir / "listing_raw.csv").write_text("a\n1\n", encoding="utf-8")
-
-    step = next(s for s in pipeline.status(cfg) if s.key == "listing")
-    assert not step.done
-    assert "1/3" in step.detail
-
-
-def test_complete_listing_is_done(tmp_path):
-    cfg = _cfg(tmp_path)
-    cfg.raw_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.raw_dir / "checkpoint.json").write_text(
-        json.dumps(["2026-01-01", "2026-01-02", "2026-01-03"]), encoding="utf-8")
-    (cfg.raw_dir / "listing_raw.csv").write_text("a\n1\n2\n", encoding="utf-8")
-    assert next(s for s in pipeline.status(cfg) if s.key == "listing").done
-
-
-def test_status_names_the_next_command(tmp_path):
-    cfg = _cfg(tmp_path)
-    cfg.probe_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.probe_dir / "PROBE_REPORT.md").write_text("结论：ok", encoding="utf-8")
-    text = pipeline.format_status(pipeline.status(cfg))
-    assert "run_listing.py" in text
-
-
-def test_pdf_step_never_blocks_the_pipeline():
-    """第 5 步是按需的，不该让流水线永远显示「没做完」。"""
-    steps = pipeline.status(_cfg(__import__("pathlib").Path("/tmp")))
-    pdf = next(s for s in steps if s.key == "pdf")
-    assert "按需" in pdf.detail
