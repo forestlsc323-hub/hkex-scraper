@@ -72,14 +72,39 @@ class Result:
     qc_notes: list = field(default_factory=list)
 
 
+def _speed_settings() -> tuple[int, int]:
+    """从 config.yaml 读翻页步长和并发段数。读不到就用实测过的默认值。"""
+    try:
+        import yaml
+        cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+        listing = cfg.get("listing", {}) or {}
+        return (int(listing.get("row_range_step", 4000)),
+                max(1, int(listing.get("max_workers", 4))))
+    except Exception:
+        return 4000, 4
+
+
 def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
-    """用 vendor/hkex_client.py（用户提供的实战客户端，一字未改）抓列表。"""
+    """用 vendor/hkex_client.py（用户提供的实战客户端，一字未改）抓列表。
+
+    客户端本身不改，但它的两个速度旋钮在 vendor/config.py 里写死了
+    （步长 500、单线程）。实测 7 天要 10 分钟，一年就是 5 小时 ——
+    这两个值从我们的 config.yaml 覆盖进去，客户端代码仍然一字未动。
+    """
     import sys
     sys.path.insert(0, str(ROOT / "vendor"))
+    import config as vendor_config              # noqa: E402
     from hkex_client import HKEXClient          # noqa: E402
 
+    step, workers = _speed_settings()
+    vendor_config.ROW_RANGE_STEP = step
+
     n_days = (d2 - d1).days + 1
+    workers = max(1, min(workers, n_days))      # 段数不能多过天数
+
     log(f"日期范围 {d1} ~ {d2}（{n_days} 天）")
+    log(f"翻页步长 {step}　并发 {workers} 段（共用一个限速器，"
+        f"总频率不变）")
     log("正在访问检索页建立会话…")
 
     client = HKEXClient()
@@ -87,15 +112,27 @@ def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
     log(f"会话 cookie：{cookies if cookies else '（服务端未下发）'}")
 
     done = [0]
+    lock = threading.Lock()
 
     def progress(day, total_days, count):
-        if cancel_event is not None and cancel_event.is_set():
-            raise Cancelled()
-        done[0] += 1
-        log(f"  [{done[0]}/{total_days}] {day}　累计 {count} 条")
-        on_step(0, done[0] / max(1, total_days))
+        # ⚠️ 并发时这个回调由多个线程调用，而且客户端把它包在
+        # try/except 里 —— 这里抛异常会被吞掉，所以停止不能靠抛异常，
+        # 只能靠 cancel_event（客户端每天开头都会检查它）。
+        with lock:
+            done[0] += 1
+            n = done[0]
+        log(f"  [{n}/{total_days}] {day}　累计 {count} 条")
+        on_step(0, n / max(1, total_days))
 
-    return client.search(d1, d2, progress_cb=progress, cancel_event=cancel_event)
+    try:
+        return client.search(d1, d2, progress_cb=progress,
+                             cancel_event=cancel_event, max_workers=workers)
+    except Exception as exc:
+        # 客户端有自己的取消异常，名字不同但意思一样。不翻译的话，
+        # 用户点了「停止」会看到一条像是崩溃的报错。
+        if type(exc).__name__ == "CancelledError":
+            raise Cancelled() from exc
+        raise
 
 
 def _write_listing(records: list[dict], log) -> Path:

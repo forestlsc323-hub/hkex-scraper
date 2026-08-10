@@ -235,3 +235,57 @@ def test_premium_basis_sits_next_to_the_premium_number():
     """口径和数字必须相邻，中间插别的列就会有人只复制数字。"""
     i = runner.DEAL_COLUMNS.index("主值溢价率(%)")
     assert runner.DEAL_COLUMNS[i + 1] == "主值口径"
+
+
+# ---------------------------------------------------------------- .htm 公告
+
+def test_html_announcements_are_accepted_too():
+    """留存桶里有 .htm 公告 —— 实测一周 15 份里有 4 份是，全部抽取失败。
+
+    披露易短公告发的是 HTML，正文措辞和 PDF 版一模一样。
+    """
+    from hkexdb import pdf_source
+
+    assert pdf_source.is_html_link("https://x/a_c.htm")
+    assert pdf_source.is_html_link("https://x/a.HTML")
+    assert not pdf_source.is_html_link("https://x/a.pdf")
+
+
+def test_html_is_stripped_down_to_the_announcement_text():
+    from hkexdb import pdf_source
+
+    html_bytes = (
+        "<html><head><style>p{color:red}</style></head><body>"
+        "<script>var x=1</script>"
+        "<p>「要約價」 指 每股要約股份2.20港元</p>"
+        "<p>要約人就悉數接納要約而應付之最高現金金額為1,905,849,908.60港元。</p>"
+        "</body></html>").encode("utf-8")
+    pages = pdf_source.extract_html_pages(html_bytes)
+
+    text = " ".join(pages.values())
+    assert "2.20港元" in text and "1,905,849,908.60港元" in text
+    assert "var x" not in text and "color:red" not in text
+
+
+def test_html_announcement_flows_through_the_extractor():
+    """HTML 版走完抽取层，字段要和 PDF 版抽出来的一样。"""
+    from hkexdb import extractor, pdf_source
+
+    html_bytes = (
+        "<html><body><p>「要約價」 指 提出要約所按之價格，即每股要約股份2.20港元</p>"
+        "<p>要約人就悉數接納要約而應付之最高現金金額為1,905,849,908.60港元。</p>"
+        "</body></html>").encode("utf-8")
+    ex = extractor.extract("公告 自願性有條件全面現金要約",
+                           pdf_source.extract_html_pages(html_bytes))
+    assert ex.offer_type == "VGO"
+    assert ex.offer_price == "2.20"
+    assert ex.deal_size == "1905849908.60"
+
+
+def test_html_and_pdf_use_different_cache_files():
+    """两种格式共用一个缓存名会互相覆盖，重跑就拿到错的字节。"""
+    from hkexdb import pdf_source
+
+    p = pdf_source._cache_path(runner.Path("/tmp/c"), "https://x/a_c.htm")
+    q = pdf_source._cache_path(runner.Path("/tmp/c"), "https://x/a.pdf")
+    assert p.suffix == ".htm" and q.suffix == ".pdf"

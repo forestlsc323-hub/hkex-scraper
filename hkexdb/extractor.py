@@ -340,8 +340,18 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
 # 这里仍然只做摘录：从标题里**剪**出这几段字，一个字都不改写。
 
 _AGENT = re.compile(r"為並代表|為代表|代表")
-# FA 段的左边界：编号括号、「由」、连接词
-_FA_LEFT = re.compile(r"[)）]|由|及|and\s", re.I)
+# FA 段的左边界：**编号**括号、「由」、连接词。
+#
+# ⚠️ 只认编号括号（里面纯数字或罗马数字），不能认所有括号 ——
+# 券商名字里带括号是常态：中國銀河國際證券(香港)有限公司、
+# 建銀國際(控股)有限公司。按任意括号切，FA 会被切成「有限公司」。
+# 实测 01657 那单就是这么错的。
+_FA_LEFT = re.compile(r"[(（]\s*(?:\d{1,2}|[ivxIVX]{1,4})\s*[)）]|由|及|and\s", re.I)
+
+# 这些不是名字，是公告里的通称。抽到它们等于没抽到 ——
+# 表里出现一个叫「要約人」的要约方，比留空更糟：它看着像抽到了。
+_PLACEHOLDER = {"要約人", "要约人", "本公司", "該公司", "买方", "買方",
+                "offeror", "the offeror", "有限公司", "公司"}
 # 要约人段的右边界：接下来必然是动词或介词
 _OFFEROR_RIGHT = re.compile(r"就|提出|作出|向|對|以|，|。|,")
 
@@ -365,6 +375,10 @@ def _cut_fa(before: str) -> str:
     return before[left:].strip(" 　-–—")
 
 
+def _is_placeholder(name: str) -> bool:
+    return name.strip().lower() in _PLACEHOLDER
+
+
 def extract_parties(title: str, pages: dict[int, str]) -> dict:
     """从标题剪出 要约人 / 要约人财务顾问 / 受要约方。
 
@@ -381,9 +395,9 @@ def extract_parties(title: str, pages: dict[int, str]) -> dict:
         rest = title[m.end():]
         cut = _OFFEROR_RIGHT.search(rest)
         offeror = (rest[:cut.start()] if cut else rest).strip(" 　")
-        if 2 <= len(fa) <= 40:
+        if 2 <= len(fa) <= 40 and not _is_placeholder(fa):
             out["offeror_fa"] = fa
-        if 2 <= len(offeror) <= 60:
+        if 2 <= len(offeror) <= 60 and not _is_placeholder(offeror):
             out["offeror"] = offeror
             out["parties_evidence"] = Evidence(0, title[max(0, m.start() - 30):
                                                         m.end() + 60].strip())
@@ -392,11 +406,12 @@ def extract_parties(title: str, pages: dict[int, str]) -> dict:
     if t:
         out["target"] = t.group(1).strip(" 　")
 
-    if not out["offeror"]:                      # 标题没写，退到释义节
+    # 标题里写的是通称（「代表要約人提出…」）或压根没写，退到释义节找真名
+    if not out["offeror"]:
         for page in sorted(pages):
             flat = _flat(pages[page])
             d = _OFFEROR_DEF.search(flat)
-            if d:
+            if d and not _is_placeholder(d.group(1)):
                 out["offeror"] = d.group(1).strip()
                 out["parties_evidence"] = Evidence(page, d.group(0)[:200])
                 break

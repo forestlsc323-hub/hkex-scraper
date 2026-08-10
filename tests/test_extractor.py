@@ -311,3 +311,37 @@ def test_every_extracted_field_carries_page_and_quote():
     assert ex.deal_size and ex.deal_size_evidence.page > 0
     for c in ex.comparisons:
         assert c.page > 0 and c.quote.strip()
+
+
+def test_fa_name_with_parentheses_is_not_chopped():
+    """券商名带括号是常态：中國銀河國際證券(香港)有限公司、建銀國際(控股)有限公司。
+
+    按任意括号切左边界，FA 会被切成「有限公司」——实测 01657 那单就是
+    这么错的，表里显示的要约方FA 是「有限公司」，看着像抽到了。
+    只认编号括号（里面纯数字或罗马数字）。
+    """
+    ex = extractor.extract(
+        "聯合公告 (1) 買賣協議 及 (2) 由中國銀河國際證券(香港)有限公司代表 "
+        "ABC LIMITED 提出強制性無條件現金要約", {})
+    assert ex.offeror_fa == "中國銀河國際證券(香港)有限公司"
+    assert ex.offeror == "ABC LIMITED"
+
+
+def test_generic_offeror_word_falls_back_to_the_definition_section():
+    """标题写「代表要約人提出…」时，「要約人」是通称不是名字。
+
+    表里出现一个叫「要約人」的要约方比留空更糟 —— 它看着像抽到了。
+    真名在释义节里，退过去找。
+    """
+    ex = extractor.extract(
+        "公告 由某證券有限公司代表要約人提出強制性無條件現金要約",
+        {1: "「要約人」 指 樺欣投資控股有限公司，一家於英屬處女群島註冊成立之公司。"})
+    assert ex.offeror == "樺欣投資控股有限公司"
+    assert ex.parties_evidence.page == 1
+
+
+def test_generic_offeror_with_no_definition_stays_empty():
+    """释义节里也没有真名，就留空 —— 绝不把通称当名字填进去。"""
+    ex = extractor.extract("公告 由某證券有限公司代表要約人提出要約", {})
+    assert ex.offeror == ""
+    assert any("要约方" in n for n in ex.notes)

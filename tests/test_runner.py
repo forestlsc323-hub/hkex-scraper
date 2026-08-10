@@ -291,3 +291,135 @@ def test_updater_points_at_the_branch_we_actually_push_to():
     folder = next(ln for ln in bat.splitlines() if ln.startswith('set "FOLDER='))
     folder = folder.split("=", 1)[1].rstrip('"')
     assert folder == "hkex-scraper-" + branch.replace("/", "-")
+
+
+# ---------------------------------------------------------------- 速度旋钮
+
+def test_speed_settings_come_from_config_yaml(tmp_path, monkeypatch):
+    """步长和并发段数写在 config.yaml，不改 vendor 客户端一个字。"""
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "listing:\n  row_range_step: 4000\n  max_workers: 4\n", encoding="utf-8")
+    assert runner._speed_settings() == (4000, 4)
+
+
+def test_speed_settings_fall_back_when_config_is_unreadable(tmp_path, monkeypatch):
+    """配置坏了要能跑，不能因为一行 YAML 打不开就整个程序起不来。"""
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    step, workers = runner._speed_settings()
+    assert step >= 1000 and workers >= 1
+
+
+def test_row_range_step_is_big_enough_for_a_real_day():
+    """实测单日最多 1928 条（2026-06-01）。步长小于它就要多跑一轮，
+    而多跑一轮意味着把当天所有记录再拉一遍 —— 平方级浪费。"""
+    import yaml
+    cfg = yaml.safe_load(
+        (runner.Path(__file__).parent.parent / "config.yaml").read_text(
+            encoding="utf-8"))
+    assert cfg["listing"]["row_range_step"] >= 2000
+
+
+def test_row_range_step_stays_under_the_server_cap():
+    """超过服务端 10000 条上限会被截断，而且翻页失效 —— 静默丢数据。"""
+    import yaml
+    cfg = yaml.safe_load(
+        (runner.Path(__file__).parent.parent / "config.yaml").read_text(
+            encoding="utf-8"))
+    rounds = cfg["listing"]["max_rounds_per_day"]
+    assert cfg["listing"]["row_range_step"] * rounds <= 10000
+
+
+def test_fetch_pushes_the_knobs_into_the_vendor_client(tmp_path, monkeypatch):
+    """vendor/hkex_client.py 一字未改，所以旋钮只能从它的 config 模块覆盖进去。"""
+    import sys
+    import types
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "listing:\n  row_range_step: 4000\n  max_workers: 4\n", encoding="utf-8")
+
+    fake_config = types.ModuleType("config")
+    fake_config.ROW_RANGE_STEP = 500
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = types.SimpleNamespace(cookies=[])
+
+        def search(self, d1, d2, *, progress_cb, cancel_event, max_workers):
+            seen["workers"] = max_workers
+            seen["step"] = fake_config.ROW_RANGE_STEP
+            return [{"NEWS_ID": "n1"}]
+
+    fake_client_mod = types.ModuleType("hkex_client")
+    fake_client_mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", fake_config)
+    monkeypatch.setitem(sys.modules, "hkex_client", fake_client_mod)
+
+    out = runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 7),
+                        lambda *_: None, lambda *_: None, None)
+    assert out and seen["step"] == 4000
+    assert seen["workers"] == 4
+
+
+def test_segments_never_exceed_the_number_of_days(tmp_path, monkeypatch):
+    """抓 2 天却切 4 段，会白建两个会话（每个会话都要访问一次检索页）。"""
+    import sys
+    import types
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "listing:\n  row_range_step: 4000\n  max_workers: 4\n", encoding="utf-8")
+
+    fake_config = types.ModuleType("config")
+    fake_config.ROW_RANGE_STEP = 500
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = types.SimpleNamespace(cookies=[])
+
+        def search(self, d1, d2, *, progress_cb, cancel_event, max_workers):
+            seen["workers"] = max_workers
+            return []
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", fake_config)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+
+    runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 2),
+                  lambda *_: None, lambda *_: None, None)
+    assert seen["workers"] == 2
+
+
+def test_vendor_cancel_is_translated_so_the_ui_says_stopped(tmp_path, monkeypatch):
+    """客户端有自己的 CancelledError。不翻译的话，点「停止」会显示成崩溃。"""
+    import sys
+    import types
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+
+    class VendorCancelled(Exception):
+        pass
+    VendorCancelled.__name__ = "CancelledError"
+
+    fake_config = types.ModuleType("config")
+    fake_config.ROW_RANGE_STEP = 500
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = types.SimpleNamespace(cookies=[])
+
+        def search(self, *a, **kw):
+            raise VendorCancelled("任务已被用户停止")
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", fake_config)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+
+    with pytest.raises(runner.Cancelled):
+        runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 2),
+                      lambda *_: None, lambda *_: None, None)

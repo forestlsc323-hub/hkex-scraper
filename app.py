@@ -108,8 +108,6 @@ def main() -> int:
 
     btn_reload = ttk.Button(dtop, text="重新载入")
     btn_reload.pack(side="left", padx=4)
-    btn_pdf = ttk.Button(dtop, text="打开这单的 PDF", state="disabled")
-    btn_pdf.pack(side="left", padx=4)
     btn_csv = ttk.Button(dtop, text="打开 deals.csv")
     btn_csv.pack(side="left", padx=4)
 
@@ -133,10 +131,29 @@ def main() -> int:
     # 置信度低的整行标黄 —— 这几单必须人看过才能用
     tree.tag_configure("low", background="#fff4d6")
 
-    detail = tk.Text(page_deals, height=15, wrap="word", state="disabled",
+    # 明细区：左边正文，右边一列动作按钮。
+    # 按钮单独放一边、离表格远远的 —— 原来双击表格行就直接开浏览器，
+    # 想看明细手一抖就弹出去了。现在双击表格什么也不做。
+    dbot = ttk.Frame(page_deals, padding=(12, 0, 12, 12))
+    dbot.pack(fill="both", expand=False)
+
+    detail = tk.Text(dbot, height=15, wrap="word", state="disabled",
                      font=("Consolas" if sys.platform.startswith("win")
                            else "monospace", 9))
-    detail.pack(fill="both", expand=False, padx=12, pady=(0, 12))
+    detail.pack(side="left", fill="both", expand=True)
+
+    actions = ttk.Frame(dbot, padding=(10, 0, 0, 0))
+    actions.pack(side="right", fill="y")
+
+    lbl_which = ttk.Label(actions, text="未选中", width=20, wraplength=150,
+                          foreground="#666")
+    lbl_which.pack(anchor="w", pady=(0, 6))
+    btn_pdf = ttk.Button(actions, text="打开原文 PDF", state="disabled", width=18)
+    btn_pdf.pack(pady=2)
+    btn_copy = ttk.Button(actions, text="复制 PDF 链接", state="disabled", width=18)
+    btn_copy.pack(pady=2)
+    lbl_copied = ttk.Label(actions, text="", foreground="#1f7a4d")
+    lbl_copied.pack(anchor="w", pady=(4, 0))
 
     def show_detail(text: str) -> None:
         detail.configure(state="normal")
@@ -157,8 +174,14 @@ def main() -> int:
                         values=[dealsview.display(row, f)
                                 for f, *_ in dealsview.COLUMNS])
         dsum.configure(text=dealsview.summary(rows))
-        btn_pdf.configure(state="disabled")
+        _clear_selection()
         show_detail(dealsview.detail_text({}))
+
+    def _clear_selection() -> None:
+        lbl_which.configure(text="未选中")
+        lbl_copied.configure(text="")
+        btn_pdf.configure(state="disabled")
+        btn_copy.configure(state="disabled")
 
     def sort_by(field: str) -> None:
         dstate["reverse"] = not dstate["reverse"] if dstate["sort"] == field else False
@@ -171,29 +194,42 @@ def main() -> int:
             ROOT / "data" / "deals_evidence.json")
         refresh_tree()
 
-    def on_pick(_event=None) -> None:
+    def _selected() -> dict:
         sel = tree.selection()
-        if not sel:
+        return dstate["view"][int(sel[0])] if sel else {}
+
+    def on_pick(_event=None) -> None:
+        row = _selected()
+        if not row:
             return
-        row = dstate["view"][int(sel[0])]
         show_detail(dealsview.detail_text(row, dstate["evidence"]))
-        btn_pdf.configure(state="normal" if row.get("PDF链接") else "disabled")
+        lbl_which.configure(
+            text=f"{row.get('股票代码', '')} {row.get('受要约方', '')}")
+        lbl_copied.configure(text="")
+        has_url = bool(row.get("PDF链接"))
+        btn_pdf.configure(state="normal" if has_url else "disabled")
+        btn_copy.configure(state="normal" if has_url else "disabled")
 
     def open_pdf() -> None:
-        sel = tree.selection()
-        if not sel:
-            return
-        url = dstate["view"][int(sel[0])].get("PDF链接", "")
+        url = _selected().get("PDF链接", "")
         if url:
             import webbrowser
             webbrowser.open(url)
 
+    def copy_link() -> None:
+        url = _selected().get("PDF链接", "")
+        if not url:
+            return
+        root.clipboard_clear()
+        root.clipboard_append(url)
+        lbl_copied.configure(text="已复制")
+
     tree.bind("<<TreeviewSelect>>", on_pick)
-    tree.bind("<Double-1>", lambda _e: open_pdf())
     e_search.bind("<KeyRelease>", lambda _e: refresh_tree())
     cb_type.bind("<<ComboboxSelected>>", lambda _e: refresh_tree())
     btn_reload.configure(command=load_deals)
     btn_pdf.configure(command=open_pdf)
+    btn_copy.configure(command=copy_link)
     btn_csv.configure(command=lambda: _open_file(ROOT / "data" / "deals.csv"))
 
     # ================================================================

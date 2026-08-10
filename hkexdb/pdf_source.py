@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,7 +80,17 @@ class PdfDoc:
 
 
 def _cache_path(cache_dir: Path, url: str) -> Path:
-    return cache_dir / f"{hashlib.sha256(url.encode()).hexdigest()[:20]}.pdf"
+    suffix = ".htm" if is_html_link(url) else ".pdf"
+    return cache_dir / f"{hashlib.sha256(url.encode()).hexdigest()[:20]}{suffix}"
+
+
+def is_html_link(url: str) -> bool:
+    """披露易的短公告发的是 .htm，不是 PDF。
+
+    实测那一周 15 份留存公告里有 4 份是 .htm，全部抽取失败 ——
+    27% 的留存桶就这么没了，而日志上只是一行「不是 PDF」。
+    """
+    return url.split("?")[0].lower().endswith((".htm", ".html"))
 
 
 def fetch_bytes(url: str, cache_dir: Path, *,
@@ -107,14 +118,54 @@ def fetch_bytes(url: str, cache_dir: Path, *,
     resp.raise_for_status()
 
     content = resp.content
-    if not content.startswith(b"%PDF"):
+    if not is_html_link(url) and not content.startswith(b"%PDF"):
         raise ValueError(
             f"这个链接返回的不是 PDF（开头是 {content[:16]!r}）：{url}")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
-    log.info("已取回 PDF %s（%.1f KB）", url, len(content) / 1024)
+    log.info("已取回 %s（%.1f KB）", url, len(content) / 1024)
     return content, False
+
+
+# ---------------------------------------------------------------- HTML 公告
+
+# 换页符：披露易的 .htm 公告用它分页，正好对应 PDF 的页码
+_PAGE_BREAK = re.compile(r"page-break|pagebreak", re.I)
+
+
+def extract_html_pages(data: bytes) -> dict[int, str]:
+    """把 .htm 公告拆成 {页码: 文本}。
+
+    这些公告本来就是同一份文件的另一种发布格式，正文措辞和 PDF 版
+    一模一样，所以抽取层的正则原样适用 —— 只要把标签去干净。
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(data, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    # 有分页标记就按标记分页，没有就整篇算第 1 页。
+    # 页码是出处的一部分（铁律三），宁可全算第 1 页，也不能编一个页码。
+    chunks, current = [], []
+    for element in soup.body.descendants if soup.body else soup.descendants:
+        name = getattr(element, "name", None)
+        if name in ("hr", "div", "p", "br"):
+            klass = " ".join(element.get("class", []) or []) if hasattr(
+                element, "get") else ""
+            style = element.get("style", "") if hasattr(element, "get") else ""
+            if _PAGE_BREAK.search(f"{klass} {style}"):
+                chunks.append("".join(current))
+                current = []
+        if isinstance(element, str):
+            current.append(str(element))
+    chunks.append("".join(current))
+
+    pages = {}
+    for i, chunk in enumerate([c for c in chunks if c.strip()] or [""], 1):
+        pages[i] = " ".join(chunk.split())
+    return pages
 
 
 def _extract_pdfplumber(data: bytes, max_pages: int) -> tuple[dict[int, str], int]:
@@ -207,9 +258,19 @@ def open_pdf(url: str, cache_dir: Path, *,
              session: requests.Session | None = None,
              user_agent: str = "hkex-precedent-db/0.1",
              max_pages: int = 0, min_text_chars: int = 500) -> PdfDoc:
-    """链接进，带页码的文本出。这是本模块唯一需要调用的函数。"""
+    """链接进，带页码的文本出。这是本模块唯一需要调用的函数。
+
+    .htm 和 .pdf 都收 —— 披露易两种格式都在发，短公告发 .htm。
+    """
     data, from_cache = fetch_bytes(url, cache_dir, session=session,
                                    user_agent=user_agent)
+    if is_html_link(url):
+        pages = extract_html_pages(data)
+        return PdfDoc(url=url, pages=pages, page_count=len(pages),
+                      has_text_layer=_chars(pages) >= min_text_chars,
+                      from_cache=from_cache, extractor="html",
+                      extractor_note="披露易的 .htm 版公告，正文与 PDF 版一致")
+
     pages, page_count, extractor, note = extract_pages(data, max_pages)
     has_text = _chars(pages) >= min_text_chars
 
