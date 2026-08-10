@@ -199,3 +199,51 @@ def test_app_reads_default_dates_from_config():
     import app
     d1, d2 = app.default_dates()
     assert dt.date.fromisoformat(d1) <= dt.date.fromisoformat(d2)
+
+
+# ---------------------------------------------------------------- 启动兜底
+
+def test_crash_guard_writes_a_file_and_never_dies_silently(tmp_path, monkeypatch):
+    """双击后「什么都没发生」是最难排查的失败 —— 必须留下痕迹。
+
+    RUN.bat 曾用 pythonw.exe 启动，它没有控制台：界面若在启动阶段崩掉，
+    用户看不到任何东西，我也拿不到线索。现在改用 python.exe 保留控制台，
+    并加这层兜底：写文件 + 打控制台 + 尽量弹窗。
+    """
+    import app
+    monkeypatch.setattr(app, "ROOT", tmp_path)
+    monkeypatch.setattr(app, "main", lambda: (_ for _ in ()).throw(
+        RuntimeError("启动就炸")))
+
+    rc = app._crash_guard()
+
+    assert rc == 1
+    crash = tmp_path / "app_crash.txt"
+    assert crash.exists(), "崩溃了却没留下任何文件"
+    text = crash.read_text(encoding="utf-8")
+    assert "RuntimeError" in text and "启动就炸" in text
+    assert "发给 Claude" in text
+
+
+def test_crash_guard_passes_through_success(tmp_path, monkeypatch):
+    import app
+    monkeypatch.setattr(app, "main", lambda: 0)
+    assert app._crash_guard() == 0
+
+
+def test_launcher_keeps_a_console_for_errors():
+    """RUN.bat 不能用 pythonw.exe —— 那样启动失败就是静默的。"""
+    bat = (runner.Path(__file__).parent.parent / "RUN.bat").read_bytes().decode("utf-8")
+    # 只看真正会执行的行 —— 注释里提到 pythonw 是在说明为什么不用它
+    live = [ln for ln in bat.splitlines()
+            if ln.strip() and not ln.strip().upper().startswith("REM")]
+    assert not any("pythonw" in ln for ln in live), \
+        "pythonw 没有控制台，启动失败时用户什么都看不到"
+    assert any("python.exe app.py" in ln for ln in live)
+
+
+def test_launcher_uses_crlf_line_endings():
+    """LF 换行会让 Windows cmd 解析崩掉，双击后闪一下就关（真踩过）。"""
+    raw = (runner.Path(__file__).parent.parent / "RUN.bat").read_bytes()
+    assert b"\r\n" in raw
+    assert raw.count(b"\n") == raw.count(b"\r\n"), "存在裸 LF 换行"

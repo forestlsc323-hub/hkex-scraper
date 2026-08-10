@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title HKEX Scraper
+title HKEX Scraper - 这个黑窗口别关，出错信息会显示在这里
 
 set "PY="
 py -3 -c "import sys" >nul 2>&1
@@ -50,5 +50,21 @@ if not %errorlevel%==0 (
   exit /b 1
 )
 
-start "" .venv\Scripts\pythonw.exe app.py
-exit /b 0
+echo.
+echo 正在打开窗口... 这个黑框请留着，出错信息会显示在这里。
+echo.
+
+REM 用 python.exe 而不是 pythonw.exe：
+REM pythonw 没有控制台，界面启动失败时你什么都看不到（静默失败）。
+.venv\Scripts\python.exe app.py
+set "RC=%errorlevel%"
+
+if not "%RC%"=="0" (
+  echo.
+  echo ------------------------------------------------------------
+  echo  [X] 程序异常退出，代码 %RC%
+  echo      上面的报错请截图，或把 app_crash.txt / run_log.txt 发给 Claude
+  echo ------------------------------------------------------------
+  pause
+)
+exit /b %RC%

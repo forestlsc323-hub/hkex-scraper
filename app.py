@@ -220,5 +220,42 @@ def main() -> int:
     return 0
 
 
+def _crash_guard() -> int:
+    """启动阶段的兜底。
+
+    界面程序最怕「双击了、什么都没发生」—— 用户无从下手，我也拿不到线索。
+    所以不管出什么错，都做三件事：写进 app_crash.txt、打到控制台、
+    再尽量弹个窗。三条路总有一条能让人看见。
+    """
+    import traceback
+    try:
+        return main()
+    except Exception:
+        detail = traceback.format_exc()
+        crash = ROOT / "app_crash.txt"
+        try:
+            crash.write_text(
+                "程序启动失败。请把这个文件发给 Claude。\n\n"
+                f"Python: {sys.version}\n"
+                f"平台: {sys.platform}\n"
+                f"目录: {ROOT}\n\n{detail}",
+                encoding="utf-8")
+        except Exception:
+            pass
+
+        print("\n程序启动失败：\n", file=sys.stderr)
+        print(detail, file=sys.stderr)
+        print(f"\n详情已写入 {crash}，把这个文件发给 Claude。", file=sys.stderr)
+
+        try:
+            import tkinter.messagebox as mb
+            mb.showerror("启动失败",
+                         f"程序启动失败，详情已写入：\n{crash}\n\n"
+                         "请把这个文件发给 Claude。")
+        except Exception:
+            pass
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_crash_guard())
