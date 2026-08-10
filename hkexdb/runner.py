@@ -15,6 +15,7 @@ import csv
 import datetime as dt
 import json
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,10 +29,16 @@ class Cancelled(Exception):
     """用户点了停止。"""
 
 
+VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约"}
+
+
 @dataclass
 class Deal:
     """一单要约的最终结果 —— 这就是你要的那张表的一行。"""
 
+    # 正文层判定：标题层留下来的，未必真是要约（实跑 15 条里只有 2 条是）
+    verdict: str = "unclear"
+    verdict_reason: str = ""
     # 当事方 —— 做 precedent 时第一眼看的就是「谁买谁、谁做的 FA」
     code: str = ""                    # 受要约方股票代码
     name: str = ""                    # 受要约方（披露易归属的简称）
@@ -72,16 +79,109 @@ class Result:
     qc_notes: list = field(default_factory=list)
 
 
-def _speed_settings() -> tuple[int, int]:
-    """从 config.yaml 读翻页步长和并发段数。读不到就用实测过的默认值。"""
+DEFAULT_KEYWORDS = ["要約", "收購", "私有化"]
+
+
+def _speed_settings() -> tuple[int, int, str, list[str]]:
+    """从 config.yaml 读抓取旋钮。读不到就用实测过的默认值。"""
+    step, workers, mode, keywords = 4000, 4, "keyword", list(DEFAULT_KEYWORDS)
     try:
         import yaml
         cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
         listing = cfg.get("listing", {}) or {}
-        return (int(listing.get("row_range_step", 4000)),
-                max(1, int(listing.get("max_workers", 4))))
+        step = int(listing.get("row_range_step", step))
+        workers = max(1, int(listing.get("max_workers", workers)))
+        mode = str(listing.get("mode", mode))
+        keywords = list(listing.get("title_keywords") or keywords)
     except Exception:
-        return 4000, 4
+        pass
+    return step, workers, mode, keywords
+
+
+def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
+    """按月切段。照抄你 asso 那份文件 search_by_category 的做法，
+    连理由都一样：「类别筛选后记录数远小于上限，无需按天」。
+
+    关键词筛过之后一个月也就几十条，按天切纯属浪费请求。
+    """
+    out, cur = [], d1
+    while cur <= d2:
+        nxt = (dt.date(cur.year + 1, 1, 1) if cur.month == 12
+               else dt.date(cur.year, cur.month + 1, 1))
+        out.append((cur, min(d2, nxt - dt.timedelta(days=1))))
+        cur = nxt
+    return out
+
+
+def _fetch_by_keyword(client, vendor_config, keywords: list[str],
+                      d1: dt.date, d2: dt.date, log, on_step,
+                      cancel_event) -> dict[str, dict]:
+    """让披露易在服务端就把标题筛掉，别把全市场拉回来自己筛。
+
+    检索页那个「標題」输入框对应的就是 servlet 的 `title` 参数 ——
+    你 asso 的文件里一直显式传 `"title": ""`（不带关键词＝抓全量），
+    那个空字符串就是这条路的入口。
+
+    差距有多大：一周全量是 6993 条、7 次请求；按关键词是几十条、
+    每个关键词一次请求。一年从约 250 次请求降到十几次。
+
+    ⚠️ 这是**漏检风险最高**的一处改动，所以：
+      · 关键词取并集，一条公告命中任一即收；
+      · screening_rules.yaml 里那六条已核实的真实 T0 标题，
+        必须条条命中至少一个关键词，否则测试直接不让跑；
+      · 万一某个关键词一条都没返回，说明服务端语义和预期不符，
+        调用方会退回全量抓取 —— 宁可慢，不可漏。
+    """
+    import json as _json
+
+    found: dict[str, dict] = {}
+    chunks = _month_chunks(d1, d2)
+    total = len(chunks) * len(keywords)
+    done = 0
+    per_keyword: dict[str, int] = {k: 0 for k in keywords}
+
+    for c1, c2 in chunks:
+        for kw in keywords:
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled()
+            params = {
+                "sortDir": "0", "sortByOptions": "DateTime", "category": "0",
+                "market": "SEHK", "stockId": "-1", "documentType": "-1",
+                "fromDate": c1.strftime("%Y%m%d"), "toDate": c2.strftime("%Y%m%d"),
+                "title": kw, "searchType": "0",
+                "t1code": "-2", "t2Gcode": "-2", "t2code": "-2",
+                "rowRange": str(vendor_config.ROW_RANGE_STEP), "lang": "zh",
+            }
+            resp = client.session.get(vendor_config.HKEX_SEARCH_URL,
+                                      params=params,
+                                      timeout=vendor_config.REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            raw = payload.get("result")
+            records = _json.loads(raw) if raw not in (None, "null") else []
+            new = 0
+            for rec in records:
+                nid = rec["NEWS_ID"]
+                if nid not in found:
+                    found[nid] = client._clean(rec)
+                    new += 1
+            per_keyword[kw] += len(records)
+
+            done += 1
+            log(f"  [{done}/{total}] {c1:%Y-%m}　「{kw}」返回 {len(records)} 条，"
+                f"新增 {new}　累计 {len(found)}")
+            on_step(0, done / max(1, total))
+            time.sleep(vendor_config.SLEEP_BETWEEN_REQUESTS)
+
+    dead = [k for k, n in per_keyword.items() if n == 0]
+    if dead:
+        raise KeywordModeUnusable(
+            f"关键词 {dead} 一条都没返回 —— 服务端的标题筛选语义和预期不符")
+    return found
+
+
+class KeywordModeUnusable(RuntimeError):
+    """关键词模式看着不对劲。宁可退回慢的全量抓取，也不能静默漏掉公告。"""
 
 
 def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
@@ -96,20 +196,39 @@ def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
     import config as vendor_config              # noqa: E402
     from hkex_client import HKEXClient          # noqa: E402
 
-    step, workers = _speed_settings()
+    step, workers, mode, keywords = _speed_settings()
     vendor_config.ROW_RANGE_STEP = step
 
     n_days = (d2 - d1).days + 1
     workers = max(1, min(workers, n_days))      # 段数不能多过天数
 
     log(f"日期范围 {d1} ~ {d2}（{n_days} 天）")
-    log(f"翻页步长 {step}　并发 {workers} 段（共用一个限速器，"
-        f"总频率不变）")
     log("正在访问检索页建立会话…")
 
     client = HKEXClient()
     cookies = sorted(c.name for c in client.session.cookies)
     log(f"会话 cookie：{cookies if cookies else '（服务端未下发）'}")
+
+    if mode == "keyword":
+        log(f"抓取方式：关键词 {keywords}（服务端筛标题，按月分段）")
+        try:
+            found = _fetch_by_keyword(client, vendor_config, keywords,
+                                      d1, d2, log, on_step, cancel_event)
+            out = sorted(found.values(),
+                         key=lambda r: r.get("DATE_TIME", ""), reverse=True)
+            log(f"关键词模式抓到 {len(out)} 条")
+            return out
+        except Cancelled:
+            raise
+        except Exception as exc:
+            if type(exc).__name__ == "CancelledError":
+                raise Cancelled() from exc
+            # 宁可慢，不可漏 —— 关键词模式一有异常就退回全量
+            log(f"⚠️ 关键词模式不可用（{type(exc).__name__}: {exc}）")
+            log("   已自动退回全量抓取。慢，但不会漏。")
+
+    log(f"抓取方式：全量（翻页步长 {step}，并发 {workers} 段，"
+        f"共用一个限速器，总频率不变）")
 
     done = [0]
     lock = threading.Lock()
@@ -133,6 +252,71 @@ def _fetch(d1: dt.date, d2: dt.date, log, on_step, cancel_event) -> list[dict]:
         if type(exc).__name__ == "CancelledError":
             raise Cancelled() from exc
         raise
+
+
+def self_check(d1: dt.date, d2: dt.date, *, on_log=None,
+               cancel_event=None, fetch_full=None, fetch_keyword=None) -> str:
+    """同一段日期，两种抓法各跑一遍，逐条对 NEWS_ID。
+
+    关键词模式快得多，但它的正确性取决于服务端怎么理解 `title` 参数 ——
+    那是我在这里验证不了的。所以给你一个按钮：跑一次，把关键词模式
+    漏掉的公告逐条列出来。漏的是无关公告就放心用；漏了要约公告，
+    就把 config.yaml 的 mode 改回 full，并告诉我漏了什么。
+
+    只对一小段日期跑（一两周），因为全量那一侧本来就慢。
+    """
+    lines: list[str] = []
+
+    def log(text: str = "") -> None:
+        lines.append(str(text))
+        if on_log:
+            on_log(str(text))
+
+    from . import screening as S
+
+    step, workers, _mode, keywords = _speed_settings()
+    log(f"自检：{d1} ~ {d2}")
+    log(f"关键词 {keywords}")
+    log("")
+
+    def noop(*_a, **_k):
+        return None
+
+    log("【1/2】关键词模式")
+    kw = (fetch_keyword or _fetch)(d1, d2, log, noop, cancel_event)
+    log("")
+    log("【2/2】全量模式（慢，请等）")
+    full = (fetch_full or _fetch)(d1, d2, log, noop, cancel_event)
+
+    kw_ids = {r.get("NEWS_ID") for r in kw}
+    missed = [r for r in full if r.get("NEWS_ID") not in kw_ids]
+
+    log("")
+    log("=" * 56)
+    log(f"关键词模式 {len(kw)} 条　全量 {len(full)} 条　"
+        f"关键词漏掉 {len(missed)} 条")
+
+    rules = S.load_rules("screening_rules.yaml")
+    risky = []
+    for rec in missed:
+        verdict = S.classify_title(rec.get("TITLE", ""), rules)
+        if verdict.bucket in (S.RETAINED, S.MANUAL):
+            risky.append((verdict.bucket, rec))
+
+    if not risky:
+        log("漏掉的全是筛查层本来就会剔除的公告 —— 关键词模式可以放心用。")
+    else:
+        log(f"⚠️ 漏掉的里面有 {len(risky)} 条筛查层会留下来的，逐条列出：")
+        for bucket, rec in risky[:50]:
+            log(f"   [{bucket}] {rec.get('STOCK_CODE', '')} "
+                f"{rec.get('TITLE', '')[:70]}")
+        log("")
+        log("→ 把 config.yaml 里 listing.mode 改成 full，并把这段发给 Claude。")
+    log("=" * 56)
+
+    out = ROOT / "自检报告.txt"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return str(out)
 
 
 def _write_listing(records: list[dict], log) -> Path:
@@ -323,6 +507,7 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
             deal.deal_size = ex.deal_size
             deal.listing_intent = ex.listing_intent
             deal.confidence = ex.confidence
+            deal.verdict, deal.verdict_reason = ex.verdict()
             deal.notes = "；".join(ex.notes)
 
             comps = [{"anchor": c.anchor, "window": c.window, "label": c.label,
@@ -350,10 +535,14 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
                 "上市意向": [ex.listing_intent_evidence.page,
                              ex.listing_intent_evidence.quote],
             }
-            log(f"    [{i}/{len(targets)}] {deal.code} {deal.name}　"
-                f"← {deal.offeror or '要约方未识别'}　"
-                f"{deal.offer_type}　{deal.offer_price}　"
-                f"{deal.premium_pct}%　{deal.deal_size}")
+            if deal.verdict == "offer":
+                log(f"    [{i}/{len(targets)}] ✓ {deal.code} {deal.name}　"
+                    f"← {deal.offeror or '要约方未识别'}　"
+                    f"{deal.offer_type}　{deal.offer_price}　"
+                    f"{deal.premium_pct}%　{deal.deal_size}")
+            else:
+                log(f"    [{i}/{len(targets)}] － {deal.code} {deal.name}　"
+                    f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}")
         except Exception as exc:
             deal.notes = f"抽取失败：{type(exc).__name__}: {exc}"
             deal.confidence = "low"
@@ -402,6 +591,7 @@ LADDER_COLUMNS = [
 LADDER_OTHER = "其他比较项"
 
 DEAL_COLUMNS = [
+    "判定", "判定理由",
     "公告日期", "股票代码", "受要约方", "受要约方全称", "要约方", "要约方财务顾问",
     "要约类型", "对价形式", "要约价(HKD)", "主值溢价率(%)", "主值口径",
     "交易规模(HKD)", "上市地位意向", "停牌前最后交易日",
@@ -413,7 +603,8 @@ DEAL_COLUMNS = [
 def _deal_row(d: Deal) -> list[str]:
     other = "；".join(f"较{k} {v}%" for k, v in d.premium_ladder.items()
                       if k not in LADDER_COLUMNS)
-    return [d.date, d.code, d.name, d.target_full, d.offeror, d.offeror_fa,
+    return [VERDICT_LABEL.get(d.verdict, d.verdict), d.verdict_reason,
+            d.date, d.code, d.name, d.target_full, d.offeror, d.offeror_fa,
             d.offer_type, d.consideration, d.offer_price, d.premium_pct,
             d.premium_basis, d.deal_size, d.listing_intent, d.last_trading_day,
             *[d.premium_ladder.get(c, "") for c in LADDER_COLUMNS], other,

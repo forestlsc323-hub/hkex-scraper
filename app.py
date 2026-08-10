@@ -101,8 +101,8 @@ def main() -> int:
     e_search.pack(side="left", padx=(6, 16))
 
     ttk.Label(dtop, text="类型").pack(side="left")
-    cb_type = ttk.Combobox(dtop, width=8, state="readonly",
-                           values=["全部", "MGO", "VGO", "PO"])
+    cb_type = ttk.Combobox(dtop, width=10, state="readonly",
+                           values=dealsview.TYPE_CHOICES)
     cb_type.current(0)
     cb_type.pack(side="left", padx=(6, 16))
 
@@ -130,6 +130,7 @@ def main() -> int:
 
     # 置信度低的整行标黄 —— 这几单必须人看过才能用
     tree.tag_configure("low", background="#fff4d6")
+    tree.tag_configure("notoffer", foreground="#9aa0a6")
 
     # 明细区：左边正文，右边一列动作按钮。
     # 按钮单独放一边、离表格远远的 —— 原来双击表格行就直接开浏览器，
@@ -162,14 +163,17 @@ def main() -> int:
         detail.configure(state="disabled")
 
     def refresh_tree() -> None:
-        rows = dealsview.filter_rows(
-            dstate["rows"], e_search.get(),
-            "" if cb_type.get() == "全部" else cb_type.get())
+        rows = dealsview.filter_rows(dstate["rows"], e_search.get(),
+                                     cb_type.get())
         rows = dealsview.sort_rows(rows, dstate["sort"], dstate["reverse"])
         dstate["view"] = rows
         tree.delete(*tree.get_children())
         for i, row in enumerate(rows):
-            tags = ("low",) if row.get("置信度") == "low" else ()
+            # 正文层判定不是要约的整行灰掉；是要约但置信度低的标黄
+            if row.get("判定") != "要约":
+                tags = ("notoffer",)
+            else:
+                tags = ("low",) if row.get("置信度") == "low" else ()
             tree.insert("", "end", iid=str(i), tags=tags,
                         values=[dealsview.display(row, f)
                                 for f, *_ in dealsview.COLUMNS])
@@ -285,6 +289,8 @@ def main() -> int:
     btn_diag.pack(side="left", padx=8)
     btn_folder = ttk.Button(bottom, text="打开文件夹")
     btn_folder.pack(side="left", padx=8)
+    btn_check = ttk.Button(bottom, text="自检（对比两种抓法）")
+    btn_check.pack(side="right", padx=8)
 
     # ---------------- 消息泵 ----------------
     def append(text: str) -> None:
@@ -308,6 +314,12 @@ def main() -> int:
                                       f"{runner.STEPS[index]}")
             elif kind == "done":
                 finish(payload)
+            elif kind == "checked":
+                state["running"] = False
+                btn_run.configure(state="normal")
+                btn_check.configure(state="normal")
+                btn_stop.configure(state="disabled")
+                status.configure(text="自检结束，看下面的日志")
         root.after(120, pump)
 
     def finish(result) -> None:
@@ -376,7 +388,42 @@ def main() -> int:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def start_self_check() -> None:
+        """关键词模式快，但它对不对取决于服务端怎么理解 title 参数 ——
+        那是离线验证不了的。所以给一个按钮：同一段日期两种抓法各跑一遍，
+        把关键词模式漏掉的逐条列出来。只对一两周跑，全量那侧本来就慢。"""
+        if state["running"]:
+            return
+        try:
+            d1 = dt.date.fromisoformat(e_from.get().strip())
+            d2 = dt.date.fromisoformat(e_to.get().strip())
+        except ValueError:
+            append("日期格式不对，应该像 2026-06-01")
+            return
+        if (d2 - d1).days > 30:
+            append("自检请只选一两周 —— 全量那一侧很慢，一个月要跑很久。")
+            return
+
+        cancel.clear()
+        state["running"] = True
+        btn_run.configure(state="disabled")
+        btn_check.configure(state="disabled")
+        btn_stop.configure(state="normal")
+
+        def work() -> None:
+            try:
+                path = runner.self_check(d1, d2,
+                                         on_log=lambda t: msgs.put(("log", t)),
+                                         cancel_event=cancel)
+                msgs.put(("log", f"\n自检报告已保存：{path}"))
+            except Exception as exc:
+                msgs.put(("log", f"自检失败：{type(exc).__name__}: {exc}"))
+            msgs.put(("checked", None))
+
+        threading.Thread(target=work, daemon=True).start()
+
     btn_run.configure(command=start)
+    btn_check.configure(command=start_self_check)
     btn_stop.configure(command=lambda: (cancel.set(), append("正在停止…")))
     btn_report.configure(
         command=lambda: _open_file(state["result"].report_path))

@@ -7,6 +7,7 @@ runner.py，界面只剩转发。这些测试覆盖的就是「界面点下去�
 from __future__ import annotations
 
 import datetime as dt
+import json
 import threading
 
 import pytest
@@ -299,15 +300,17 @@ def test_speed_settings_come_from_config_yaml(tmp_path, monkeypatch):
     """步长和并发段数写在 config.yaml，不改 vendor 客户端一个字。"""
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     (tmp_path / "config.yaml").write_text(
-        "listing:\n  row_range_step: 4000\n  max_workers: 4\n", encoding="utf-8")
-    assert runner._speed_settings() == (4000, 4)
+        'listing:\n  row_range_step: 4000\n  max_workers: 4\n'
+        '  mode: "full"\n  title_keywords: ["要約"]\n', encoding="utf-8")
+    assert runner._speed_settings() == (4000, 4, "full", ["要約"])
 
 
 def test_speed_settings_fall_back_when_config_is_unreadable(tmp_path, monkeypatch):
     """配置坏了要能跑，不能因为一行 YAML 打不开就整个程序起不来。"""
     monkeypatch.setattr(runner, "ROOT", tmp_path)
-    step, workers = runner._speed_settings()
+    step, workers, mode, keywords = runner._speed_settings()
     assert step >= 1000 and workers >= 1
+    assert mode in ("keyword", "full") and keywords
 
 
 def test_row_range_step_is_big_enough_for_a_real_day():
@@ -337,7 +340,7 @@ def test_fetch_pushes_the_knobs_into_the_vendor_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     (tmp_path / "config.yaml").write_text(
-        "listing:\n  row_range_step: 4000\n  max_workers: 4\n", encoding="utf-8")
+        'listing:\n  row_range_step: 4000\n  max_workers: 4\n  mode: "full"\n', encoding="utf-8")
 
     fake_config = types.ModuleType("config")
     fake_config.ROW_RANGE_STEP = 500
@@ -370,7 +373,7 @@ def test_segments_never_exceed_the_number_of_days(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     (tmp_path / "config.yaml").write_text(
-        "listing:\n  row_range_step: 4000\n  max_workers: 4\n", encoding="utf-8")
+        'listing:\n  row_range_step: 4000\n  max_workers: 4\n  mode: "full"\n', encoding="utf-8")
 
     fake_config = types.ModuleType("config")
     fake_config.ROW_RANGE_STEP = 500
@@ -423,3 +426,233 @@ def test_vendor_cancel_is_translated_so_the_ui_says_stopped(tmp_path, monkeypatc
     with pytest.raises(runner.Cancelled):
         runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 2),
                       lambda *_: None, lambda *_: None, None)
+
+
+# ---------------------------------------------------------------- 关键词模式
+
+def _fake_vendor(monkeypatch, tmp_path, *, by_keyword):
+    """造一个假披露易：按 title 参数返回不同的结果。"""
+    import sys
+    import types
+
+    cfg = types.ModuleType("config")
+    cfg.ROW_RANGE_STEP = 4000
+    cfg.SLEEP_BETWEEN_REQUESTS = 0
+    cfg.REQUEST_TIMEOUT = (1, 1)
+    cfg.HKEX_SEARCH_URL = "https://x/titleSearchServlet.do"
+    calls = []
+
+    class Resp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._p
+
+    class Session:
+        cookies: list = []
+
+        def get(self, url, params=None, timeout=None):
+            calls.append(params)
+            recs = by_keyword.get(params["title"], [])
+            return Resp({"result": json.dumps(recs) if recs else "null"})
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = Session()
+
+        @staticmethod
+        def _clean(rec):
+            return dict(rec)
+
+        def search(self, *a, **kw):
+            raise AssertionError("关键词模式不该退回全量")
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", cfg)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+    return calls
+
+
+def test_fast_mode_keywords_cover_every_verified_t0_title():
+    """关键词模式是漏检风险最高的一处改动。
+
+    screening_rules.yaml 里那六条标题是人工核实过的真实 T0 ——
+    任何一条不含任何关键词，这条路就会静默漏掉那一类公告。
+    """
+    import yaml
+    root = runner.Path(__file__).parent.parent
+    rules = yaml.safe_load((root / "screening_rules.yaml").read_text(encoding="utf-8"))
+    cfg = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    keywords = cfg["listing"]["title_keywords"]
+
+    for title in rules["t0_title_corpus"]:
+        assert any(k in title for k in keywords), \
+            f"已核实的真实 T0 一个关键词都没命中，关键词模式会漏掉它：\n  {title[:80]}"
+
+
+def test_keyword_mode_unions_results_and_dedupes(_isolate, monkeypatch):
+    """一条公告可能同时含「要約」和「收購」，不能记两遍。"""
+    (_isolate / "config.yaml").write_text(
+        'listing:\n  mode: "keyword"\n  title_keywords: ["要約", "收購"]\n',
+        encoding="utf-8")
+    both = {"NEWS_ID": "a", "DATE_TIME": "2026-06-01 08:00", "TITLE": "收購要約"}
+    only = {"NEWS_ID": "b", "DATE_TIME": "2026-06-02 08:00", "TITLE": "收購事項"}
+    _fake_vendor(monkeypatch, _isolate,
+                 by_keyword={"要約": [both], "收購": [both, only]})
+
+    out = runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 30),
+                        lambda *_: None, lambda *_: None, None)
+    assert [r["NEWS_ID"] for r in out] == ["b", "a"]      # 按时间倒序，不重复
+
+
+def test_keyword_mode_queries_by_month_not_by_day(_isolate, monkeypatch):
+    """筛过之后一个月才几十条，按天切纯属浪费请求 ——
+    这是照抄 asso 那份文件 search_by_category 的做法。"""
+    (_isolate / "config.yaml").write_text(
+        'listing:\n  mode: "keyword"\n  title_keywords: ["要約"]\n',
+        encoding="utf-8")
+    rec = {"NEWS_ID": "a", "DATE_TIME": "2026-01-05 08:00", "TITLE": "要約"}
+    calls = _fake_vendor(monkeypatch, _isolate, by_keyword={"要約": [rec]})
+
+    runner._fetch(dt.date(2026, 1, 1), dt.date(2026, 3, 31),
+                  lambda *_: None, lambda *_: None, None)
+    assert len(calls) == 3, "三个月一个关键词就该是 3 次请求"
+    assert [c["fromDate"] for c in calls] == ["20260101", "20260201", "20260301"]
+    assert [c["toDate"] for c in calls] == ["20260131", "20260228", "20260331"]
+
+
+def test_keyword_mode_actually_sends_the_keyword(_isolate, monkeypatch):
+    """title 传空就是全量 —— 传错了会静默变成把全市场拉回来。"""
+    (_isolate / "config.yaml").write_text(
+        'listing:\n  mode: "keyword"\n  title_keywords: ["私有化"]\n',
+        encoding="utf-8")
+    rec = {"NEWS_ID": "a", "DATE_TIME": "2026-06-01 08:00", "TITLE": "私有化"}
+    calls = _fake_vendor(monkeypatch, _isolate, by_keyword={"私有化": [rec]})
+
+    runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 30),
+                  lambda *_: None, lambda *_: None, None)
+    assert calls[0]["title"] == "私有化"
+    assert calls[0]["lang"] == "zh" and calls[0]["searchType"] == "0"
+
+
+def test_a_dead_keyword_falls_back_to_the_full_scan(_isolate, monkeypatch):
+    """某个关键词一条都没返回 = 服务端语义和预期不符。
+
+    宁可慢，不可漏 —— 这时候必须退回全量，而不是交出一份少了一半的表。
+    """
+    import sys
+    import types
+
+    (_isolate / "config.yaml").write_text(
+        'listing:\n  mode: "keyword"\n  title_keywords: ["要約", "收購"]\n',
+        encoding="utf-8")
+
+    cfg = types.ModuleType("config")
+    cfg.ROW_RANGE_STEP = 4000
+    cfg.SLEEP_BETWEEN_REQUESTS = 0
+    cfg.REQUEST_TIMEOUT = (1, 1)
+    cfg.HKEX_SEARCH_URL = "https://x/s.do"
+    fell_back = []
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"result": "null"}          # 每个关键词都返回 0 条
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = types.SimpleNamespace(
+                cookies=[], get=lambda *a, **k: Resp())
+
+        @staticmethod
+        def _clean(rec):
+            return dict(rec)
+
+        def search(self, *a, **kw):
+            fell_back.append(True)
+            return [{"NEWS_ID": "x"}]
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", cfg)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+
+    logs = []
+    out = runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 30),
+                        logs.append, lambda *_: None, None)
+    assert fell_back, "关键词全空却没退回全量 —— 会交出一份漏掉一半的表"
+    assert out == [{"NEWS_ID": "x"}]
+    assert any("退回全量" in ln for ln in logs), "退回了却不告诉用户"
+
+
+def test_full_mode_is_still_reachable(_isolate, monkeypatch):
+    """config 写 full 就老老实实全量抓，不许偷偷走快的那条。"""
+    import sys
+    import types
+
+    (_isolate / "config.yaml").write_text(
+        'listing:\n  mode: "full"\n', encoding="utf-8")
+    cfg = types.ModuleType("config")
+    cfg.ROW_RANGE_STEP = 500
+    used = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = types.SimpleNamespace(cookies=[])
+
+        def search(self, *a, **kw):
+            used.append("full")
+            return []
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", cfg)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+
+    runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 7),
+                  lambda *_: None, lambda *_: None, None)
+    assert used == ["full"]
+
+
+def test_self_check_flags_a_missed_offer_announcement(_isolate):
+    """自检的全部意义：把关键词模式漏掉的、而且筛查层会留下来的，列出来。"""
+    offer = {"NEWS_ID": "miss", "DATE_TIME": "2026-06-01 08:00",
+             "STOCK_CODE": "01417",
+             "TITLE": "聯合公告 - 可能強制性無條件現金要約及恢復買賣"}
+    noise = {"NEWS_ID": "n1", "DATE_TIME": "2026-06-01 09:00",
+             "STOCK_CODE": "00001", "TITLE": "翌日披露報表"}
+
+    logs = []
+    runner.self_check(dt.date(2026, 6, 1), dt.date(2026, 6, 7),
+                      on_log=logs.append,
+                      fetch_keyword=lambda *a: [noise],
+                      fetch_full=lambda *a: [noise, offer])
+    text = "\n".join(logs)
+    assert "关键词漏掉 1 条" in text
+    assert "01417" in text and "改成 full" in text
+
+
+def test_self_check_says_all_clear_when_only_noise_is_missed(_isolate):
+    logs = []
+    runner.self_check(dt.date(2026, 6, 1), dt.date(2026, 6, 7),
+                      on_log=logs.append,
+                      fetch_keyword=lambda *a: [],
+                      fetch_full=lambda *a: [
+                          {"NEWS_ID": "n1", "DATE_TIME": "2026-06-01 09:00",
+                           "STOCK_CODE": "00001", "TITLE": "翌日披露報表"}])
+    text = "\n".join(logs)
+    assert "可以放心用" in text
+
+
+def test_self_check_writes_a_file_you_can_send_me(_isolate):
+    path = runner.self_check(dt.date(2026, 6, 1), dt.date(2026, 6, 7),
+                             fetch_keyword=lambda *a: [],
+                             fetch_full=lambda *a: [])
+    assert runner.Path(path).exists()

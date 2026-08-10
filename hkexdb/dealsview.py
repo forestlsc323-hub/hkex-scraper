@@ -22,6 +22,7 @@ from pathlib import Path
 
 # (字段名, 表头, 宽度, 对齐)  —— 表头与 runner.DEAL_COLUMNS 保持一致
 COLUMNS = [
+    ("判定", "判定", 56, "center"),
     ("公告日期", "公告日期", 88, "center"),
     ("股票代码", "代码", 58, "center"),
     ("受要约方", "受要约方", 150, "w"),
@@ -115,10 +116,23 @@ def save_evidence(deals, path: str | Path) -> None:
 
 # ---------------------------------------------------------------- 筛选与排序
 
+# 类型下拉的选项。「只看要约」放第一位 —— 打开程序最常做的就是这件事。
+TYPE_CHOICES = ["只看要约", "全部", "MGO", "VGO", "PO"]
+
+
 def filter_rows(rows: list[dict], query: str, offer_type: str = "") -> list[dict]:
-    """搜索框对整行做子串匹配；类型下拉单独筛。"""
+    """搜索框对整行做子串匹配；类型下拉单独筛。
+
+    「只看要约」筛的是正文层判定，不是要约类型 —— 类型没抽出来的
+    真要约也要留在里面，否则就成了拿抽取失败去掩盖数据。
+    """
     out = rows
-    if offer_type:
+    if offer_type == "只看要约":
+        # 判定为空 = 这份 deals.csv 是旧版本跑的，没有这一列。
+        # 那种情况下**全部显示** —— 打开程序看到一张空表，
+        # 用户只会以为程序坏了，而数据其实好好地躺在文件里。
+        out = [r for r in out if r.get("判定") in ("要约", "", None)]
+    elif offer_type and offer_type != "全部":
         out = [r for r in out if r.get("要约类型", "") == offer_type]
     q = (query or "").strip().lower()
     if q:
@@ -148,6 +162,7 @@ def sort_rows(rows: list[dict], field: str, reverse: bool = False) -> list[dict]
 
 # 明细面板的分组，顺序即阅读顺序
 _DETAIL_GROUPS = [
+    ("判定", ["判定", "判定理由"]),
     ("当事方", ["公告日期", "股票代码", "受要约方", "受要约方全称",
                 "要约方", "要约方财务顾问"]),
     ("交易条款", ["要约类型", "对价形式", "要约价(HKD)", "交易规模(HKD)",
@@ -204,12 +219,20 @@ def detail_text(row: dict, evidence: dict | None = None) -> str:
 
 
 def summary(rows: list[dict]) -> str:
-    """表头上的一行汇总。"""
+    """表头上的一行汇总。
+
+    先说「几单是真要约」，再说别的。原来只报「共 15 单」而其中 13 单
+    是普通停复牌公告，表看着就像坏了。
+    """
     if not rows:
         return "没有要约记录。先在「抓取」页跑一次，或确认 data/deals.csv 存在。"
-    kinds = {}
-    for r in rows:
-        kinds[r.get("要约类型") or "未识别"] = kinds.get(r.get("要约类型") or "未识别", 0) + 1
-    got = sum(1 for r in rows if str(r.get("主值溢价率(%)", "")).strip())
-    parts = "　".join(f"{k} {v}" for k, v in sorted(kinds.items()))
-    return f"共 {len(rows)} 单　·　{parts}　·　{got} 单抽到溢价率"
+
+    offers = [r for r in rows if r.get("判定") == "要约"]
+    other = len(rows) - len(offers)
+    kinds: dict[str, int] = {}
+    for r in offers:
+        key = r.get("要约类型") or "类型未识别"
+        kinds[key] = kinds.get(key, 0) + 1
+    parts = "　".join(f"{k} {v}" for k, v in sorted(kinds.items())) or "无"
+    tail = f"　·　另有 {other} 条标题像要约、正文不是（判定列已标出）" if other else ""
+    return f"{len(offers)} 单要约　·　{parts}{tail}"

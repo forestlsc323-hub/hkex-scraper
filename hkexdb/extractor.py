@@ -95,6 +95,27 @@ class Extraction:
     total_shares: str = ""
     notes: list[str] = field(default_factory=list)
 
+    def verdict(self) -> tuple[str, str]:
+        """这份公告到底是不是一单要约？返回 (判定, 理由)。
+
+        实跑一周，留存桶 15 条里只有 2 条是真要约，其余是普通停复牌公告 ——
+        标题层的「復牌／恢復買賣」在**已经筛过一遍的要约表**里是强特征，
+        但在全市场里每天都有一堆无关的停复牌。
+
+        表里摆 13 行空白，看起来像程序坏了。所以在正文层再判一次：
+        正文连「要約價」和「價值比較」都没有的，就直接说它不像要约，
+        而不是留一行空白让人猜。
+
+        注意这是**判定**不是删除（铁律二：软删除）——行照样在表里，
+        只是标出来，人一眼能跳过。
+        """
+        if self.offer_price and self.comparisons:
+            return "offer", "正文有要约价与价值比较"
+        if not self.offer_price and not self.comparisons:
+            return "not_offer", "正文没有「要約價」也没有「價值比較」，不像要约公告"
+        missing = "价值比较" if self.offer_price else "要约价"
+        return "unclear", f"正文只找到一半：缺{missing}，需人工看一眼"
+
     @property
     def confidence(self) -> str:
         """有几个主字段抽到了。低置信度的必须人工复核。"""

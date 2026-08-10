@@ -16,7 +16,8 @@ from hkexdb import runner
 
 
 def make_deal(**kw) -> runner.Deal:
-    base = dict(code="03336", name="巨騰國際", target_full="巨騰國際控股有限公司",
+    base = dict(verdict="offer", verdict_reason="正文有要约价与价值比较",
+                code="03336", name="巨騰國際", target_full="巨騰國際控股有限公司",
                 offeror="藍思科技股份有限公司", offeror_fa="中信里昂證券有限公司",
                 date="2026-05-18", offer_type="VGO", consideration="现金",
                 offer_price="2.20", premium_pct="-15.45",
@@ -191,7 +192,7 @@ def test_summary_counts_by_type():
     text = D.summary(rows(make_deal(offer_type="VGO"),
                           make_deal(offer_type="MGO"),
                           make_deal(offer_type="MGO")))
-    assert "共 3 单" in text and "MGO 2" in text and "VGO 1" in text
+    assert "3 单要约" in text and "MGO 2" in text and "VGO 1" in text
 
 
 def test_summary_on_empty_tells_the_user_what_to_do():
@@ -289,3 +290,53 @@ def test_html_and_pdf_use_different_cache_files():
     p = pdf_source._cache_path(runner.Path("/tmp/c"), "https://x/a_c.htm")
     q = pdf_source._cache_path(runner.Path("/tmp/c"), "https://x/a.pdf")
     assert p.suffix == ".htm" and q.suffix == ".pdf"
+
+
+# ---------------------------------------------------------------- 正文层判定
+
+def test_summary_leads_with_how_many_are_actually_offers():
+    """实跑那次：15 单里只有 2 单是真要约，其余是普通停复牌公告。
+
+    只报「共 15 单」而其中 13 单是空白，表看着就像坏了。
+    """
+    text = D.summary(rows(make_deal(),
+                          make_deal(verdict="not_offer", offer_type=""),
+                          make_deal(verdict="not_offer", offer_type="")))
+    assert text.startswith("1 单要约")
+    assert "另有 2 条" in text
+
+
+def test_only_offers_filter_keeps_offers_whose_type_failed_to_extract():
+    """「只看要约」筛的是正文层判定，不是要约类型。
+
+    类型没抽出来的真要约也要留在里面 —— 否则就成了拿抽取失败去掩盖数据。
+    """
+    data = rows(make_deal(offer_type=""), make_deal(verdict="not_offer"))
+    kept = D.filter_rows(data, "", "只看要约")
+    assert len(kept) == 1 and kept[0]["要约类型"] == ""
+
+
+def test_all_choice_shows_everything():
+    data = rows(make_deal(), make_deal(verdict="not_offer"))
+    assert len(D.filter_rows(data, "", "全部")) == 2
+
+
+def test_verdict_reason_is_visible_in_the_detail_pane():
+    """判定不是删除（铁律二：软删除）—— 行还在，理由要能看到。"""
+    text = D.detail_text(rows(make_deal(
+        verdict="not_offer",
+        verdict_reason="正文没有「要約價」也没有「價值比較」，不像要约公告"))[0])
+    assert "非要约" in text and "不像要约公告" in text
+
+
+def test_an_old_deals_csv_without_the_verdict_column_still_shows_up(tmp_path):
+    """上一版跑出来的 deals.csv 没有「判定」这一列。
+
+    默认筛选是「只看要约」，如果按缺失值一律过滤，用户更新完打开程序
+    会看到一张空表 —— 只会以为程序坏了，而数据好好地躺在文件里。
+    """
+    old = tmp_path / "deals.csv"
+    old.write_text("﻿公告日期,股票代码,受要约方,要约类型,主值溢价率(%)\n"
+                   "2026-05-18,03336,巨騰國際,VGO,-15.45\n", encoding="utf-8")
+    loaded = D.load_rows(old)
+    assert len(D.filter_rows(loaded, "", "只看要约")) == 1

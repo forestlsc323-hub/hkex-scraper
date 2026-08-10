@@ -345,3 +345,31 @@ def test_generic_offeror_with_no_definition_stays_empty():
     ex = extractor.extract("公告 由某證券有限公司代表要約人提出要約", {})
     assert ex.offeror == ""
     assert any("要约方" in n for n in ex.notes)
+
+
+# ---------------------------------------------------------------- 正文层判定
+
+def test_a_real_offer_is_judged_an_offer():
+    assert extractor.extract("", P1417).verdict()[0] == "offer"
+    assert extractor.extract("", P3336).verdict()[0] == "offer"
+    assert extractor.extract("", P00195).verdict()[0] == "offer"
+
+
+def test_a_plain_trading_halt_notice_is_judged_not_an_offer():
+    """实跑一周，留存桶 15 条里 13 条是这种 —— 标题带「復牌」而已。
+
+    表里摆 13 行空白看起来像程序坏了。判出来、标出来，人一眼跳过。
+    """
+    verdict, reason = extractor.extract(
+        "恢復買賣", {1: "應本公司要求，本公司股份已於今日上午九時正起恢復買賣。"}
+    ).verdict()
+    assert verdict == "not_offer"
+    assert "價值比較" in reason
+
+
+def test_half_extracted_is_flagged_for_a_human_not_silently_dropped():
+    """只抽到一半 —— 可能是真要约但格式特别，绝不能当成非要约扔掉。"""
+    verdict, reason = extractor.extract(
+        "", {1: "「要約價」 指 每股要約股份1.50港元"}).verdict()
+    assert verdict == "unclear"
+    assert "人工" in reason
