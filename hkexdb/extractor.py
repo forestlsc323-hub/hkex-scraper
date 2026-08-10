@@ -324,8 +324,55 @@ def _classify(item: str) -> tuple[str, str]:
     return anchor or "last_trading_day", window
 
 
+# 一条比较项长什么样：句子里同时有「溢價/折讓 X%」和「每股…港元」。
+# 这个形状比小标题稳得多 —— 小标题各家律所写法不一，形状是收购守则
+# 规则 3.5 要求披露的内容，不会变。
+_LOOKS_LIKE_COMPARISON = re.compile(
+    r"(?=[^；;。]*(?:溢價|折讓|折價)\s*(?:約)?(?:為)?\s*[\d.]+\s*%)"
+    r"(?=[^；;。]*每股)")
+
+# 假的价值比较表：认购价/配售价/供股价也有一模一样的表（你陷阱清单里那条）。
+# 兜底扫描时必须把它们排掉，否则会把募资价当成要约价的比较。
+_FAKE_COMPARISON = re.compile(r"認購價|配售價|供股價|發行價|轉換價|行使價")
+
+
+def _split_clauses(text: str) -> list[tuple[int, str]]:
+    """按分句符切开，返回 [(起始位置, 句子)]。"""
+    out, start = [], 0
+    for m in re.finditer(r"[；;。]", text):
+        out.append((start, text[start:m.end()]))
+        start = m.end()
+    if start < len(text):
+        out.append((start, text[start:]))
+    return out
+
+
+def _scan_whole_document(joined: str) -> list[tuple[int, str]]:
+    """找不到小标题时，直接在全文里按「形状」捞比较项。
+
+    实跑年初至今 24 单，有 11 单（46%）是因为 `_SECTION_START` 那个
+    「價值比較」小标题没出现而整单落空 —— 有的写「要約價較…」，
+    有的干脆没有小标题，直接一段话列下来。要求小标题存在是我定错了。
+
+    形状判据：一句里同时有「溢價/折讓 X%」和「每股…港元」。
+    """
+    out = []
+    for pos, clause in _split_clauses(joined):
+        if not _LOOKS_LIKE_COMPARISON.search(clause):
+            continue
+        if _FAKE_COMPARISON.search(clause):
+            continue          # 认购价/配售价的同款表，不是要约价的
+        out.append((pos, clause))
+    return out
+
+
 def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
-    """抽「价值比较」整节。跨页也能处理 —— 3336 那节就跨了 p11/p12。"""
+    """抽「价值比较」。
+
+    两条路：
+      1. 有「價值比較」小标题 → 按小标题切出整节，再按编号切条（最精确）；
+      2. 没有小标题 → 全文按「形状」捞（兜底，覆盖 46% 的漏抽）。
+    """
     joined, page_of = "", {}
     for page in sorted(pages):
         flat = _flat(pages[page])
@@ -334,7 +381,7 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
 
     start = _SECTION_START.search(joined)
     if not start:
-        return []
+        return _comparisons_from_scan(joined, page_of)
     rest = joined[start.end():]
     end = _SECTION_END.search(rest)
     section = rest[:end.start()] if end else rest[:2500]
@@ -367,6 +414,48 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
             stated_pct=pct.group(2),
             stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
             page=page_at(pos), quote=item.strip()[:220]))
+    return out
+
+
+def _build(clause: str, page: int) -> Comparison | None:
+    """一句 → 一条比较项。抽不齐就返回 None，绝不半拉子入表。"""
+    pct = _PCT.search(clause)
+    bench = _BENCHMARK.search(clause)
+    if not pct or not bench:
+        return None
+    number = bench.group(3).replace(",", "")
+    approx = bench.group(1) is not None or bench.group(2) is not None
+    anchor, window = _classify(clause)
+    return Comparison(
+        anchor=anchor, window=window,
+        benchmark=number, benchmark_decimals=_decimals(number),
+        benchmark_is_exact=not approx,
+        stated_pct=pct.group(2),
+        stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
+        page=page, quote=clause.strip()[:220])
+
+
+def _comparisons_from_scan(joined: str, page_of: dict[int, int]) -> list[Comparison]:
+    """兜底：没有小标题时按形状全文捞。"""
+    def page_at(pos: int) -> int:
+        best = 0
+        for at, page in sorted(page_of.items()):
+            if at <= pos:
+                best = page
+        return best
+
+    out: list[Comparison] = []
+    seen: set[tuple[str, str, str]] = set()
+    for pos, clause in _scan_whole_document(joined):
+        cmp_ = _build(clause, page_at(pos))
+        if cmp_ is None:
+            continue
+        # 同一条比较可能在摘要和正文各出现一次，去重
+        key = (cmp_.anchor, cmp_.window, cmp_.stated_pct)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cmp_)
     return out
 
 
@@ -608,16 +697,36 @@ def extract_six_month(pages: dict[int, str]) -> tuple[str, str, Evidence]:
 
 # ---------------------------------------------------------------- 交易规模
 
-_UNIT = {"萬": 10_000, "万": 10_000, "億": 100_000_000, "亿": 100_000_000}
+# 港式中文的量词。少了「百萬」这一个，「約66.8百萬港元」就抽不出来 ——
+# 而这是香港公告里最常见的写法之一。
+_UNIT = {"萬": 10_000, "万": 10_000, "億": 100_000_000, "亿": 100_000_000,
+         "百萬": 1_000_000, "百万": 1_000_000,
+         "千萬": 10_000_000, "千万": 10_000_000}
 
+# 量词要按长度倒序排进正则，否则「百萬」会被「萬」先吃掉一半
+_UNIT_ALT = "|".join(sorted(_UNIT, key=len, reverse=True))
+_AMOUNT = rf"([\d,]+\.?\d*)\s*({_UNIT_ALT})?\s*港元"
+
+# 实跑年初至今，12 单里有 6 单交易规模是空的 —— 原来只认三种措辞太窄。
+# 顺序即优先级：越明确写「最高」的越靠前。
+#
+# 口径始终是同一个（你那句判别口诀）：这笔钱付给谁？
+# 付给接纳要约的公众股东的才算，付给特定卖方的不算。
 _DEAL_SIZE = [
     # 「須支付的最高現金代價約為5,440萬港元」
-    re.compile(r"(?:最高現金代價|應付的最高現金代價|須支付的最高現金代價)"
-               r"[^0-9]{0,12}?([\d,]+\.?\d*)\s*(萬|万|億|亿)?港元"),
     # 「應付之最高現金金額為1,905,849,908.60港元」
-    re.compile(r"最高現金金額[^0-9]{0,12}?([\d,]+\.?\d*)\s*(萬|万|億|亿)?港元"),
+    re.compile(rf"最高(?:現金)?(?:總)?(?:代價|金額|價值|款項|總額)"
+               rf"[^0-9]{{0,24}}?{_AMOUNT}"),
+    # 「須支付的最高總代價」这种把「最高」和名词拆开的写法
+    re.compile(rf"(?:應付|須支付|需支付|須付|所需)[^0-9]{{0,12}}?最高"
+               rf"[^0-9]{{0,24}}?{_AMOUNT}"),
     # 「須支付的現金代價總額為92,000,000港元」
-    re.compile(r"現金代價總額[^0-9]{0,12}?([\d,]+\.?\d*)\s*(萬|万|億|亿)?港元"),
+    re.compile(rf"(?:現金)?(?:代價|款項)總額[^0-9]{{0,24}}?{_AMOUNT}"),
+    # 「倘要約獲悉數接納，應付總額約為…」
+    re.compile(rf"(?:悉數接納|全數接納|全部接納)[^。；]{{0,60}}?{_AMOUNT}"),
+    # 「要約項下之總代價約為…」
+    re.compile(rf"要約(?:項下)?(?:之|的)?(?:總代價|總價值)"
+               rf"[^0-9]{{0,24}}?{_AMOUNT}"),
 ]
 
 

@@ -22,6 +22,8 @@ import hashlib
 import io
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,10 +95,68 @@ def is_html_link(url: str) -> bool:
     return url.split("?")[0].lower().endswith((".htm", ".html"))
 
 
+class RateLimiter:
+    """跨线程限速。抄你 asso 那份客户端的 `_RateLimiter`，一模一样的做法。
+
+    他在列表层用了它，注释写着「并发的目的是让网络延迟重叠，不是提高
+    对服务器的请求频率」；但他自己的 `download_pdf` 绕过了它 ——
+    那是他文件里我早就记下的第 9 号 bug。
+
+    我把下载改成 4 路并发时，把这个 bug 一起继承了：56 份公告不限速地
+    并发拉，披露易直接掐连接（10054 远程主机强迫关闭了一个现有的连接）。
+    所以下载也必须走同一把闸。
+    """
+
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            wait = self.min_interval - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+
+
+# 会被对方掐掉的那几种错，重试往往就好了；其余的直接抛，别白等。
+_TRANSIENT = (requests.ConnectionError, requests.Timeout)
+
+
+def _get_with_retry(session, url, headers, timeout, limiter,
+                    attempts: int = 3, backoff: float = 1.5, sleeper=time.sleep):
+    """带退避重试的 GET。
+
+    实跑 56 份公告时挂了 3 份，全是 ConnectionReset / Max retries ——
+    偶发网络错误不该让那一单永久丢掉数据，重试一次通常就回来了。
+
+    ⚠️ 重试次数和超时是一对：读超时曾经是 180 秒，配 4 次重试，
+    一个连不上的链接能白烧 12 分钟 —— 那 56 份跑了 24 分钟，
+    一半时间耗在几个死链上。现在超时压到 (10, 60)、重试 3 次，
+    最坏情况约 3 分钟封顶。
+    """
+    last = None
+    for attempt in range(attempts):
+        if limiter is not None:
+            limiter.acquire()
+        try:
+            resp = session.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except _TRANSIENT as exc:
+            last = exc
+            if attempt < attempts - 1:
+                sleeper(backoff * (2 ** attempt))
+                log.warning("下载失败第 %d 次，退避后重试：%s", attempt + 1, exc)
+    raise last
+
+
 def fetch_bytes(url: str, cache_dir: Path, *,
                 session: requests.Session | None = None,
                 user_agent: str = "hkex-precedent-db/0.1",
-                timeout: int = 180) -> tuple[bytes, bool]:
+                limiter: "RateLimiter | None" = None,
+                timeout: tuple = (10, 60)) -> tuple[bytes, bool]:
     """取 PDF 字节。返回 (内容, 是否来自本地副本)。
 
     ⚠️ `session` 应当传入**已访问过检索页的那个会话**。
@@ -114,8 +174,7 @@ def fetch_bytes(url: str, cache_dir: Path, *,
                     "若失败请传入检索时用的那个 session", url)
         session = requests.Session()
     headers = dict(HEADERS, **{"User-Agent": user_agent})
-    resp = session.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
+    resp = _get_with_retry(session, url, headers, timeout, limiter)
 
     content = resp.content
     if not is_html_link(url) and not content.startswith(b"%PDF"):
@@ -257,13 +316,14 @@ def extract_pages(data: bytes, max_pages: int = 0, *,
 def open_pdf(url: str, cache_dir: Path, *,
              session: requests.Session | None = None,
              user_agent: str = "hkex-precedent-db/0.1",
+             limiter: "RateLimiter | None" = None,
              max_pages: int = 0, min_text_chars: int = 500) -> PdfDoc:
     """链接进，带页码的文本出。这是本模块唯一需要调用的函数。
 
     .htm 和 .pdf 都收 —— 披露易两种格式都在发，短公告发 .htm。
     """
     data, from_cache = fetch_bytes(url, cache_dir, session=session,
-                                   user_agent=user_agent)
+                                   user_agent=user_agent, limiter=limiter)
     if is_html_link(url):
         pages = extract_html_pages(data)
         return PdfDoc(url=url, pages=pages, page_count=len(pages),

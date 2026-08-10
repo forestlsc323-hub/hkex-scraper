@@ -721,3 +721,68 @@ def test_cancelling_mid_extraction_stops_the_batch(_isolate, monkeypatch):
     with pytest.raises(runner.Cancelled):
         runner._extract_deals(rows, lambda *_: None, lambda *_: None,
                               event, open_pdf=fake_open_pdf)
+
+
+# ---------------------------------------------------------------- 镜像归档
+
+def _mirror_pair():
+    """实跑撞上的两组之一：巨騰國際 / 藍思科技 同日同标题各归档一次。"""
+    title = ("聯合公告 (1)買賣協議 (2)中信里昂證券代表藍思科技股份有限公司提出"
+             "自願性有條件全面現金要約 (4)復牌")
+    target = runner.Deal(code="03336", name="巨騰國際", date="2026-05-18",
+                         title=title, offeror="藍思科技股份有限公司",
+                         verdict="offer", premium_pct="-15.45")
+    offeror = runner.Deal(code="06613", name="藍思科技", date="2026-05-18",
+                          title=title, offeror="藍思科技股份有限公司",
+                          verdict="offer", premium_pct="-15.45")
+    return target, offeror
+
+
+def test_the_offeror_side_of_a_mirror_filing_is_marked_not_counted_twice():
+    """两边抽出来的数字一模一样，直接进表就是把同一单记了两遍 ——
+    做中位数时这一单的权重凭空翻倍。"""
+    target, offeror = _mirror_pair()
+    assert runner.mark_mirror_filings([target, offeror]) == 1
+    assert offeror.verdict == "mirror"
+    assert target.verdict == "offer", "受要约方那一行必须留着"
+    assert "坑⑨" in offeror.verdict_reason
+
+
+def test_the_mirror_row_stays_in_the_table():
+    """铁律二：软删除。标出来，不删掉。"""
+    target, offeror = _mirror_pair()
+    runner.mark_mirror_filings([target, offeror])
+    row = runner._deal_row(offeror)
+    assert row[0] == "镜像重复"
+    assert "藍思科技" in row[1]
+
+
+def test_two_different_deals_on_the_same_day_are_not_merged():
+    """同日两单不同交易，标题不同 —— 绝不能当成镜像。"""
+    a = runner.Deal(code="01417", name="浦江中國", date="2026-06-15",
+                    title="甲公告", offeror="YOMI.SUN", verdict="offer")
+    b = runner.Deal(code="03336", name="巨騰國際", date="2026-06-15",
+                    title="乙公告", offeror="藍思科技股份有限公司",
+                    verdict="offer")
+    assert runner.mark_mirror_filings([a, b]) == 0
+    assert a.verdict == b.verdict == "offer"
+
+
+def test_same_company_two_offers_are_never_merged():
+    """同一家公司被不同要约人先后发要约要分开记（绿科×2、金川 MGO+PO）。"""
+    a = runner.Deal(code="02362", name="金川國際", date="2026-03-02",
+                    title="甲", offeror="ALTERNATIVE LIQUIDITY", verdict="offer")
+    b = runner.Deal(code="02362", name="金川國際", date="2026-05-27",
+                    title="乙", offeror="別的要约人", verdict="offer")
+    assert runner.mark_mirror_filings([a, b]) == 0
+
+
+def test_an_unidentifiable_mirror_pair_is_left_for_a_human():
+    """认不出谁是要约方就两行都留着 —— 手册说这一步不许自动猜受要约方。"""
+    title = "聯合公告 全面現金要約"
+    a = runner.Deal(code="01111", name="甲公司", date="2026-05-18",
+                    title=title, offeror="毫不相干的離岸公司", verdict="offer")
+    b = runner.Deal(code="02222", name="乙公司", date="2026-05-18",
+                    title=title, offeror="毫不相干的離岸公司", verdict="offer")
+    assert runner.mark_mirror_filings([a, b]) == 0
+    assert a.verdict == b.verdict == "offer"

@@ -29,7 +29,49 @@ class Cancelled(Exception):
     """用户点了停止。"""
 
 
-VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约"}
+VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约",
+                 "mirror": "镜像重复"}
+
+
+def _normalise(text: str) -> str:
+    import re as _re
+    return _re.sub(r"\s+", "", text or "")
+
+
+def mark_mirror_filings(deals: list) -> int:
+    """同一份联合公告在双方代码下各归档一次，合并记一单（坑⑨）。
+
+    实跑年初至今就撞上两组：
+        03336 巨騰國際 / 06613 藍思科技      要约方＝藍思科技股份有限公司
+        01875 東曜藥業 / 02268 藥明合聯      要约方＝藥明合聯生物技術有限公司
+    两边抽出来的数字一模一样，直接进表就是把同一单记了两遍 ——
+    做中位数时这一单的权重凭空翻倍。
+
+    谁是要约方？**公告自己说了**：把已抽出的「要约方」名字和两家的
+    简称比一下，对得上的那一行就是要约方自己的归档，标成镜像重复。
+    对不上就两行都留着交人工 —— 手册说这一步不许自动猜受要约方。
+    """
+    groups: dict[tuple, list] = {}
+    for d in deals:
+        groups.setdefault((d.date, _normalise(d.title)), []).append(d)
+
+    marked = 0
+    for group in groups.values():
+        if len(group) < 2 or len({d.code for d in group}) < 2:
+            continue
+        offeror = _normalise(next((d.offeror for d in group if d.offeror), ""))
+        if not offeror:
+            continue
+        for d in group:
+            name = _normalise(d.name)
+            # 简称出现在要约方全称里 → 这一行是要约方自己的归档
+            if name and len(name) >= 2 and name in offeror:
+                d.verdict = "mirror"
+                d.verdict_reason = (
+                    f"与同日同标题的另一条重复；本行的公司「{d.name}」就是要约方，"
+                    f"受要约方是同组另一条。合并记一单（坑⑨）")
+                marked += 1
+    return marked
 
 
 @dataclass
@@ -450,7 +492,12 @@ def score_against_answer_key(on_log=None) -> str:
     elif not got:
         log("data/deals.csv 是空的 —— 先跑一次抓取。")
     else:
-        report = scoring.score(got, scoring.load(key_path))
+        answers = scoring.load(key_path)
+        for problem in scoring.sanity_check(answers):
+            log(f"⚠️ 答案表本身有问题：{problem}")
+        if scoring.sanity_check(answers):
+            log("")
+        report = scoring.score(got, answers)
         for line in report.text().splitlines():
             log(line)
 
@@ -624,9 +671,30 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
     _step, workers, _mode, _kw = _speed_settings()
     workers = max(1, min(workers, len(targets)))
     cache = ROOT / "data" / "cache" / "pdf"
-    opener = open_pdf or (lambda url: pdf_source.open_pdf(url, cache))
 
-    log(f"  留存桶 {len(targets)} 条，{workers} 路并发打开 PDF…")
+    if open_pdf is None:
+        # 三件事一起做对，缺一样都会被对方掐连接（实测 56 份挂了 3 份）：
+        #   · 复用**已访问过检索页**的那个会话 —— 带着 cookie，也省掉
+        #     每份都重新握手。原来每下一份就新建一个裸 session。
+        #   · 所有下载共用一把限速闸 —— 并发是为了让延迟重叠，
+        #     不是为了提高请求频率（asso 的 download_pdf 就漏了这一步）。
+        #   · 失败退避重试 —— 偶发的 ConnectionReset 不该让那一单永久丢数据。
+        import sys
+        sys.path.insert(0, str(ROOT / "vendor"))
+        import config as vendor_config          # noqa: E402
+        from hkex_client import HKEXClient      # noqa: E402
+
+        client = HKEXClient()
+        limiter = pdf_source.RateLimiter(vendor_config.SLEEP_BETWEEN_REQUESTS)
+
+        def opener(url):
+            return pdf_source.open_pdf(url, cache, session=client.session,
+                                       limiter=limiter)
+    else:
+        opener = open_pdf
+
+    log(f"  留存桶 {len(targets)} 条，{workers} 路并发打开 PDF"
+        f"（共用会话与限速闸，失败自动重试）…")
 
     done = [0]
     lock = threading.Lock()
@@ -659,6 +727,10 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
 
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
+
+    mirrors = mark_mirror_filings(deals)
+    if mirrors:
+        log(f"  发现 {mirrors} 条镜像归档（要约方自己那一边），已标出不重复计数")
 
     n, size = cache_info()
     if n:

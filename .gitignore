@@ -5,6 +5,8 @@
 # （data/raw 是数据资产，体积会很大，建议单独备份而不是提交到仓库）
 data/
 logs/
+# 但答案表是资产不是产物 —— 它是准确率的唯一标尺，必须进版本库
+!data/answer_key.csv
 
 # Python
 __pycache__/

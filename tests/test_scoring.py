@@ -99,3 +99,35 @@ def test_scoring_a_run_without_an_answer_key_explains_what_to_do(tmp_path, monke
     text = "\n".join(logs)
     assert "answer_key.csv" in text
     assert (tmp_path / "data" / "answer_key_template.csv").exists()
+
+
+def test_the_answer_key_itself_is_sanity_checked():
+    """答案表也会有错 —— 折让不可能超过 100%（价格最低只能到 0）。
+
+    你那份手工表里東曜藥業写的是 -114.67%，而你自己的材料里说这单是
+    「东曜+114%」，是正负号写反了。程序不该默默按错的答案打分。
+    """
+    from hkexdb import scoring as S
+    problems = S.sanity_check([
+        {"股票代码": "01875", "公告日期": "2026-01-13", "主值溢价率(%)": "-114.67"}])
+    assert len(problems) == 1
+    assert "01875" in problems[0] and "不可能" in problems[0]
+
+
+def test_a_normal_discount_is_not_flagged():
+    from hkexdb import scoring as S
+    assert not S.sanity_check([{"股票代码": "01417", "主值溢价率(%)": "-55.57"}])
+    assert not S.sanity_check([{"股票代码": "09638", "主值溢价率(%)": "27.20"}])
+
+
+def test_the_shipped_answer_key_loads_and_is_checked():
+    """仓库里那份 25 单的答案表要能直接读，并且自检能跑。"""
+    from hkexdb import runner, scoring as S
+    path = runner.Path(__file__).parent.parent / "data" / "answer_key.csv"
+    if not path.exists():
+        import pytest
+        pytest.skip("答案表不在（本地 data/ 被清过）")
+    rows = S.load(path)
+    assert len(rows) == 25
+    assert rows[0]["股票代码"].startswith("0"), "代码列前导零被吞了"
+    assert any("01875" in p for p in S.sanity_check(rows))

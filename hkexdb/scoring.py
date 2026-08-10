@@ -146,3 +146,22 @@ def write_template(columns: list[str], path: Path) -> Path:
 def load(path: Path) -> list[dict]:
     from .dealsview import load_rows
     return load_rows(path)
+
+
+# ---------------------------------------------------------------- 答案表自检
+
+def sanity_check(answer_rows: list[dict]) -> list[str]:
+    """答案表自己也会有错 —— 你手册里「公告会错」那一节同样适用于人工表。
+
+    这里只查算术上不可能的值，不碰口径判断：
+    折让不可能超过 100%（价格再低也只能低到 0）。
+    """
+    problems = []
+    for row in answer_rows:
+        pct = _num(row.get("主值溢价率(%)", ""))
+        if pct is not None and pct < -100:
+            problems.append(
+                f"{row.get('股票代码', '?')} / {row.get('公告日期', '?')}："
+                f"折让 {pct}% 在算术上不可能（价格最低只能到 0，即 -100%）。"
+                f"多半是正负号写反了。")
+    return problems
