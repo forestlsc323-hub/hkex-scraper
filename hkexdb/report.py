@@ -174,9 +174,12 @@ def _deals_table(deals) -> str:
                 '可能是该时段确实没有，也可能是筛查词表漏了新措辞 —— '
                 '看下面「人工复核」桶里有没有像要约的标题。</div>')
 
-    head = ("<tr><th>代码</th><th>公司</th><th>日期</th><th>类型</th>"
-            "<th>要约价<br>HKD</th><th>溢价率</th><th>基准</th>"
-            "<th>交易规模<br>HKD</th><th>复算校验</th><th>原文</th></tr>")
+    head = ("<tr><th>日期</th><th>代码</th><th>受要约方</th><th>要约方</th>"
+            "<th>要约方FA</th><th>类型</th><th>对价</th>"
+            "<th>要约价<br>HKD</th><th>溢价率</th><th>口径</th>"
+            "<th>交易规模<br>HKD</th><th>上市地位</th>"
+            "<th>复算校验</th><th>原文</th></tr>")
+    ncols = head.count("<th>")
     body = []
     for d in deals:
         pct = d.premium_pct
@@ -184,27 +187,39 @@ def _deals_table(deals) -> str:
                  else "#b91c1c" if pct else "var(--muted)")
         size = ""
         if d.deal_size:
+            # 只加千分位，小数位原样保留 —— 取整会丢掉角分
+            whole, _, frac = d.deal_size.partition(".")
             try:
-                size = f"{float(d.deal_size):,.0f}"
+                size = f"{int(whole):,}" + (f".{frac}" if frac else "")
             except ValueError:
                 size = d.deal_size
         flag = "" if d.confidence == "high" else \
             f'<span class="tag" style="background:#a86400">{d.confidence}</span>'
         pdf = (f'<a href="{html.escape(d.pdf_url)}" target="_blank" '
                f'rel="noopener">PDF</a>' if d.pdf_url else "")
+        small = 'style="font-size:12px"'
         body.append(
-            f"<tr><td><code>{html.escape(d.code)}</code></td>"
-            f"<td>{html.escape(d.name)}</td><td>{html.escape(d.date)}</td>"
+            f"<tr><td>{html.escape(d.date)}</td>"
+            f"<td><code>{html.escape(d.code)}</code></td>"
+            f"<td>{html.escape(d.target_full or d.name)}</td>"
+            f"<td>{html.escape(d.offeror)}</td>"
+            f"<td {small}>{html.escape(d.offeror_fa)}</td>"
             f"<td><b>{html.escape(d.offer_type)}</b> {flag}</td>"
+            f"<td {small}>{html.escape(d.consideration)}</td>"
             f"<td>{html.escape(d.offer_price)}</td>"
             f'<td style="color:{color};font-weight:600">'
             f"{html.escape(pct)}{'%' if pct else ''}</td>"
-            f'<td style="font-size:12px">{html.escape(d.premium_basis)}</td>'
+            f"<td {small}>{html.escape(d.premium_basis)}</td>"
             f"<td>{size}</td>"
-            f'<td style="font-size:12px">{html.escape(d.checks)}</td>'
+            f"<td {small}>{html.escape(d.listing_intent)}</td>"
+            f"<td {small}>{html.escape(d.checks)}</td>"
             f"<td>{pdf}</td></tr>")
+        ladder = "　".join(f"{k} {v}%" for k, v in d.premium_ladder.items())
+        if ladder:
+            body.append(f'<tr><td colspan="{ncols}" style="color:var(--muted);'
+                        f'font-size:12px">溢价梯子　{html.escape(ladder)}</td></tr>')
         if d.notes:
-            body.append(f'<tr><td colspan="10" style="color:#a86400;'
+            body.append(f'<tr><td colspan="{ncols}" style="color:#a86400;'
                         f'font-size:12px">{html.escape(d.notes)}</td></tr>')
 
     return (f'<h2 style="margin:24px 0 8px">要约明细（{len(deals)} 单）</h2>'

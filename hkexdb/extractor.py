@@ -74,6 +74,14 @@ class Comparison:
 
 @dataclass
 class Extraction:
+    offeror: str = ""                 # 要约方
+    offeror_fa: str = ""              # 要约方财务顾问（标题里「由X代表」的X）
+    target: str = ""                  # 受要约方（标题里写全称时）
+    parties_evidence: Evidence = field(default_factory=Evidence)
+    consideration: str = ""           # 现金 / 证券 / 现金＋证券
+    listing_intent: str = ""          # 拟维持上市 / 拟撤销上市
+    listing_intent_evidence: Evidence = field(default_factory=Evidence)
+    last_trading_day: str = ""        # 停牌前最后交易日
     offer_type: str = ""
     offer_type_evidence: Evidence = field(default_factory=Evidence)
     offer_price: str = ""
@@ -182,7 +190,13 @@ _SECTION_END = re.compile(r"最高(?:與|及)最低股價|財務資源|可動用
 # 「每股」和数字之间可能隔着一长串修饰语，例如
 #   每股經審計合併淨資產價值約0.348的港元
 # 所以中间允许非数字若干字；「約」出现在数字前就说明这是约整值。
-_BENCHMARK = re.compile(r"每股[^0-9%]{0,24}?(約)?\s*([\d,]+\.?\d*)\s*(?:的)?港元")
+# 「約」可能落在「每股」的**两侧**，两种写法都见过：
+#     平均收市價每股約1.168港元          （1417、00195）
+#     平均收市價約每股股份3.18港元        （3336）
+# 只认后一种会把 3336 的 8 个基准全判成精确值，V4 的区间检验退化成等式检验，
+# 于是 11 项里 8 项报假警报 —— 这正是当初设计区间检验要避免的事。
+_BENCHMARK = re.compile(
+    r"(約)?\s*每股[^0-9%]{0,24}?(約)?\s*([\d,]+\.?\d*)\s*(?:的)?港元")
 _PCT = re.compile(r"(溢價|折讓|折價)\s*(?:約)?(?:為)?\s*([\d.]+)\s*%")
 
 _ANCHORS = [
@@ -302,14 +316,146 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
         if not pct or not bench:
             continue
         anchor, window = _classify(item)
-        number = bench.group(2).replace(",", "")
+        number = bench.group(3).replace(",", "")
+        approx = bench.group(1) is not None or bench.group(2) is not None
         out.append(Comparison(
             anchor=anchor, window=window,
             benchmark=number, benchmark_decimals=_decimals(number),
-            benchmark_is_exact=bench.group(1) is None,   # 有「約」就不是精确值
+            benchmark_is_exact=not approx,   # 「約」在哪一侧都算约整值
             stated_pct=pct.group(2),
             stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
             page=page_at(pos), quote=item.strip()[:220]))
+    return out
+
+
+# ---------------------------------------------------------------- 当事方
+#
+# 港股要约公告的标题几乎是固定句式，把三方都写在里面：
+#
+#   由 [要约人财务顾问] （為並）代表 [要约人] 就收購 [受要约方] 全部已發行股份 作出…
+#
+# 三份样本各是一种写法，但结构一致。做投行 precedent 时，
+# 「谁买谁」和「谁做的 FA」是第一眼要看的东西，比溢价率还先看。
+#
+# 这里仍然只做摘录：从标题里**剪**出这几段字，一个字都不改写。
+
+_AGENT = re.compile(r"為並代表|為代表|代表")
+# FA 段的左边界：编号括号、「由」、连接词
+_FA_LEFT = re.compile(r"[)）]|由|及|and\s", re.I)
+# 要约人段的右边界：接下来必然是动词或介词
+_OFFEROR_RIGHT = re.compile(r"就|提出|作出|向|對|以|，|。|,")
+
+# 标题里常有两处「收購」——「部分收購要約以收購綠科科技…」。
+# 非贪婪从第一处起匹配会把「要約以收購」一起吃进公司名里，
+# 所以名字段里明确不许再出现「收購」「要約」。
+_TARGET = re.compile(
+    r"收購\s*((?:(?!收購|要約)[^，。；]){2,40}?)\s*(?:之|的)?"
+    r"(?:全部已發行股份|全部已發行股本|不超過|全部股份)")
+
+# 释义节里的兜底：「要約人」 指 XXX
+_OFFEROR_DEF = re.compile(r"「要約人」\s*(?:指|指的是)?\s*([^，。；、]{2,60}?)"
+                          r"\s*(?:，|。|；|指|一家|之)")
+
+
+def _cut_fa(before: str) -> str:
+    """标题里 FA 的名字夹在编号和「代表」之间，从右往左找左边界。"""
+    left = 0
+    for m in _FA_LEFT.finditer(before):
+        left = m.end()
+    return before[left:].strip(" 　-–—")
+
+
+def extract_parties(title: str, pages: dict[int, str]) -> dict:
+    """从标题剪出 要约人 / 要约人财务顾问 / 受要约方。
+
+    抽不到就留空 —— 受要约方还能退回列表层的 STOCK_NAME（那是披露易
+    自己给的归属，比猜可靠），要约人和 FA 没有退路，宁可空着。
+    """
+    title = title or ""
+    out = {"offeror": "", "offeror_fa": "", "target": "",
+           "parties_evidence": Evidence()}
+
+    m = _AGENT.search(title)
+    if m:
+        fa = _cut_fa(title[:m.start()])
+        rest = title[m.end():]
+        cut = _OFFEROR_RIGHT.search(rest)
+        offeror = (rest[:cut.start()] if cut else rest).strip(" 　")
+        if 2 <= len(fa) <= 40:
+            out["offeror_fa"] = fa
+        if 2 <= len(offeror) <= 60:
+            out["offeror"] = offeror
+            out["parties_evidence"] = Evidence(0, title[max(0, m.start() - 30):
+                                                        m.end() + 60].strip())
+
+    t = _TARGET.search(title)
+    if t:
+        out["target"] = t.group(1).strip(" 　")
+
+    if not out["offeror"]:                      # 标题没写，退到释义节
+        for page in sorted(pages):
+            flat = _flat(pages[page])
+            d = _OFFEROR_DEF.search(flat)
+            if d:
+                out["offeror"] = d.group(1).strip()
+                out["parties_evidence"] = Evidence(page, d.group(0)[:200])
+                break
+    return out
+
+
+# ---------------------------------------------------------------- 交易条款
+
+# 对价形式：现金 / 证券 / 混合。港股要约绝大多数是纯现金，
+# 但「證券交換要約」估值口径完全不同，必须能一眼分辨。
+_CASH = re.compile(r"現金要約|以現金(?:方式)?(?:支付|作出)|現金代價")
+_SECURITIES = re.compile(r"證券交換要約|以.{0,6}股份.{0,4}支付|換股要約")
+
+# 要约人对上市地位的意向：维持 vs 撤销。这决定这单能不能当私有化可比。
+_KEEP_LISTING = re.compile(r"維持[^。；]{0,20}上市地位|保持[^。；]{0,20}上市地位")
+_DELIST = re.compile(r"撤(?:銷|回)[^。；]{0,20}上市地位|私有化")
+
+# 停牌前最后交易日：两种写法都见过
+_LAST_TRADING_DAY = [
+    re.compile(r"(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*[（(]\s*即\s*最後交易日"),
+    re.compile(r"最後(?:一個)?交易日\s*[，,]?\s*即\s*(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)"),
+    re.compile(r"最後(?:一個)?交易日\s*(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)"),
+]
+
+
+def extract_terms(title: str, pages: dict[int, str]) -> dict:
+    """对价形式、上市地位意向、停牌前最后交易日。
+
+    三项都是「有就摘、没有就空」，不做任何推断 ——
+    比如「没写撤销上市」不等于「维持上市」，那样的默认值就是编造。
+    """
+    out = {"consideration": "", "listing_intent": "", "last_trading_day": "",
+           "listing_intent_evidence": Evidence()}
+    whole = title or ""
+    flats = {p: _flat(pages[p]) for p in sorted(pages)}
+    whole += "".join(flats.values())
+
+    has_cash = bool(_CASH.search(whole))
+    has_sec = bool(_SECURITIES.search(whole))
+    out["consideration"] = ("现金＋证券" if has_cash and has_sec
+                            else "现金" if has_cash
+                            else "证券" if has_sec else "")
+
+    for page, flat in flats.items():
+        m = _DELIST.search(flat) or _KEEP_LISTING.search(flat)
+        if m:
+            out["listing_intent"] = ("拟撤销上市" if _DELIST.match(m.group(0))
+                                     else "拟维持上市")
+            out["listing_intent_evidence"] = Evidence(page, m.group(0)[:200])
+            break
+
+    for page, flat in flats.items():
+        for pattern in _LAST_TRADING_DAY:
+            m = pattern.search(flat)
+            if m:
+                out["last_trading_day"] = re.sub(r"\s+", "", m.group(1))
+                break
+        if out["last_trading_day"]:
+            break
     return out
 
 
@@ -376,6 +522,18 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     """一份公告 → 结构化字段。抽不到的留空，绝不猜。"""
     result = Extraction()
 
+    parties = extract_parties(title, pages)
+    result.offeror = parties["offeror"]
+    result.offeror_fa = parties["offeror_fa"]
+    result.target = parties["target"]
+    result.parties_evidence = parties["parties_evidence"]
+
+    terms = extract_terms(title, pages)
+    result.consideration = terms["consideration"]
+    result.listing_intent = terms["listing_intent"]
+    result.listing_intent_evidence = terms["listing_intent_evidence"]
+    result.last_trading_day = terms["last_trading_day"]
+
     result.offer_type, result.offer_type_evidence = extract_offer_type(title, pages)
     result.offer_price, result.offer_price_evidence = extract_offer_price(pages)
     result.comparisons = extract_comparisons(pages)
@@ -389,4 +547,6 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         result.notes.append("未找到「價值比較」一节，溢价率无法抽取")
     if not result.deal_size:
         result.notes.append("交易规模未识别")
+    if not result.offeror:
+        result.notes.append("要约方未识别，需人工从公告首页读取")
     return result

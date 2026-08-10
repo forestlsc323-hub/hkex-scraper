@@ -69,17 +69,138 @@ def main() -> int:
 
     from hkexdb import runner
 
+    from hkexdb import dealsview
+
     root = tk.Tk()
     root.title("披露易要约公告抓取工具")
-    root.geometry("880x600")
-    root.minsize(720, 480)
+    root.geometry("1200x740")
+    root.minsize(900, 560)
 
     msgs: queue.Queue = queue.Queue()
     cancel = threading.Event()
     state = {"running": False, "result": None}
 
+    tabs = ttk.Notebook(root)
+    tabs.pack(fill="both", expand=True)
+    page_run = ttk.Frame(tabs)
+    page_deals = ttk.Frame(tabs)
+    tabs.add(page_deals, text="  要约明细  ")
+    tabs.add(page_run, text="  抓取  ")
+
+    # ================================================================
+    # 要约明细页 —— 抓出来的东西在这里看
+    # ================================================================
+    dstate = {"rows": [], "view": [], "evidence": {},
+              "sort": "公告日期", "reverse": True}
+
+    dtop = ttk.Frame(page_deals, padding=(12, 10, 12, 4))
+    dtop.pack(fill="x")
+
+    ttk.Label(dtop, text="搜索").pack(side="left")
+    e_search = ttk.Entry(dtop, width=28)
+    e_search.pack(side="left", padx=(6, 16))
+
+    ttk.Label(dtop, text="类型").pack(side="left")
+    cb_type = ttk.Combobox(dtop, width=8, state="readonly",
+                           values=["全部", "MGO", "VGO", "PO"])
+    cb_type.current(0)
+    cb_type.pack(side="left", padx=(6, 16))
+
+    btn_reload = ttk.Button(dtop, text="重新载入")
+    btn_reload.pack(side="left", padx=4)
+    btn_pdf = ttk.Button(dtop, text="打开这单的 PDF", state="disabled")
+    btn_pdf.pack(side="left", padx=4)
+    btn_csv = ttk.Button(dtop, text="打开 deals.csv")
+    btn_csv.pack(side="left", padx=4)
+
+    dsum = ttk.Label(page_deals, text="", foreground="#666", padding=(12, 0))
+    dsum.pack(fill="x")
+
+    dmid = ttk.Frame(page_deals, padding=(12, 6))
+    dmid.pack(fill="both", expand=True)
+
+    tree = ttk.Treeview(dmid, columns=[c[0] for c in dealsview.COLUMNS],
+                        show="headings", height=14, selectmode="browse")
+    for field, heading, width, anchor in dealsview.COLUMNS:
+        tree.heading(field, text=heading,
+                     command=lambda f=field: sort_by(f))
+        tree.column(field, width=width, anchor=anchor, stretch=False)
+    tsb = ttk.Scrollbar(dmid, command=tree.yview)
+    tree.configure(yscrollcommand=tsb.set)
+    tsb.pack(side="right", fill="y")
+    tree.pack(fill="both", expand=True)
+
+    # 置信度低的整行标黄 —— 这几单必须人看过才能用
+    tree.tag_configure("low", background="#fff4d6")
+
+    detail = tk.Text(page_deals, height=15, wrap="word", state="disabled",
+                     font=("Consolas" if sys.platform.startswith("win")
+                           else "monospace", 9))
+    detail.pack(fill="both", expand=False, padx=12, pady=(0, 12))
+
+    def show_detail(text: str) -> None:
+        detail.configure(state="normal")
+        detail.delete("1.0", "end")
+        detail.insert("1.0", text)
+        detail.configure(state="disabled")
+
+    def refresh_tree() -> None:
+        rows = dealsview.filter_rows(
+            dstate["rows"], e_search.get(),
+            "" if cb_type.get() == "全部" else cb_type.get())
+        rows = dealsview.sort_rows(rows, dstate["sort"], dstate["reverse"])
+        dstate["view"] = rows
+        tree.delete(*tree.get_children())
+        for i, row in enumerate(rows):
+            tags = ("low",) if row.get("置信度") == "low" else ()
+            tree.insert("", "end", iid=str(i), tags=tags,
+                        values=[dealsview.display(row, f)
+                                for f, *_ in dealsview.COLUMNS])
+        dsum.configure(text=dealsview.summary(rows))
+        btn_pdf.configure(state="disabled")
+        show_detail(dealsview.detail_text({}))
+
+    def sort_by(field: str) -> None:
+        dstate["reverse"] = not dstate["reverse"] if dstate["sort"] == field else False
+        dstate["sort"] = field
+        refresh_tree()
+
+    def load_deals() -> None:
+        dstate["rows"] = dealsview.load_rows(ROOT / "data" / "deals.csv")
+        dstate["evidence"] = dealsview.load_evidence(
+            ROOT / "data" / "deals_evidence.json")
+        refresh_tree()
+
+    def on_pick(_event=None) -> None:
+        sel = tree.selection()
+        if not sel:
+            return
+        row = dstate["view"][int(sel[0])]
+        show_detail(dealsview.detail_text(row, dstate["evidence"]))
+        btn_pdf.configure(state="normal" if row.get("PDF链接") else "disabled")
+
+    def open_pdf() -> None:
+        sel = tree.selection()
+        if not sel:
+            return
+        url = dstate["view"][int(sel[0])].get("PDF链接", "")
+        if url:
+            import webbrowser
+            webbrowser.open(url)
+
+    tree.bind("<<TreeviewSelect>>", on_pick)
+    tree.bind("<Double-1>", lambda _e: open_pdf())
+    e_search.bind("<KeyRelease>", lambda _e: refresh_tree())
+    cb_type.bind("<<ComboboxSelected>>", lambda _e: refresh_tree())
+    btn_reload.configure(command=load_deals)
+    btn_pdf.configure(command=open_pdf)
+    btn_csv.configure(command=lambda: _open_file(ROOT / "data" / "deals.csv"))
+
+    # ================================================================
+    # 抓取页
+    # ================================================================
     # ---------------- 顶部：日期 + 按钮 ----------------
-    top = ttk.Frame(root, padding=12)
+    top = ttk.Frame(page_run, padding=12)
     top.pack(fill="x")
 
     d1_default, d2_default = default_dates()
@@ -103,7 +224,7 @@ def main() -> int:
                                       sticky="w", pady=(6, 0))
 
     # ---------------- 中部：进度 + 日志 ----------------
-    mid = ttk.Frame(root, padding=(12, 0))
+    mid = ttk.Frame(page_run, padding=(12, 0))
     mid.pack(fill="both", expand=True)
 
     status = ttk.Label(mid, text="就绪")
@@ -120,7 +241,7 @@ def main() -> int:
     logbox.pack(fill="both", expand=True)
 
     # ---------------- 底部：结果按钮 ----------------
-    bottom = ttk.Frame(root, padding=12)
+    bottom = ttk.Frame(page_run, padding=12)
     bottom.pack(fill="x")
     btn_report = ttk.Button(bottom, text="打开结果网页", state="disabled")
     btn_report.pack(side="left", padx=(0, 8))
@@ -178,6 +299,13 @@ def main() -> int:
         if result.diagnostic_path:
             btn_diag.configure(state="normal")
 
+        # 跑完直接把人送到明细页 —— 那才是他要看的东西
+        if result.deals:
+            dstate["rows"] = dealsview.rows_from_deals(result.deals)
+            dstate["evidence"] = {d.pdf_url: d.evidence for d in result.deals}
+            refresh_tree()
+            tabs.select(page_deals)
+
     def start() -> None:
         if state["running"]:
             return
@@ -222,6 +350,11 @@ def main() -> int:
 
     append("准备就绪。改好日期后点「开始抓取」。")
     append("第一次跑建议只抓一周，确认能通再放大范围。")
+
+    load_deals()                      # 上次的结果直接摆出来，不用重跑
+    if not dstate["rows"]:
+        tabs.select(page_run)         # 还没有数据，先去抓取页
+
     root.after(120, pump)
     root.mainloop()
     return 0

@@ -32,14 +32,24 @@ class Cancelled(Exception):
 class Deal:
     """一单要约的最终结果 —— 这就是你要的那张表的一行。"""
 
-    code: str = ""
-    name: str = ""
-    date: str = ""
+    # 当事方 —— 做 precedent 时第一眼看的就是「谁买谁、谁做的 FA」
+    code: str = ""                    # 受要约方股票代码
+    name: str = ""                    # 受要约方（披露易归属的简称）
+    target_full: str = ""             # 受要约方全称（标题里写了才有）
+    offeror: str = ""                 # 要约方
+    offeror_fa: str = ""              # 要约方财务顾问
+    date: str = ""                    # 首次公告日期（T0）
+    last_trading_day: str = ""        # 停牌前最后交易日
+    # 条款
     offer_type: str = ""
+    consideration: str = ""           # 现金 / 证券 / 现金＋证券
     offer_price: str = ""
-    premium_pct: str = ""
-    premium_basis: str = ""
+    premium_pct: str = ""             # 主值溢价率
+    premium_basis: str = ""           # 主值口径 —— 没有它这个数字没意义
+    premium_ladder: dict = field(default_factory=dict)   # 全部比较项
     deal_size: str = ""
+    listing_intent: str = ""          # 拟维持上市 / 拟撤销上市
+    # 出处与复核
     confidence: str = ""
     checks: str = ""
     pdf_url: str = ""
@@ -264,9 +274,17 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
                 continue
 
             ex = extractor.extract(row["title"], doc.pages)
+            deal.offeror = ex.offeror
+            deal.offeror_fa = ex.offeror_fa
+            # 标题没写受要约方全称时退回披露易给的简称 —— 那是它自己的归属，
+            # 比从正文里猜可靠
+            deal.target_full = ex.target or row["name"]
+            deal.last_trading_day = ex.last_trading_day
             deal.offer_type = ex.offer_type
+            deal.consideration = ex.consideration
             deal.offer_price = ex.offer_price
             deal.deal_size = ex.deal_size
+            deal.listing_intent = ex.listing_intent
             deal.confidence = ex.confidence
             deal.notes = "；".join(ex.notes)
 
@@ -279,14 +297,24 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
                 deal.premium_pct = str(pick.signed_pct)
                 deal.premium_basis = pick.label
 
+            # 整条溢价梯子都留着：投行看可比不会只看一个口径，
+            # 而且下一个人可能要按「最后交易日收市价」重排
+            deal.premium_ladder = {
+                c.label: ("-" if c.stated_direction == "discount" else "")
+                         + c.stated_pct for c in ex.comparisons}
+
             deal.checks = _run_checks(ex, validators)
             deal.evidence = {
+                "当事方": [ex.parties_evidence.page, ex.parties_evidence.quote],
                 "要约类型": [ex.offer_type_evidence.page, ex.offer_type_evidence.quote],
                 "要约价": [ex.offer_price_evidence.page, ex.offer_price_evidence.quote],
                 "交易规模": [ex.deal_size_evidence.page, ex.deal_size_evidence.quote],
                 "溢价率": [pick.page, pick.source_quote] if pick else [0, ""],
+                "上市意向": [ex.listing_intent_evidence.page,
+                             ex.listing_intent_evidence.quote],
             }
             log(f"    [{i}/{len(targets)}] {deal.code} {deal.name}　"
+                f"← {deal.offeror or '要约方未识别'}　"
                 f"{deal.offer_type}　{deal.offer_price}　"
                 f"{deal.premium_pct}%　{deal.deal_size}")
         except Exception as exc:
@@ -320,19 +348,55 @@ def _run_checks(ex, validators) -> str:
     return "全部通过" if not failed else "未通过 " + "；".join(failed[:3])
 
 
+# 溢价梯子的固定列。做可比表时人人都要按同一口径横向对齐，
+# 所以列是固定的：某一单没有这个口径就留空，绝不用别的口径顶上。
+LADDER_COLUMNS = [
+    "最后交易日收市价", "最后交易日前5日均价", "最后交易日前10日均价",
+    "最后交易日前30日均价", "最后交易日前180日均价",
+    "未受干扰日收市价", "未受干扰日前5日均价", "未受干扰日前10日均价",
+    "未受干扰日前30日均价", "未受干扰日前180日均价",
+    "3.7公告前收市价",
+    "每股净资产",
+]
+
+# 兜底列：公告用了固定列以外的口径时，原样写在这里。
+# 没有这一列，那几条比较就悄悄消失了 —— 1417 的「規則3.7 公告前」
+# 和 3336 的「前180日均价」当初就是这么丢的。
+LADDER_OTHER = "其他比较项"
+
+DEAL_COLUMNS = [
+    "公告日期", "股票代码", "受要约方", "受要约方全称", "要约方", "要约方财务顾问",
+    "要约类型", "对价形式", "要约价(HKD)", "主值溢价率(%)", "主值口径",
+    "交易规模(HKD)", "上市地位意向", "停牌前最后交易日",
+    *[f"较{c}(%)" for c in LADDER_COLUMNS], LADDER_OTHER,
+    "置信度", "复算校验", "备注", "公告标题", "PDF链接",
+]
+
+
+def _deal_row(d: Deal) -> list[str]:
+    other = "；".join(f"较{k} {v}%" for k, v in d.premium_ladder.items()
+                      if k not in LADDER_COLUMNS)
+    return [d.date, d.code, d.name, d.target_full, d.offeror, d.offeror_fa,
+            d.offer_type, d.consideration, d.offer_price, d.premium_pct,
+            d.premium_basis, d.deal_size, d.listing_intent, d.last_trading_day,
+            *[d.premium_ladder.get(c, "") for c in LADDER_COLUMNS], other,
+            d.confidence, d.checks, d.notes, d.title, d.pdf_url]
+
+
 def _write_deals(deals: list[Deal], log) -> None:
     if not deals:
         return
     out = ROOT / "data" / "deals.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["股票代码", "公司名称", "公告日期", "要约类型", "要约价(HKD)",
-                    "溢价率(%)", "溢价率基准", "交易规模(HKD)", "置信度",
-                    "复算校验", "备注", "公告标题", "PDF链接"])
+        w.writerow(DEAL_COLUMNS)
         for d in deals:
-            w.writerow([d.code, d.name, d.date, d.offer_type, d.offer_price,
-                        d.premium_pct, d.premium_basis, d.deal_size,
-                        d.confidence, d.checks, d.notes, d.title, d.pdf_url])
+            w.writerow(_deal_row(d))
+
+    # 出处单独存：CSV 塞不下整段引文，而重启后没有出处就违背铁律三
+    from . import dealsview
+    dealsview.save_evidence(deals, ROOT / "data" / "deals_evidence.json")
     log(f"  已保存 {out.name}（{len(deals)} 单）")
 
 

@@ -166,6 +166,108 @@ def test_approx_marker_decides_whether_the_benchmark_is_exact():
     assert by_window["30d"].benchmark_is_exact is False        # 約1.168
 
 
+def test_approx_marker_is_found_on_either_side_of_每股():
+    """3336 写的是「約每股股份3.18港元」——「約」在「每股」**左边**。
+
+    只认「每股約X」会把 3336 的 8 个基准全判成精确值，V4 的区间检验
+    退化成等式检验，11 项里 8 项报假警报。这条守着的是那 8 个假警报。
+    """
+    ex = extractor.extract("", P3336)
+    exact = {c.label: c.benchmark_is_exact for c in ex.comparisons}
+    assert exact["最后交易日前5日均价"] is False        # 約每股股份3.18
+    assert exact["未受干扰日前30日均价"] is False       # 約每股股份2.60
+    assert exact["最后交易日收市价"] is True            # 每股股份4.05，无「約」
+
+
+def test_the_whole_ladder_survives_recomputation():
+    """V4 用公告自己的基准价复算公告自己的百分比，三单一条都不许挂。
+
+    这条是「铁律一」的落点：模型只摘录，Python 复算交叉验证。
+    真挂了说明摘错了，不是公告错了。
+    """
+    from decimal import Decimal
+
+    from hkexdb import validators
+
+    for pages in (P1417, P3336, P00195):
+        ex = extractor.extract("", pages)
+        comps = [validators.PriceComparison(
+            label=c.label, benchmark=Decimal(c.benchmark),
+            benchmark_decimals=c.benchmark_decimals,
+            benchmark_is_exact=c.benchmark_is_exact,
+            stated_pct=Decimal(c.stated_pct),
+            stated_direction=c.stated_direction,
+            page=c.page, source_quote=c.quote) for c in ex.comparisons]
+        nonmarket = frozenset(c.label for c in ex.comparisons if c.anchor == "nav")
+        findings = validators.run_price_comparisons(
+            Decimal(ex.offer_price), comps,
+            Decimal(ex.six_month_low or 0), Decimal(ex.six_month_high or 10 ** 9),
+            nonmarket_labels=nonmarket)
+        failed = [f"{f.code}:{f.subject}" for f in findings if not f.passed]
+        assert not failed, failed
+
+
+# ---------------------------------------------------------------- 当事方
+
+PARTY_CASES = [
+    ("1417",
+     "聯合公告 (1) 完成出售及購買浦江中國控股有限公司擬出售股份 (2) 由力高證券有限公司"
+     "為並代表 YOMI.SUN HOLDING LIMITED 就收購浦江中國控股有限公司全部已發行股份"
+     "作出強制性無條件現金要約 及 (3) 恢復股份買賣",
+     "YOMI.SUN HOLDING LIMITED", "力高證券有限公司", "浦江中國控股有限公司"),
+    ("3336",
+     "聯合公告 (1)有關本公司已發行股份總數約27.81%的買賣協議 (2)中信里昂證券有限公司"
+     "代表藍思科技股份有限公司提出具有前置條件之自願性有條件全面現金要約 "
+     "(3)藍思科技股份有限公司之須予披露交易 及 (4)復牌",
+     "藍思科技股份有限公司", "中信里昂證券有限公司", ""),      # 标题没写受要约方
+    ("00195",
+     "公告 由華富建業企業融資有限公司代表 YELLOWSTONE INTERNATIONAL LIMITED "
+     "提出附帶先決條件的自願現金部分收購要約以收購綠科科技國際有限公司的"
+     "不超過230,000,000股股份",
+     "YELLOWSTONE INTERNATIONAL LIMITED", "華富建業企業融資有限公司",
+     "綠科科技國際有限公司"),
+]
+
+
+@pytest.mark.parametrize("name,title,offeror,fa,target", PARTY_CASES,
+                         ids=[c[0] for c in PARTY_CASES])
+def test_parties_are_cut_out_of_the_title(name, title, offeror, fa, target):
+    """港股要约标题是固定句式：由[FA]（為並）代表[要约人]就收購[标的]…
+
+    做 precedent 时「谁买谁、谁做的 FA」比溢价率还先看。
+    """
+    ex = extractor.extract(title, {})
+    assert ex.offeror == offeror
+    assert ex.offeror_fa == fa
+    assert ex.target == target
+
+
+def test_the_second_收購_does_not_get_eaten_into_the_target_name():
+    """00195 标题里有两处「收購」：「部分收購要約以收購綠科…」。
+
+    从第一处起非贪婪匹配，会把「要約以收購」一起吃进公司名里，
+    产出「要約以收購綠科科技國際有限公司」这种看着还挺像的错答案。
+    """
+    ex = extractor.extract(PARTY_CASES[2][1], {})
+    assert ex.target == "綠科科技國際有限公司"
+    assert "要約" not in ex.target
+
+
+def test_missing_offeror_is_flagged_not_guessed():
+    ex = extractor.extract("董事會會議日期", {1: "本公司謹訂於下週召開董事會會議。"})
+    assert ex.offeror == "" and ex.offeror_fa == "" and ex.target == ""
+    assert any("要约方" in n for n in ex.notes)
+
+
+def test_listing_intent_is_only_reported_when_the_pdf_says_so():
+    """「没写撤销上市」不等于「维持上市」—— 那样的默认值就是编造。"""
+    assert extractor.extract("", P1417).listing_intent == ""
+    assert extractor.extract(
+        "", {1: "要約人擬維持本公司的上市地位。"}).listing_intent == "拟维持上市"
+    assert extractor.extract(
+        "", {1: "要約人擬撤銷本公司的上市地位。"}).listing_intent == "拟撤销上市"
+
+
 def test_chinese_unit_is_converted_and_plain_number_is_kept():
     """「約5,440萬港元」要换算；印全的数字要原样保留，不许取整。"""
     assert extractor.extract("", P1417).deal_size == "54400000"
