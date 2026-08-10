@@ -56,6 +56,18 @@ class Deal:
     premium_ladder: dict = field(default_factory=dict)   # 全部比较项
     deal_size: str = ""
     listing_intent: str = ""          # 拟维持上市 / 拟撤销上市
+    is_conditional: str = ""          # 无条件MGO＝已成事实；有条件＝还要判断能否成
+    board: str = ""                   # 主板 / GEM —— GEM 单可比性弱
+    nature: str = ""                  # 交易性质（建议值，待人工确认）
+    nature_reasons: str = ""
+    # 估值组：和 deal size 分开。付给公众股东的才是规模，整家公司作价多少是估值
+    total_shares: str = ""
+    nav_per_share: str = ""
+    implied_equity_value: str = ""    # 已发行股数 × 要约价
+    pb_ratio: str = ""                # 要约价 ÷ 每股NAV
+    runup_pct: str = ""               # 未受干扰日→最后交易日涨幅（泄露证据）
+    six_month_low: str = ""
+    six_month_high: str = ""
     # 出处与复核
     confidence: str = ""
     checks: str = ""
@@ -319,6 +331,43 @@ def self_check(d1: dt.date, d2: dt.date, *, on_log=None,
     return str(out)
 
 
+def score_against_answer_key(on_log=None) -> str:
+    """拿 data/deals.csv 和 data/answer_key.csv 逐字段对，出准确率报告。
+
+    没有标准答案，「跑通了」和「跑对了」区分不开 —— 而这两件事差很远。
+    答案表里留空的格子不计分，所以你可以只填有把握的那几列。
+    """
+    from . import dealsview, scoring
+
+    lines: list[str] = []
+
+    def log(text: str = "") -> None:
+        lines.append(str(text))
+        if on_log:
+            on_log(str(text))
+
+    got = dealsview.load_rows(ROOT / "data" / "deals.csv")
+    key_path = ROOT / "data" / "answer_key.csv"
+    if not key_path.exists():
+        tpl = scoring.write_template(DEAL_COLUMNS,
+                                     ROOT / "data" / "answer_key_template.csv")
+        log("还没有答案表。已经生成空模板：")
+        log(f"  {tpl}")
+        log("")
+        log("把你人工核过的那些单填进去（只填你确定的字段，其余留空不计分），")
+        log("另存为 data/answer_key.csv，再点一次这个按钮。")
+    elif not got:
+        log("data/deals.csv 是空的 —— 先跑一次抓取。")
+    else:
+        report = scoring.score(got, scoring.load(key_path))
+        for line in report.text().splitlines():
+            log(line)
+
+    out = ROOT / "准确率报告.txt"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return str(out)
+
+
 def _write_listing(records: list[dict], log) -> Path:
     out_dir = ROOT / "data" / "raw"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -483,7 +532,13 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
             raise Cancelled()
         on_step(2, i / len(targets))
 
+        # 板块从文件路径就能读出来：/sehk/ 是主板，/gem/ 是创业板。
+        # GEM 单可比性弱，做可比表时要能一眼分出来。
+        link = row["pdf_url"] or ""
+        board = "GEM" if "/gem/" in link.lower() else (
+            "主板" if "/sehk/" in link.lower() else "")
         deal = Deal(code=row["code"], name=row["name"], date=row["date"],
+                    board=board,
                     title=row["title"], pdf_url=pdf_source.full_url(row["pdf_url"]))
         try:
             doc = opener(deal.pdf_url)
@@ -525,6 +580,31 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
                 c.label: ("-" if c.stated_direction == "discount" else "")
                          + c.stated_pct for c in ex.comparisons}
 
+            # 估值组：算术全在 Python（铁律一），每个结果都说得出依据
+            from . import valuation
+            derived = valuation.derive(
+                offer_price=ex.offer_price, total_shares=ex.total_shares,
+                nav_per_share=ex.nav_per_share,
+                undisturbed_spot=ex.spot("undisturbed"),
+                last_trading_spot=ex.spot("last_trading_day"))
+            deal.total_shares = ex.total_shares
+            deal.nav_per_share = ex.nav_per_share
+            deal.implied_equity_value = derived.implied_equity_value
+            deal.pb_ratio = derived.pb_ratio
+            deal.runup_pct = derived.runup_pct
+            deal.six_month_low = ex.six_month_low
+            deal.six_month_high = ex.six_month_high
+            deal.is_conditional = ex.is_conditional
+
+            # 交易性质只是建议值 —— 真收购和买壳混在一起算中位数就是废数据，
+            # 但这条属于分类层（铁律二），错了是静默污染，所以永远带「待确认」
+            guess = valuation.guess_nature(
+                premium_pct=deal.premium_pct, listing_intent=ex.listing_intent,
+                debt_conversion=ex.debt_conversion, offer_type=ex.offer_type,
+                runup_pct=derived.runup_pct)
+            deal.nature = guess.label
+            deal.nature_reasons = "；".join(guess.reasons)
+
             deal.checks = _run_checks(ex, validators)
             deal.evidence = {
                 "当事方": [ex.parties_evidence.page, ex.parties_evidence.quote],
@@ -534,6 +614,15 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
                 "溢价率": [pick.page, pick.source_quote] if pick else [0, ""],
                 "上市意向": [ex.listing_intent_evidence.page,
                              ex.listing_intent_evidence.quote],
+                "已发行股数": [ex.total_shares_evidence.page,
+                               ex.total_shares_evidence.quote],
+                "条件": [ex.is_conditional_evidence.page,
+                         ex.is_conditional_evidence.quote],
+                "债转股痕迹": [ex.debt_conversion_evidence.page,
+                               ex.debt_conversion_evidence.quote],
+                "隐含股权价值": [0, derived.implied_equity_basis],
+                "市净率": [0, derived.pb_basis],
+                "泄露涨幅": [0, derived.runup_basis],
             }
             if deal.verdict == "offer":
                 log(f"    [{i}/{len(targets)}] ✓ {deal.code} {deal.name}　"
@@ -591,11 +680,19 @@ LADDER_COLUMNS = [
 LADDER_OTHER = "其他比较项"
 
 DEAL_COLUMNS = [
-    "判定", "判定理由",
-    "公告日期", "股票代码", "受要约方", "受要约方全称", "要约方", "要约方财务顾问",
-    "要约类型", "对价形式", "要约价(HKD)", "主值溢价率(%)", "主值口径",
-    "交易规模(HKD)", "上市地位意向", "停牌前最后交易日",
+    # 第一层：识别与筛选（决定这单能不能进样本）
+    "判定", "判定理由", "交易性质(待确认)", "性质依据",
+    "公告日期", "股票代码", "板块", "受要约方", "受要约方全称",
+    "要约方", "要约方财务顾问",
+    "要约类型", "条件", "对价形式",
+    # 第二层：定价
+    "要约价(HKD)", "主值溢价率(%)", "主值口径",
     *[f"较{c}(%)" for c in LADDER_COLUMNS], LADDER_OTHER,
+    "六个月最低", "六个月最高", "泄露涨幅(%)",
+    # 估值组 —— 和规模分开：付给公众股东的才是规模
+    "每股NAV", "市净率P/B", "隐含股权价值(HKD)", "已发行股数",
+    # 第四层：规模与执行
+    "交易规模(HKD)", "上市地位意向", "停牌前最后交易日",
     "置信度", "复算校验", "备注", "公告标题", "PDF链接",
 ]
 
@@ -604,11 +701,26 @@ def _deal_row(d: Deal) -> list[str]:
     other = "；".join(f"较{k} {v}%" for k, v in d.premium_ladder.items()
                       if k not in LADDER_COLUMNS)
     return [VERDICT_LABEL.get(d.verdict, d.verdict), d.verdict_reason,
-            d.date, d.code, d.name, d.target_full, d.offeror, d.offeror_fa,
-            d.offer_type, d.consideration, d.offer_price, d.premium_pct,
-            d.premium_basis, d.deal_size, d.listing_intent, d.last_trading_day,
+            d.nature, d.nature_reasons,
+            d.date, d.code, d.board, d.name, d.target_full,
+            d.offeror, d.offeror_fa,
+            d.offer_type, d.is_conditional, d.consideration,
+            d.offer_price, d.premium_pct, d.premium_basis,
             *[d.premium_ladder.get(c, "") for c in LADDER_COLUMNS], other,
+            d.six_month_low, d.six_month_high, d.runup_pct,
+            d.nav_per_share, d.pb_ratio, d.implied_equity_value, d.total_shares,
+            d.deal_size, d.listing_intent, d.last_trading_day,
             d.confidence, d.checks, d.notes, d.title, d.pdf_url]
+
+
+# Excel 打开 CSV 会把 01417 当数字吞成 1417（你自己踩过：代码列设文本防吞零）。
+# 写成 ="01417" 是唯一在 Excel / WPS / LibreOffice 里都保住前导零的写法，
+# 读回来时 load_rows 再脱掉这层壳，两边都不别扭。
+_TEXT_COLUMNS = {"股票代码"}
+
+
+def _excel_text(value: str) -> str:
+    return f'="{value}"' if value else value
 
 
 def _write_deals(deals: list[Deal], log) -> None:
@@ -616,11 +728,15 @@ def _write_deals(deals: list[Deal], log) -> None:
         return
     out = ROOT / "data" / "deals.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
+    text_at = [i for i, c in enumerate(DEAL_COLUMNS) if c in _TEXT_COLUMNS]
     with out.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(DEAL_COLUMNS)
         for d in deals:
-            w.writerow(_deal_row(d))
+            row = _deal_row(d)
+            for i in text_at:
+                row[i] = _excel_text(row[i])
+            w.writerow(row)
 
     # 出处单独存：CSV 塞不下整段引文，而重启后没有出处就违背铁律三
     from . import dealsview

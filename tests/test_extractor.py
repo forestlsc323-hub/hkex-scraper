@@ -373,3 +373,54 @@ def test_half_extracted_is_flagged_for_a_human_not_silently_dropped():
         "", {1: "「要約價」 指 每股要約股份1.50港元"}).verdict()
     assert verdict == "unclear"
     assert "人工" in reason
+
+
+# ---------------------------------------------------------------- 估值组
+
+def test_six_month_range_survives_a_date_in_the_middle():
+    """1417 写的是「最高收市價為**於2026年6月8日的**每股1.980港元」。
+
+    中间那个日期里有数字，原来的正则不许出现数字，被整段挡掉 ——
+    1417 和 00195 的六个月区间就是这么丢的，而丢了它 V6 就没得校验。
+    """
+    ex = extractor.extract("", P1417)
+    assert ex.six_month_low == "0.200" and ex.six_month_high == "1.980"
+
+
+def test_nav_is_available_separately_from_the_premium():
+    """NAV 不做溢价率主值，但要单独取得到 —— 壳股看 P/B。"""
+    assert extractor.extract("", P3336).nav_per_share == "3.73"
+    assert extractor.extract("", P00195).nav_per_share == "0.7355"
+
+
+def test_both_anchor_spots_are_reachable_for_the_leak_check():
+    """算泄露涨幅要拿到两个锚点的收市价。"""
+    ex = extractor.extract("", P3336)
+    assert ex.spot("undisturbed") == "3.18"
+    assert ex.spot("last_trading_day") == "4.05"
+
+
+def test_conditionality_comes_from_the_title():
+    """无条件 MGO ＝ 已成事实；有条件 ＝ 还要判断能不能成。"""
+    assert extractor.extract(
+        "聯合公告 作出強制性無條件現金要約", {}).is_conditional == "无条件"
+    assert extractor.extract(
+        "聯合公告 具有前置條件之自願性有條件全面現金要約", {}).is_conditional == "附先决条件"
+
+
+def test_debt_conversion_leaves_a_trace_with_a_quote():
+    """债转股被动触发 26.1 是技术性要约的标志，必须留出处。"""
+    ex = extractor.extract("", {1: "本公司將發行可換股債券，換股價為每股1.00港元。"})
+    assert ex.debt_conversion
+    assert ex.debt_conversion_evidence.quote
+
+
+def test_no_debt_conversion_on_a_plain_cash_offer():
+    assert not extractor.extract("", P1417).debt_conversion
+
+
+def test_total_shares_is_extracted_not_computed():
+    """股数是摘的，乘法是 Python 做的（铁律一）。"""
+    ex = extractor.extract("", P3336)
+    assert ex.total_shares == "1200008445"
+    assert ex.total_shares_evidence.page > 0

@@ -22,23 +22,32 @@ from pathlib import Path
 
 # (字段名, 表头, 宽度, 对齐)  —— 表头与 runner.DEAL_COLUMNS 保持一致
 COLUMNS = [
-    ("判定", "判定", 56, "center"),
-    ("公告日期", "公告日期", 88, "center"),
-    ("股票代码", "代码", 58, "center"),
-    ("受要约方", "受要约方", 150, "w"),
-    ("要约方", "要约方", 190, "w"),
-    ("要约类型", "类型", 52, "center"),
-    ("对价形式", "对价", 60, "center"),
-    ("要约价(HKD)", "要约价", 74, "e"),
-    ("主值溢价率(%)", "溢价率%", 74, "e"),
-    ("主值口径", "溢价口径", 140, "w"),
-    ("交易规模(HKD)", "交易规模", 120, "e"),
-    ("要约方财务顾问", "要约方FA", 150, "w"),
-    ("置信度", "置信度", 56, "center"),
+    ("判定", "判定", 50, "center"),
+    ("交易性质(待确认)", "交易性质", 118, "center"),
+    ("公告日期", "公告日期", 86, "center"),
+    ("股票代码", "代码", 54, "center"),
+    ("板块", "板块", 46, "center"),
+    ("受要约方", "受要约方", 128, "w"),
+    ("要约方", "要约方", 170, "w"),
+    ("要约类型", "类型", 46, "center"),
+    ("条件", "条件", 76, "center"),
+    ("要约价(HKD)", "要约价", 68, "e"),
+    ("主值溢价率(%)", "溢价率%", 66, "e"),
+    ("主值口径", "溢价口径", 132, "w"),
+    ("市净率P/B", "P/B", 52, "e"),
+    ("交易规模(HKD)", "交易规模", 112, "e"),
+    ("隐含股权价值(HKD)", "隐含股权价值", 112, "e"),
+    ("要约方财务顾问", "要约方FA", 132, "w"),
+    ("置信度", "置信度", 50, "center"),
 ]
 
 # 数值列：排序要按数字，不能按字符串（否则 9 会排在 1,905,849,908 后面）
-_NUMERIC = {"要约价(HKD)", "主值溢价率(%)", "交易规模(HKD)"}
+_NUMERIC = {"要约价(HKD)", "主值溢价率(%)", "交易规模(HKD)",
+            "隐含股权价值(HKD)", "市净率P/B", "泄露涨幅(%)", "每股NAV",
+            "六个月最低", "六个月最高", "已发行股数"}
+
+# 加千分位显示的列。数字本身一个字符都不动 —— 这是显示，不是计算。
+_THOUSANDS = {"交易规模(HKD)", "隐含股权价值(HKD)", "已发行股数"}
 
 _CONFIDENCE_LABEL = {"high": "高", "medium": "中", "low": "低"}
 
@@ -66,7 +75,7 @@ def thousands(value: str) -> str:
 def display(row: dict, field: str) -> str:
     """一个单元格显示成什么样。"""
     raw = str(row.get(field, "") or "")
-    if field == "交易规模(HKD)":
+    if field in _THOUSANDS:
         return thousands(raw)
     if field == "置信度":
         return _CONFIDENCE_LABEL.get(raw, raw)
@@ -88,7 +97,16 @@ def load_rows(path: str | Path) -> list[dict]:
     if not path.exists():
         return []
     with path.open(encoding="utf-8-sig", newline="") as fh:
-        return list(csv.DictReader(fh))
+        return [{k: _unwrap_excel_text(v) for k, v in row.items()}
+                for row in csv.DictReader(fh)]
+
+
+def _unwrap_excel_text(value):
+    """CSV 里代码列写成 ="01417" 是为了不让 Excel 吞掉前导零，
+    读回来要脱掉这层壳，否则界面上会显示成 ="01417"。"""
+    if isinstance(value, str) and value.startswith('="') and value.endswith('"'):
+        return value[2:-1]
+    return value
 
 
 def load_evidence(path: str | Path) -> dict:
@@ -162,12 +180,16 @@ def sort_rows(rows: list[dict], field: str, reverse: bool = False) -> list[dict]
 
 # 明细面板的分组，顺序即阅读顺序
 _DETAIL_GROUPS = [
-    ("判定", ["判定", "判定理由"]),
-    ("当事方", ["公告日期", "股票代码", "受要约方", "受要约方全称",
-                "要约方", "要约方财务顾问"]),
-    ("交易条款", ["要约类型", "对价形式", "要约价(HKD)", "交易规模(HKD)",
-                  "上市地位意向", "停牌前最后交易日"]),
-    ("溢价／折让（公告原文口径）", None),      # None = 展开整条梯子
+    ("① 识别与筛选", ["判定", "判定理由", "交易性质(待确认)", "性质依据",
+                      "公告日期", "板块", "股票代码", "受要约方", "受要约方全称",
+                      "要约方", "要约方财务顾问"]),
+    ("② 定价 — 溢价／折让（公告原文口径）", None),   # None = 展开整条梯子
+    ("② 定价 — 估值组（付给谁决定它归哪一组）",
+     ["要约价(HKD)", "每股NAV", "市净率P/B", "隐含股权价值(HKD)",
+      "已发行股数", "六个月最低", "六个月最高", "泄露涨幅(%)"]),
+    ("③ 结构", ["要约类型", "条件", "对价形式", "上市地位意向",
+                "停牌前最后交易日"]),
+    ("④ 规模", ["交易规模(HKD)"]),
     ("复核", ["置信度", "复算校验", "备注"]),
 ]
 

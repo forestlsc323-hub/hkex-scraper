@@ -110,6 +110,8 @@ def main() -> int:
     btn_reload.pack(side="left", padx=4)
     btn_csv = ttk.Button(dtop, text="打开 deals.csv")
     btn_csv.pack(side="left", padx=4)
+    btn_score = ttk.Button(dtop, text="对答案（准确率）")
+    btn_score.pack(side="left", padx=4)
 
     dsum = ttk.Label(page_deals, text="", foreground="#666", padding=(12, 0))
     dsum.pack(fill="x")
@@ -235,6 +237,13 @@ def main() -> int:
     btn_pdf.configure(command=open_pdf)
     btn_copy.configure(command=copy_link)
     btn_csv.configure(command=lambda: _open_file(ROOT / "data" / "deals.csv"))
+
+    def run_scoring() -> None:
+        """拿抽出来的和人工答案表逐字段对。没有标准答案就量不出准确率。"""
+        path = runner.score_against_answer_key()
+        _open_file(Path(path))
+
+    btn_score.configure(command=run_scoring)
 
     # ================================================================
     # 抓取页

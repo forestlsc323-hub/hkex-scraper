@@ -93,7 +93,28 @@ class Extraction:
     deal_size: str = ""
     deal_size_evidence: Evidence = field(default_factory=Evidence)
     total_shares: str = ""
+    total_shares_evidence: Evidence = field(default_factory=Evidence)
+    is_conditional: str = ""          # 无条件 / 有条件 / 附先决条件
+    is_conditional_evidence: Evidence = field(default_factory=Evidence)
+    debt_conversion: bool = False     # 债转股被动触发 26.1 的痕迹（技术性要约）
+    debt_conversion_evidence: Evidence = field(default_factory=Evidence)
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def nav_per_share(self) -> str:
+        """每股 NAV。它**不做**溢价率主值，但必须单独存 ——
+        壳股估值看 P/B 不看 P/E，这个数是估值组的，不是溢价组的。"""
+        for c in self.comparisons:
+            if c.anchor == "nav":
+                return c.benchmark
+        return ""
+
+    def spot(self, anchor: str) -> str:
+        """某个锚点的收市价。用来算泄露证据（不受干扰→最后交易日涨幅）。"""
+        for c in self.comparisons:
+            if c.anchor == anchor and c.window == "spot":
+                return c.benchmark
+        return ""
 
     def verdict(self) -> tuple[str, str]:
         """这份公告到底是不是一单要约？返回 (判定, 理由)。
@@ -495,11 +516,85 @@ def extract_terms(title: str, pages: dict[int, str]) -> dict:
     return out
 
 
+# ---------------------------------------------------------------- 估值组
+
+# 已发行股数。乘上要约价就是隐含股权价值（equity value）。
+#
+# 「全部已發行股本估值」不是垃圾，只是**不能当 deal size** ——
+# 它是估值指标，投行做倍数时正要用它。所以它归估值组，不归规模组。
+# 抽的是股数，乘法交给 Python（铁律一）。
+_TOTAL_SHARES = [
+    re.compile(r"已發行股份總數為?\s*([\d,]+)\s*股"),
+    re.compile(r"合共\s*([\d,]+)\s*股股份"),
+    re.compile(r"已發行\s*([\d,]+)\s*股(?:股份)?"),
+    re.compile(r"([\d,]{9,})\s*股已發行股份"),
+]
+
+
+def extract_total_shares(pages: dict[int, str]) -> tuple[str, Evidence]:
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        for pattern in _TOTAL_SHARES:
+            m = pattern.search(flat)
+            if m:
+                start = max(0, m.start() - 40)
+                return (m.group(1).replace(",", ""),
+                        Evidence(page, flat[start:m.end() + 10].strip()))
+    return "", Evidence()
+
+
+# ---------------------------------------------------------------- 条件
+
+# 无条件 MGO ＝ 已成事实；有条件 VGO ＝ 还要判断能不能成。
+# 这个区分决定这单在可比表里怎么用，标题里就写着。
+_CONDITIONAL = [
+    ("附先决条件", re.compile(r"附帶先決條件|具有前置條件|附有先決條件")),
+    ("无条件", re.compile(r"無條件")),
+    ("有条件", re.compile(r"有條件")),
+]
+
+
+def extract_conditionality(title: str, pages: dict[int, str]) -> tuple[str, Evidence]:
+    for label, pattern in _CONDITIONAL:
+        m = pattern.search(title or "")
+        if m:
+            return label, Evidence(0, (title or "")[max(0, m.start() - 20):
+                                                    m.end() + 20].strip())
+    head = _flat("".join(pages.get(p, "") for p in sorted(pages)[:2]))
+    for label, pattern in _CONDITIONAL:
+        m = pattern.search(head)
+        if m:
+            return label, Evidence(1, head[max(0, m.start() - 30):m.end() + 30])
+    return "", Evidence()
+
+
+# ---------------------------------------------------------------- 技术性要约
+
+# 债转股被动触发规则 26.1 → 要约价＝换股价，走程序保上市地位。
+# 这类单的溢价率和真收购完全不是一回事，混进中位数就是废数据。
+_DEBT_CONVERSION = re.compile(
+    r"可換股債券|可轉換債券|債務轉[換股]|換股價|轉換價|"
+    r"以股代債|資本化.{0,8}債務|PSCS|優先股.{0,6}轉換")
+
+
+def extract_debt_conversion(pages: dict[int, str]) -> tuple[bool, Evidence]:
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        m = _DEBT_CONVERSION.search(flat)
+        if m:
+            start = max(0, m.start() - 60)
+            return True, Evidence(page, flat[start:m.end() + 60].strip())
+    return False, Evidence()
+
+
 # ---------------------------------------------------------------- 六个月区间
 
+# ⚠️ 中间可能夹着日期：「最高收市價為**於2026年6月8日的**每股1.980港元」。
+# 原来写成 [^0-9]{0,40} 不许出现数字，被这个日期整段挡掉 ——
+# 1417 和 00195 的六个月区间就是这么丢的，而丢了 V6 就没得校验。
 _SIX_MONTH = re.compile(
-    r"最高收市價[^0-9]{0,40}?每股\s*([\d.]+)\s*港元.{0,120}?"
-    r"最低收市價[^0-9]{0,60}?每股\s*([\d.]+)\s*港元")
+    r"最高收市價.{0,60}?每股\s*(?:約)?\s*([\d.]+)\s*港元.{0,160}?"
+    r"最低收市價.{0,60}?每股\s*(?:約)?\s*([\d.]+)\s*港元")
 
 
 def extract_six_month(pages: dict[int, str]) -> tuple[str, str, Evidence]:
@@ -576,6 +671,11 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.six_month_low, result.six_month_high, result.six_month_evidence = \
         extract_six_month(pages)
     result.deal_size, result.deal_size_evidence = extract_deal_size(pages)
+    result.total_shares, result.total_shares_evidence = extract_total_shares(pages)
+    result.is_conditional, result.is_conditional_evidence = \
+        extract_conditionality(title, pages)
+    result.debt_conversion, result.debt_conversion_evidence = \
+        extract_debt_conversion(pages)
 
     if not result.offer_type:
         result.notes.append("要约类型未识别，需人工判定")
