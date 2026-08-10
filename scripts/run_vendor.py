@@ -14,6 +14,11 @@
 排查范围一下子小很多。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import csv
 import datetime as dt
 import json

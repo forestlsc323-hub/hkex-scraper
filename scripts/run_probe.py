@@ -7,6 +7,11 @@
 这一步只发几个请求，很轻，可以放心重跑（有缓存）。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import logging
 
 from hkexdb import config, console, logsetup, probe

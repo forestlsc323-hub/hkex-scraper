@@ -38,7 +38,7 @@ def test_entry_scripts_print_no_emoji_to_console():
     emoji 只能出现在写进 .md / .csv 的内容里 —— 那些文件显式用 utf-8 写。
     """
     offenders = []
-    for script in sorted(REPO.glob("run_*.py")):
+    for script in sorted((REPO / "scripts").glob("run_*.py")) + [REPO / "app.py"]:
         for lineno, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
             stripped = line.strip()
             if not stripped.startswith("print"):
@@ -66,7 +66,7 @@ def test_scripts_run_under_cp936_console(tmp_path):
     """端到端：模拟 Windows 中文控制台跑 run_screening.py --demo。"""
     env = dict(os.environ, PYTHONIOENCODING="cp936")
     proc = subprocess.run(
-        [sys.executable, str(REPO / "run_screening.py"), "--demo"],
+        [sys.executable, str(REPO / "scripts" / "run_screening.py"), "--demo"],
         env=env, capture_output=True, cwd=str(tmp_path), timeout=120)
     assert proc.returncode == 0, proc.stderr.decode("cp936", errors="replace")[-800:]
     assert b"UnicodeEncodeError" not in proc.stderr

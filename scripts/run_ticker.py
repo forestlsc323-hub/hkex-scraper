@@ -11,6 +11,11 @@
 产出 data/ticker/<代码>.csv，含该公司全部公告（含已除牌证券）。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import argparse
 import csv
 import datetime as dt

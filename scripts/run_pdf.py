@@ -8,6 +8,11 @@
 可以一次给多个链接。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import logging
 import sys
 

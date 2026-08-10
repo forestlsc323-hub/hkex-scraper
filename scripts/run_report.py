@@ -8,6 +8,11 @@
 点卡片筛选判定桶、点表头排序、点行展开判定依据。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import csv
 import sys
 from pathlib import Path

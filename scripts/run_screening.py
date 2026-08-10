@@ -12,6 +12,11 @@
 矛盾行清单和人工复核桶，确认没有误杀，再往下走。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import csv
 import sys
 from pathlib import Path

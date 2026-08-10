@@ -9,6 +9,11 @@
     python run_all.py 2026-06-01 2026-06-30  # 或直接指定
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 from __future__ import annotations
 
 import datetime as dt

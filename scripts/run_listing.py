@@ -6,6 +6,11 @@
 中断了直接重跑，已完成的时间块会自动跳过。
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
 import logging
 import sys
 
