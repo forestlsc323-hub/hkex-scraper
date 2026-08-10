@@ -15,9 +15,11 @@ if not defined PY (
 if not defined PY (
   echo [X] Python not found / 没找到 Python
   echo.
-  echo     请装 Python 3.12（3.13 也可以）：
+  echo     请装 Python 3.13：
   echo       https://www.python.org/downloads/windows/
-  echo       在页面上找 Python 3.12.x，点 "Windows installer (64-bit)"
+  echo       在左边 "Stable Releases" 里找最新的 Python 3.13.x
+  echo       点它下面的 "Windows installer (64-bit)"
+  echo       右边 "Pre-releases" 是测试版，不要选
   echo.
   echo     *** 安装第一屏最底下那个勾必须勾上 ***
   echo         [v] Add python.exe to PATH
