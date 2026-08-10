@@ -15,11 +15,19 @@ if not defined PY (
 if not defined PY (
   echo [X] Python not found / 没找到 Python
   echo.
-  echo     下载安装：https://www.python.org/downloads/
-  echo     安装时务必勾选最下面的 "Add Python to PATH"
+  echo     请装 Python 3.12（3.13 也可以）：
+  echo       https://www.python.org/downloads/windows/
+  echo       在页面上找 Python 3.12.x，点 "Windows installer (64-bit)"
   echo.
-  echo     如果输 python 会弹出微软商店：
-  echo     设置 - 应用 - 高级应用设置 - 应用执行别名，关掉 python.exe
+  echo     *** 安装第一屏最底下那个勾必须勾上 ***
+  echo         [v] Add python.exe to PATH
+  echo         不勾的话装完还是这个提示。
+  echo.
+  echo     装完关掉本窗口，重新双击 RUN.bat 即可。
+  echo.
+  echo     如果输 python 会弹出微软商店（那是占位符，不是真 Python）：
+  echo       设置 - 应用 - 高级应用设置 - 应用执行别名
+  echo       把 python.exe 和 python3.exe 两个开关都关掉
   echo.
   pause
   exit /b 1
