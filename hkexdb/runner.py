@@ -510,11 +510,19 @@ def _screen(records, result: Result, log):
 
 
 def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal]:
-    """对留存桶里的公告逐份打开 PDF，抽要约字段。
+    """对留存桶里的公告打开 PDF，抽要约字段。
 
     这一步才产出你真正要的东西：要约类型、要约价、溢价率、交易规模。
-    留存桶通常只有十几条，所以逐份下载 PDF 是划算的。
+
+    列表层改成关键词模式之后，瓶颈整个搬到了这里：一周才 4 份 PDF，
+    年初至今就是一百多份。实测每份解析只要 1~2 秒，时间全花在**下载**上
+    （每份 500~800 KB，从香港拉回来）—— 也就是延迟受限，不是算力受限。
+
+    所以照搬你 asso 那份客户端对付列表的同一招：切成几段并发，
+    **共用一个限速器**，让网络往返互相重叠，而对披露易的请求频率不变。
     """
+    import concurrent.futures
+
     from . import extractor, pdf_source, selectors, validators
 
     targets = [r for r in rows if r["verdict"].bucket == "retained"]
@@ -522,32 +530,69 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
         log("  留存桶为空，没有要抽的公告。")
         return []
 
-    log(f"  留存桶 {len(targets)} 条，逐份打开 PDF…")
+    _step, workers, _mode, _kw = _speed_settings()
+    workers = max(1, min(workers, len(targets)))
     cache = ROOT / "data" / "cache" / "pdf"
     opener = open_pdf or (lambda url: pdf_source.open_pdf(url, cache))
-    deals: list[Deal] = []
 
-    for i, row in enumerate(targets, 1):
-        if cancel_event is not None and cancel_event.is_set():
-            raise Cancelled()
-        on_step(2, i / len(targets))
+    log(f"  留存桶 {len(targets)} 条，{workers} 路并发打开 PDF…")
 
-        # 板块从文件路径就能读出来：/sehk/ 是主板，/gem/ 是创业板。
-        # GEM 单可比性弱，做可比表时要能一眼分出来。
-        link = row["pdf_url"] or ""
-        board = "GEM" if "/gem/" in link.lower() else (
-            "主板" if "/sehk/" in link.lower() else "")
-        deal = Deal(code=row["code"], name=row["name"], date=row["date"],
-                    board=board,
-                    title=row["title"], pdf_url=pdf_source.full_url(row["pdf_url"]))
+    done = [0]
+    lock = threading.Lock()
+
+    def one(row) -> Deal:
+        deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
+                            selectors, validators)
+        with lock:
+            done[0] += 1
+            n = done[0]
+        on_step(2, n / len(targets))
+        if deal.verdict == "offer":
+            log(f"    [{n}/{len(targets)}] ✓ {deal.code} {deal.name}　"
+                f"← {deal.offeror or '要约方未识别'}　"
+                f"{deal.offer_type}　{deal.offer_price}　"
+                f"{deal.premium_pct}%　{deal.deal_size}")
+        else:
+            log(f"    [{n}/{len(targets)}] － {deal.code} {deal.name}　"
+                f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}")
+        return deal
+
+    if workers == 1:
+        deals = [one(r) for r in targets]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(one, r) for r in targets]
+            deals = []
+            for fut in futures:            # 按提交顺序收，输出稳定可复现
+                deals.append(fut.result())
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled()
+    return deals
+
+
+def _extract_one(row, opener, cancel_event, extractor, pdf_source,
+                 selectors, validators) -> Deal:
+    """抽一份公告。抽挂了变成 Deal 上的一条备注，不能连累其余几百份。"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled()
+
+    # 板块从文件路径就能读出来：/sehk/ 是主板，/gem/ 是创业板。
+    # GEM 单可比性弱，做可比表时要能一眼分出来。
+    link = row["pdf_url"] or ""
+    board = "GEM" if "/gem/" in link.lower() else (
+        "主板" if "/sehk/" in link.lower() else "")
+    deal = Deal(code=row["code"], name=row["name"], date=row["date"],
+                board=board,
+                title=row["title"], pdf_url=pdf_source.full_url(row["pdf_url"]))
+    if True:
         try:
             doc = opener(deal.pdf_url)
             if not doc.has_text_layer:
                 deal.notes = "扫描件无文本层，需 OCR 并人工复核"
                 deal.confidence = "low"
-                deals.append(deal)
-                log(f"    [{i}/{len(targets)}] {deal.code} 扫描件，跳过")
-                continue
+                deal.verdict, deal.verdict_reason = "unclear", "扫描件无文本层"
+                return deal
 
             ex = extractor.extract(row["title"], doc.pages)
             deal.offeror = ex.offeror
@@ -624,20 +669,13 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
                 "市净率": [0, derived.pb_basis],
                 "泄露涨幅": [0, derived.runup_basis],
             }
-            if deal.verdict == "offer":
-                log(f"    [{i}/{len(targets)}] ✓ {deal.code} {deal.name}　"
-                    f"← {deal.offeror or '要约方未识别'}　"
-                    f"{deal.offer_type}　{deal.offer_price}　"
-                    f"{deal.premium_pct}%　{deal.deal_size}")
-            else:
-                log(f"    [{i}/{len(targets)}] － {deal.code} {deal.name}　"
-                    f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}")
+        except Cancelled:
+            raise
         except Exception as exc:
             deal.notes = f"抽取失败：{type(exc).__name__}: {exc}"
             deal.confidence = "low"
-            log(f"    [{i}/{len(targets)}] {deal.code} 失败：{exc}")
-        deals.append(deal)
-    return deals
+            deal.verdict, deal.verdict_reason = "unclear", f"抽取失败：{exc}"
+    return deal
 
 
 def _run_checks(ex, validators) -> str:

@@ -323,7 +323,7 @@ def test_screen_produces_all_four_layers():
     report = S.screen(_sample_records(), RULES)
     assert report.reconciled, report.reconciliation
     assert report.counts[S.RETAINED] >= 3      # 三单真实 T0 都留住了
-    assert report.counts[S.EXCLUDED] >= 4
+    assert report.counts[S.EXCLUDED] >= 3
     assert report.counts[S.SPECIAL] == 1
     # 「董事會會議日期」两层都没中，且不含任何要约题材词 → 判为无关，不占人工桶
     assert report.counts[S.IRRELEVANT] == 1
@@ -380,7 +380,7 @@ def test_market_noise_goes_to_irrelevant_not_to_the_manual_pile():
     等于把人工桶废掉 —— 该看的十几条全淹了。
     """
     noise = ["翌日披露報表", "盈利警告", "股份發行人的證券變動月報表",
-             "更改公司秘書", "須予披露交易", "末期業績公告"]
+             "更改公司秘書", "末期業績公告", "更改註冊辦事處"]
     for title in noise:
         v = S.classify_title(title, RULES)
         assert v.bucket == S.IRRELEVANT, f"「{title}」不该进人工桶：{v.reasons}"
@@ -454,3 +454,59 @@ def test_every_verdict_carries_a_reason():
 def test_the_three_verified_deals_are_not_screened_out(title):
     """1417 / 3336 / 00195 —— 三单人工已核对过的 T0，一条都不能漏。"""
     assert bucket(title) != S.EXCLUDED, f"真实 T0 被误杀：{title}"
+
+
+# ================================================================
+# 留存桶的成本：每留一条错的就白下一份 PDF
+# ================================================================
+
+def test_resumption_still_retains_real_t0():
+    """收紧「復牌／恢復買賣」之后，六条已核实的真实 T0 一条都不许掉。
+
+    这是收紧的代价上限：宁可多下几份 PDF，也不能漏一单。
+    """
+    for title in RULES.t0_corpus:
+        v = S.classify_title(title, RULES)
+        assert v.bucket == S.RETAINED, f"收紧把真实 T0 弄丢了：{title[:70]}"
+
+
+@pytest.mark.parametrize("title", ["恢復買賣", "復牌", "恢復股份買賣",
+                                   "短暫停牌", "根據上市規則第17.20條之復牌"])
+def test_a_bare_trading_halt_notice_no_longer_costs_a_pdf_download(title):
+    """实测一周 4 条留存里 3 条是这种，白下 3 份 PDF；一年就是上百份。
+
+    PDF 下载是现在最慢的一步，所以这里每留一条错的都要真金白银付钱。
+    但也不能排除掉 —— 转人工桶，人一眼扫过去就行。
+    """
+    v = S.classify_title(title, RULES)
+    assert v.bucket != S.RETAINED, f"「{title}」还在留存桶里，会白下一份 PDF"
+    assert v.bucket != S.EXCLUDED, "也不该直接排除 —— 灰掉就看不见了"
+
+
+def test_the_resumption_lookahead_is_anchored_at_the_start():
+    """前瞻写成「(?=.*要約)恢復…」是错的：它从「恢復」往后看，
+    而「要約」通常在它**前面**（1417、3336 都是），三条真实 T0 全落空。"""
+    v = S.classify_title(
+        "聯合公告 (2) 強制性無條件現金要約 及 (3) 恢復股份買賣", RULES)
+    assert v.bucket == S.RETAINED
+    assert any("恢復" in m or "復牌" in m for m in v.matched_retain)
+
+
+def test_listing_rules_transaction_announcements_are_excluded_standalone():
+    """关键词模式下「收購」一个月拉回 113 条，绝大多数是这种。
+
+    上市规则第14/14A章的交易公告，跟收购守则项下的要约完全是两回事。
+    """
+    for title in ["須予披露交易 - 收購目標公司股權", "主要交易 - 收購物業",
+                  "關連交易 - 收購少數股東權益"]:
+        assert bucket(title) == S.EXCLUDED, title
+
+
+def test_but_bundled_into_a_t0_joint_announcement_it_is_harmless():
+    """3336 的标题里就有「(3)藍思科技股份有限公司之須予披露交易」——
+    按坑④ 走双轨，作为打包项不影响收录。"""
+    title = ("聯合公告 (1)買賣協議 (2)中信里昂證券代表藍思科技提出"
+             "自願性有條件全面現金要約 (3)藍思科技之須予披露交易 及 (4)復牌")
+    v = S.classify_title(title, RULES)
+    assert v.is_bundled
+    assert v.bucket == S.RETAINED

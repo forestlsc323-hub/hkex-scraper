@@ -656,3 +656,68 @@ def test_self_check_writes_a_file_you_can_send_me(_isolate):
                              fetch_keyword=lambda *a: [],
                              fetch_full=lambda *a: [])
     assert runner.Path(path).exists()
+
+
+# ---------------------------------------------------------------- 抽取步并发
+
+def test_concurrent_extraction_keeps_the_output_order_stable(_isolate, monkeypatch):
+    """并发拿回来的顺序是乱的，但表必须每次长一样 —— 否则同输入不同输出，
+    审计链就断了。按提交顺序收结果，不按完成顺序。"""
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 4, "keyword", ["要約"]))
+    from hkexdb import screening as S
+    rows = [{"row_id": f"r{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/listedco/listconews/sehk/2026/0615/{i}.pdf",
+             "verdict": S.Verdict(bucket=S.RETAINED)} for i in range(8)]
+
+    import random
+    import time
+
+    def jittery_open(url):
+        time.sleep(random.random() * 0.05)      # 故意让完成顺序乱掉
+        return fake_open_pdf(url)
+
+    first = runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                                  None, open_pdf=jittery_open)
+    second = runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                                   None, open_pdf=jittery_open)
+    assert [d.code for d in first] == [f"{i:05d}" for i in range(8)]
+    assert [d.code for d in first] == [d.code for d in second]
+
+
+def test_one_bad_pdf_does_not_kill_the_other_hundred(_isolate, monkeypatch):
+    """年初至今有一百多份 PDF，其中一份挂掉不能让整批白跑。"""
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 4, "keyword", ["要約"]))
+    from hkexdb import screening as S
+    rows = [{"row_id": f"r{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
+            for i in range(5)]
+
+    def flaky(url):
+        if "/2.pdf" in url:
+            raise ValueError("这个链接返回的不是 PDF")
+        return fake_open_pdf(url)
+
+    deals = runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                                  None, open_pdf=flaky)
+    assert len(deals) == 5
+    bad = deals[2]
+    assert "抽取失败" in bad.notes and bad.confidence == "low"
+    assert sum(1 for d in deals if d.verdict == "offer") == 4
+
+
+def test_cancelling_mid_extraction_stops_the_batch(_isolate, monkeypatch):
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 2, "keyword", ["要約"]))
+    from hkexdb import screening as S
+    event = threading.Event()
+    event.set()
+    rows = [{"row_id": "r0", "date": "2026-06-15", "code": "00001",
+             "name": "甲", "title": "要約", "pdf_url": "/x/0.pdf",
+             "verdict": S.Verdict(bucket=S.RETAINED)}]
+    with pytest.raises(runner.Cancelled):
+        runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                              event, open_pdf=fake_open_pdf)
