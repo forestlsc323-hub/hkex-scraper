@@ -1210,9 +1210,16 @@ def test_a_chunk_that_hits_the_row_limit_is_split_and_re_queried(
         cookies: list = []
 
         def get(self, url, params=None, timeout=None):
-            calls.append((params["fromDate"], params["toDate"]))
-            hit = within(params["fromDate"], params["toDate"])[:cap]
-            return Resp({"result": json.dumps(hit) if hit else "null"})
+            calls.append((params["fromDate"], params["toDate"],
+                          int(params["rowRange"])))
+            all_hit = within(params["fromDate"], params["toDate"])
+            room = int(params["rowRange"])
+            hit = all_hit[:room]
+            # ⚠️ 真接口就是这么答的：hasNextRow 说明还有没取完的。
+            # 夹具不还原这个字段，测出来的就是另一个系统。
+            return Resp({"result": json.dumps(hit) if hit else "null",
+                         "hasNextRow": len(all_hit) > room,
+                         "loadedRecord": len(hit)})
 
     class FakeClient:
         def __init__(self, *a, **kw):
@@ -1232,5 +1239,64 @@ def test_a_chunk_that_hits_the_row_limit_is_split_and_re_queried(
     got = runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 30),
                         lambda *_: None, lambda *_: None, None)
 
-    assert len(got) == 20, f"劈段没劈干净，只拿回 {len(got)} 条"
-    assert len(calls) > 1, "顶到上限却没有劈段重查"
+    assert len(got) == 20, f"没翻完页，只拿回 {len(got)} 条"
+    assert len(calls) > 1, "接口说还有下一页，却没有再问一次"
+    assert max(c[2] for c in calls) > cap, "翻页靠把 rowRange 调大，没调"
+
+
+def test_a_single_day_over_the_server_hard_cap_is_reported_not_swallowed(
+        monkeypatch, _isolate):
+    """劈到单日还是取不完，那就是服务端硬顶（10000 条）—— 劈不动了。
+
+    这时唯一能做对的事是**说出来**。悄悄返回一份不完整的数据，
+    正是铁律二说的静默污染。
+    """
+    import sys
+    import types
+
+    cfg = types.ModuleType("config")
+    cfg.ROW_RANGE_STEP = 5000
+    cfg.SLEEP_BETWEEN_REQUESTS = 0
+    cfg.REQUEST_TIMEOUT = (1, 1)
+    cfg.HKEX_SEARCH_URL = "https://x/titleSearchServlet.do"
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # 永远说「还有下一页」—— 模拟撞上硬顶。
+            # 得真返回点东西，否则关键词模式会以为服务端语义不对而退回全量。
+            rec = [{"NEWS_ID": "n1", "DATE_TIME": "01/06/2026 08:00",
+                    "STOCK_CODE": "00001", "STOCK_NAME": "公司",
+                    "TITLE": "作出要約", "FILE_LINK": "/x/1.pdf"}]
+            return {"result": json.dumps(rec), "hasNextRow": True,
+                    "loadedRecord": 10000}
+
+    class Session:
+        cookies: list = []
+
+        def get(self, url, params=None, timeout=None):
+            return Resp()
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = Session()
+
+        @staticmethod
+        def _clean(rec):
+            return dict(rec)
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", cfg)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (5000, 1, "keyword", ["要約"]))
+
+    said = []
+    runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 2),
+                  said.append, lambda *_: None, None)
+
+    assert any("单日就超过服务端硬顶" in s for s in said), \
+        "取不全却不吭声 —— 这正是最该避免的那种失败"

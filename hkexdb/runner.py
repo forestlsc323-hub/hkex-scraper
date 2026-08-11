@@ -55,6 +55,9 @@ MAX_PER_TARGET = 4
 # 02362 金川就是活例子：2026-03 一单 MGO，2026-05 一单 PO，隔 86 天。
 NEW_DEAL_GAP_DAYS = 60
 
+# 服务端一次最多吐这么多条，再调大 rowRange 也没用（照抄 asso 的常数）。
+SERVER_RECORD_CAP = 10000
+
 
 def _cluster_key(rows: list, gap_days: int) -> list:
     """把一个标的的公告按时间间隔切成若干单。返回 [(第几单, row), …]。"""
@@ -321,39 +324,55 @@ def _fetch_by_keyword(client, vendor_config, keywords: list[str],
 
     cap = int(vendor_config.ROW_RANGE_STEP)
 
-    def ask(a: dt.date, b: dt.date, kw: str) -> list:
-        """问一段日期。**返回条数顶到上限就把这段劈成两半再问。**
+    def ask(a: dt.date, b: dt.date, kw: str, row_range: int | None = None) -> list:
+        """问一段日期，**问到接口说「没有下一页」为止**。
 
-        ⚠️ 一个 (月, 关键词) 只发一个请求、rowRange=500、不翻页 ——
-        某个月要是超过 500 条，多出来的一声不响就没了。抓一年碰不上，
-        抓 2024~2026 迟早撞上，而且撞上时**日志上一切正常**：
-        那一段照样显示「返回 500 条」，没人看得出后面还有。
+        ⚠️ 原来一个 (月, 关键词) 只发一个请求、rowRange=500、不翻页 ——
+        某个月要是超过 500 条，多出来的一声不响就没了，而且日志上一切
+        正常：那一段照样显示「返回 500 条」，没人看得出后面还有。
+        （asso 那份客户端的 search_by_category 是同一个写法，同一个洞；
+        它按天抓的 _search_single_day 反而是对的。）
 
-        接口不给总数，所以只能反过来判：条数正好等于上限，就当它被截了，
-        对半劈开重问，一直劈到单日。多发几个请求换「不漏」，值。
+        接口自己会说话，用它的话最可靠：
+            hasNextRow    还有没有下一页
+            loadedRecord  这次实际返回多少条
+        这个接口没有 offset，翻页靠**把 rowRange 调大重查一遍**
+        （照抄 _search_single_day）。调到服务端硬顶 10000 还说有下一页，
+        就把日期对半劈开 —— 一直劈到单日，那时只能如实报警。
         """
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
+        row_range = row_range or cap
         params = {
             "sortDir": "0", "sortByOptions": "DateTime", "category": "0",
             "market": "SEHK", "stockId": "-1", "documentType": "-1",
             "fromDate": a.strftime("%Y%m%d"), "toDate": b.strftime("%Y%m%d"),
             "title": kw, "searchType": "0",
             "t1code": "-2", "t2Gcode": "-2", "t2code": "-2",
-            "rowRange": str(cap), "lang": "zh",
+            "rowRange": str(row_range), "lang": "zh",
         }
         resp = client.session.get(vendor_config.HKEX_SEARCH_URL, params=params,
                                   timeout=vendor_config.REQUEST_TIMEOUT)
         resp.raise_for_status()
-        raw = resp.json().get("result")
+        payload = resp.json()
+        raw = payload.get("result")
         records = _json.loads(raw) if raw not in (None, "null") else []
         time.sleep(vendor_config.SLEEP_BETWEEN_REQUESTS)
 
-        if len(records) < cap or a >= b:
+        if not payload.get("hasNextRow"):
             return records
-        mid = a + (b - a) // 2
-        log(f"      {a}~{b}「{kw}」顶到 {cap} 条上限，劈成两段重查（怕漏）")
-        return ask(a, mid, kw) + ask(mid + dt.timedelta(days=1), b, kw)
+        if row_range < SERVER_RECORD_CAP:
+            bigger = min(row_range + cap, SERVER_RECORD_CAP)
+            log(f"      {a}~{b}「{kw}」还有下一页，上限调到 {bigger} 重查")
+            return ask(a, b, kw, bigger)
+        if a < b:
+            mid = a + (b - a) // 2
+            log(f"      {a}~{b}「{kw}」已到服务端硬顶 {SERVER_RECORD_CAP}，"
+                f"劈成两段重查")
+            return ask(a, mid, kw) + ask(mid + dt.timedelta(days=1), b, kw)
+        log(f"      【注意】{a}「{kw}」单日就超过服务端硬顶 "
+            f"{SERVER_RECORD_CAP} 条，这一天可能有漏 —— 请人工核一下")
+        return records
 
     for c1, c2 in chunks:
         for kw in keywords:
