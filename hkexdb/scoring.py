@@ -48,6 +48,34 @@ def matches(field: str, got: str, want: str) -> bool:
     return got == want
 
 
+def _hint(got: str, want: str) -> str:
+    """两个数差在哪儿，如果差法本身有名字的话就说出来。
+
+    错项列表最费时间的部分不是「哪里错了」，而是「谁错了」—— 是程序
+    抽错，还是答案表录错。有几类差法一眼就能定性，直接标出来能省掉
+    一次翻原文：实跑里 08439 和 01657 两条最后确认是答案表打错的。
+    """
+    a, b = _num(got), _num(want)
+    if a is None or b is None or a == b:
+        return ""
+    if a == -b:
+        return ("两边数值一样、符号相反 —— 要么答案表那格正负号写反了，"
+                "要么程序把溢价/折让判反了")
+    if b and abs(a / b - 10) < 0.01:
+        return "程序的数正好是答案的 10 倍 —— 多半是某一边少写/多写了一位"
+    if a and abs(b / a - 10) < 0.01:
+        return "答案正好是程序的 10 倍 —— 多半是某一边少写/多写了一位"
+    x, y = str(int(abs(a))), str(int(abs(b)))
+    if len(x) == len(y):
+        diff = [i for i in range(len(x)) if x[i] != y[i]]
+        if len(diff) == 1:
+            return (f"位数相同，只有第 {diff[0] + 1} 位不一样"
+                    f"（{x[diff[0]]} / {y[diff[0]]}）—— 像是按错一个键")
+        if sorted(x) == sorted(y):
+            return "两个数由同一批数字组成 —— 像是打字时换了位"
+    return ""
+
+
 @dataclass
 class FieldScore:
     field: str
@@ -91,6 +119,9 @@ class Report:
                     lines.append(f"[{s.field}] {'/'.join(key)}")
                     lines.append(f"    抽到：{got or '（空）'}")
                     lines.append(f"    应为：{want}")
+                    hint = _hint(got, want)
+                    if hint:
+                        lines.append(f"    ↳ {hint}")
             if not any_wrong:
                 lines.append("（没有错项）")
 

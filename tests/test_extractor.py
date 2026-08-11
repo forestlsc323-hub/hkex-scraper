@@ -657,3 +657,28 @@ def test_a_whitewash_waiver_does_not_turn_a_partial_offer_into_an_mgo():
     title = ("公告 (1) 自願現金部分收購要約 及 "
              "(2) 申請豁免須提出強制性全面要約的責任")
     assert extractor.extract_offer_type(title, {})[0] == "PO"
+
+
+def test_rule_26_1_outranks_a_stray_partial_in_the_body():
+    """規則26.1 是强制性全面要约的**法律依据**，比正文里蹦出来的措辞硬。
+
+    实跑 01980 / 01796 / 02362 三单被正文里的「部分」判成 PO，答案都是
+    MGO —— 那些「部分」多半出在「部分股東已承諾接納」这种句子里。
+    """
+    pages = {1: "本公司股東部分已作出不可撤銷承諾。要約人須根據收購守則"
+                "規則26.1就全部已發行股份提出要約。"}
+    assert extractor.extract_offer_type("聯合公告 及 恢復買賣", pages)[0] == "MGO"
+
+
+def test_an_explicit_partial_offer_title_still_beats_rule_26_1():
+    """标题写明「部分收購要約」是最权威的证据 ——
+    而几乎每份收购文件的释义节都会顺带提到 26.1，不能让它翻盘。"""
+    pages = {1: "釋義：「收購守則」指公司收購及合併守則，包括規則26.1。"}
+    assert extractor.extract_offer_type(
+        "公告 提出附帶先決條件的自願現金部分收購要約", pages)[0] == "PO"
+
+
+def test_a_waiver_of_rule_26_1_does_not_make_it_an_mgo():
+    """清洗豁免公告满篇都是 26.1，说的却是这单**不必**做强制要约。"""
+    pages = {1: "本公司將向執行人員申請豁免根據規則26.1提出強制性全面要約的責任。"}
+    assert extractor.extract_offer_type("公告 有關清洗豁免", pages)[0] != "MGO"

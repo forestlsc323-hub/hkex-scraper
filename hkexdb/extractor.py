@@ -188,33 +188,65 @@ def _find_page(pages: dict[int, str], needle: str) -> int:
 
 # ---------------------------------------------------------------- 类型
 
+def _waived(text: str, m) -> bool:
+    """这个「強制性…要約」是不是正被豁免掉的那个。
+
+    清洗豁免公告里满篇都是「申請豁免根據規則26.1提出強制性全面要約的
+    責任」—— 句子说的是这单**不必**做强制要约，照字面读正好读反。
+    """
+    return bool(_WAIVER.search(text[max(0, m.start() - 30):m.end()]))
+
+
+def _phrase_type(text: str):
+    """在一段文字里找类型短语。返回 (类型, match) 或 (None, None)。"""
+    for kind, pattern in _TYPE_PHRASES:
+        m = pattern.search(text)
+        if not m:
+            continue
+        # 「強制性」压过「部分」：规则 26 的强制要约必须就全部股份提出，
+        # 不可能同时是部分要约。见 _MANDATORY 处的说明。
+        if kind is PO:
+            hard = _MANDATORY.search(text)
+            if hard and not _waived(text, hard):
+                return MGO, hard
+        elif kind is MGO and _waived(text, m):
+            continue          # 被豁免掉的那个不算，接着看下一档
+        return kind, m
+    return None, None
+
+
 def extract_offer_type(title: str, pages: dict[int, str]) -> tuple[str, Evidence]:
-    """先看标题，标题判不出再看首页的类型短语。
+    """证据从硬到软排三档：标题 → 規則26.1 → 正文首几页的类型短语。
 
     绝不做全文词频 —— 3336 那单会被判成相反的类型。
-    """
-    for text, page in ((title or "", 0),
-                       (_flat("".join(pages.get(p, "")
-                                      for p in sorted(pages)[:3])), 1)):
-        for kind, pattern in _TYPE_PHRASES:
-            m = pattern.search(text)
-            if not m:
-                continue
-            # 「強制性」压过「部分」：规则 26 的强制要约必须就全部股份提出，
-            # 不可能同时是部分要约。见 _MANDATORY 处的说明。
-            if kind is PO:
-                hard = _MANDATORY.search(text)
-                if hard and not _WAIVER.search(text[max(0, hard.start() - 30):
-                                                    hard.end()]):
-                    m, kind = hard, MGO
-            if page == 0:
-                return kind, Evidence(0, m.group(0))
-            start = max(0, m.start() - 30)
-            return kind, Evidence(_find_page(pages, m.group(0)) or 1,
-                                  text[start:m.end() + 30].strip())
 
-    if _RULE_26.search(_flat("".join(pages.values()))):
-        return MGO, Evidence(_find_page(pages, "規則26.1"), "收購守則規則26.1")
+    **規則26.1 排在正文短语前面**，这是这一版改的。
+    26.1 是强制性全面要约的法律依据，一份公告写下它就等于说
+    「这单是规则 26 触发的强制要约」；而正文里蹦出来一个「部分」，
+    可能只是「部分股東已承諾接納」「部分代價以股份支付」。
+    法条比措辞硬 —— 实跑里 01980 / 01796 / 02362 三单被正文的「部分」
+    判成 PO，答案都是 MGO。
+
+    但标题仍然排在最前：标题写明「部分收購要約」是最权威的，
+    而几乎每份收购文件的释义节都会顺带提到 26.1。
+    """
+    kind, m = _phrase_type(title or "")
+    if kind:
+        return kind, Evidence(0, m.group(0))
+
+    head = _flat("".join(pages.get(p, "") for p in sorted(pages)[:3]))
+    whole = _flat("".join(pages.values()))
+    rule = _RULE_26.search(whole)
+    if rule and not _WAIVER.search(whole[max(0, rule.start() - 40):rule.end()]):
+        return MGO, Evidence(_find_page(pages, rule.group(0)),
+                             whole[max(0, rule.start() - 40):rule.end() + 40].strip())
+
+    kind, m = _phrase_type(head)
+    if kind:
+        start = max(0, m.start() - 30)
+        return kind, Evidence(_find_page(pages, m.group(0)) or 1,
+                              head[start:m.end() + 30].strip())
+
     return "", Evidence()
 
 

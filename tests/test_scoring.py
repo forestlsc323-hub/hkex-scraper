@@ -199,3 +199,40 @@ def test_a_genuinely_missing_deal_is_still_reported_as_missing():
     report = scoring.score([], [_row("00195", "2026-05-29",
                                      **{"要约类型": "PO"})])
     assert len(report.missing_deals) == 1
+
+
+# ------------------------------------------------- 差法本身有名字的，就说出来
+
+def test_a_sign_only_difference_is_called_out():
+    """08031 抽到 -13.58、答案 13.58 —— 数值一样符号相反。
+
+    这类差法一眼能定性，直接标出来能省掉一次翻原文：用户已经确认过
+    自己答案表里 01875 那条就是正负号写反了。
+    """
+    report = scoring.score(
+        [_row("08031", "2026-01-21", **{"主值溢价率(%)": "-13.58"})],
+        [_row("08031", "2026-01-21", **{"主值溢价率(%)": "13.58"})])
+    assert "符号相反" in report.text()
+
+
+def test_a_single_wrong_digit_is_called_out():
+    """08439：程序 48,180,952.56，答案 18,180,952.56 —— 只差第一位。
+    用户后来确认是答案表打错的，正是这一类。"""
+    hint = scoring._hint("48180952", "18180952")
+    assert "第 1 位" in hint and "按错一个键" in hint
+
+
+def test_a_transposed_number_is_called_out():
+    assert "换了位" in scoring._hint("1243", "1234")
+
+
+def test_a_factor_of_ten_is_called_out():
+    assert "10 倍" in scoring._hint("1000", "100")
+    assert "10 倍" in scoring._hint("100", "1000")
+
+
+def test_an_ordinary_difference_gets_no_made_up_explanation():
+    """看不出名堂就别瞎猜 —— 一条错误的提示比没有提示更浪费时间。"""
+    assert scoring._hint("266329230", "66833690") == ""
+    assert scoring._hint("", "123") == ""
+    assert scoring._hint("MGO", "PO") == ""
