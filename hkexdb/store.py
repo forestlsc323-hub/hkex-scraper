@@ -32,7 +32,8 @@ from pathlib import Path
 
 # 抽取器版本。**改了抽取/校验逻辑就要改这个号**，否则旧结果会被当成
 # 新结果复用，而你根本看不出来 —— 那正是铁律二说的静默污染。
-EXTRACTOR_VERSION = "2026-08-D"   # D：公告日期改成 ISO，旧存档里那些 DD/MM/YYYY 必须重建
+EXTRACTOR_VERSION = "2026-08-E"   # E：每股价不再当成交易规模；要约方名字不再粘上释义表的邻居
+# D：公告日期改成 ISO，旧存档里那些 DD/MM/YYYY 必须重建
 
 STORE_DIR = "data/store"
 LISTING_FILE = "listing.csv"

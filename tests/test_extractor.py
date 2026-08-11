@@ -340,6 +340,32 @@ def test_generic_offeror_word_falls_back_to_the_definition_section():
     assert ex.parties_evidence.page == 1
 
 
+def test_an_alias_in_the_definition_term_is_not_glued_onto_the_name():
+    """释义表是两栏排版，扁平化后词条和定义直接连在一起，而词条常带别名。
+
+    08439 新百利那单实跑出来的要约方是「或「買方」 Sky Links Group
+    Limited」—— 左栏那句「或「買方」」被当成名字的一部分抽了进去。
+    这种脏名字比留空更坏：它看着像抽对了，粘贴进底稿也不会有人发现。
+    """
+    ex = extractor.extract(
+        "公告 由某證券有限公司代表要約人提出強制性無條件現金要約",
+        {1: "「要約人」或「買方」 Sky Links Group Limited，"
+            "一家於英屬處女群島註冊成立之有限公司"})
+    assert ex.offeror == "Sky Links Group Limited"
+
+
+def test_the_next_definition_term_does_not_leak_into_the_name():
+    """两栏排版扁平化后，下一行的词条会直接顶在上一行定义的屁股后面。
+
+    01780 榮尊那单抽出来是「楊敬堯先生「海外股東」」—— 后半截是
+    释义表下一行的词条。名字里不该出现「」，见到就是越界了，切掉。
+    """
+    ex = extractor.extract(
+        "公告 由某證券有限公司代表要約人提出強制性無條件現金要約",
+        {1: "「要約人」 楊敬堯先生「海外股東」 指 於香港境外之股東"})
+    assert ex.offeror == "楊敬堯先生"
+
+
 def test_generic_offeror_with_no_definition_stays_empty():
     """释义节里也没有真名，就留空 —— 绝不把通称当名字填进去。"""
     ex = extractor.extract("公告 由某證券有限公司代表要約人提出要約", {})
