@@ -156,6 +156,9 @@ class Deal:
     title: str = ""
     notes: str = ""
     evidence: dict = field(default_factory=dict)
+    # 只给日志看的：翻了几页 / 共几页。不进 CSV，是排查用的，
+    # 「哪一份把时间吃掉了」得能一眼看出来。
+    pages_note: str = ""
 
 
 @dataclass
@@ -195,6 +198,20 @@ def _speed_settings() -> tuple[int, int, str, list[str]]:
 def _keep_raw_files() -> bool:
     """要不要把公告原件在本地留一份。默认不留（用完即弃）。"""
     return bool(_listing_config().get("keep_raw_files", False))
+
+
+# 先翻几页再决定要不要翻完。0 = 关掉这个机制，老老实实整份解析。
+PROBE_PAGES = 12
+
+
+def _probe_pages() -> int:
+    """侦察页数。要约公告的封面必然印着价钱或名目，12 页留足了余量。"""
+    from .config import section
+    try:
+        return max(0, int(section("config.yaml", key="pdf", root=ROOT)
+                          .get("probe_pages", PROBE_PAGES)))
+    except (TypeError, ValueError, AttributeError):
+        return PROBE_PAGES
 
 
 def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
@@ -471,6 +488,68 @@ def probe_categories(on_log=None, fetch_html=None) -> str:
 
 
 CACHE_DIR = "data/cache/pdf"
+
+# 会长胖的目录，各自是什么、删了会怎样。
+# 存档（data/store）不在这里 —— 那是这个工具的本体，删不得。
+DISPOSABLE = [
+    ("data/cache/pdf", "公告原件副本", "重跑时要重新下载"),
+    ("data/cache", "接口响应缓存", "重跑时要重新请求"),
+    ("data/raw", "列表原样副本", "存档 listing.csv 里有同样的内容"),
+    ("data/screening", "筛查过程文件", "重跑筛查就会重新生成"),
+    ("data/probe", "勘察产物", "点「勘察类别码」会重新生成"),
+    ("logs", "运行日志", "只影响事后翻旧账"),
+]
+
+
+def _tree_info(path: Path) -> tuple[int, int]:
+    if not path.exists():
+        return 0, 0
+    files = [f for f in path.rglob("*") if f.is_file()]
+    return len(files), sum(f.stat().st_size for f in files)
+
+
+def disposable_report() -> list[tuple[str, str, int, int, str]]:
+    """各个可删目录占了多少。返回 [(相对路径, 名称, 份数, 字节, 删了会怎样)]。
+
+    上一轮用户问「你之前下载的 pdf 是不是都删掉了」—— 那时只能答
+    data/cache/pdf 一个目录。实际上会长胖的不止它一个，
+    列在一起才知道到底占了多少地方。
+    """
+    seen: set[Path] = set()
+    out = []
+    for rel, label, cost in DISPOSABLE:
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        files = [f for f in path.rglob("*") if f.is_file() and f not in seen]
+        if not files:
+            continue
+        seen.update(files)
+        out.append((rel, label, len(files), sum(f.stat().st_size for f in files),
+                    cost))
+    return out
+
+
+def clear_disposable(rels: list[str]) -> tuple[int, int]:
+    """删掉指定的可删目录。返回 (删了几个文件, 腾出多少字节)。
+
+    只删 DISPOSABLE 里列出来的路径 —— 传进来一个不在名单上的目录
+    直接忽略，免得哪天一个笔误把 data/store 端了。
+    """
+    allowed = {rel for rel, _, _ in DISPOSABLE}
+    gone = freed = 0
+    for rel in rels:
+        if rel not in allowed:
+            continue
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        for f in sorted(path.rglob("*"), key=lambda p: -len(p.parts)):
+            if f.is_file():
+                freed += f.stat().st_size
+                f.unlink()
+                gone += 1
+    return gone, freed
 
 
 def cache_info() -> tuple[int, int]:
@@ -925,8 +1004,9 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         # 另一个线程 add，会抛 RuntimeError: Set changed size during iteration，
         # 而那是在 4 路并发里偶发的，最难复现的那种。
         who = row.get("code") or row.get("row_id")
+        started = time.monotonic()
         with lock:
-            busy[who] = time.monotonic()
+            busy[who] = started
         _announce()
         try:
             deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
@@ -939,14 +1019,18 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
             done[0] += 1
             n = done[0]
         on_step(2, n / len(targets))
+        # 每份花了多久、翻了几页 —— 慢在哪里必须能从日志上直接读出来，
+        # 而不是靠猜。上一轮「20 分钟卡在 71」就是猜了两次才找对方向。
+        cost = f"{time.monotonic() - started:.0f}秒{deal.pages_note}"
         if deal.verdict == "offer":
             log(f"    [{n}/{len(targets)}] [OK] {deal.code} {deal.name}　"
                 f"← {deal.offeror or '要约方未识别'}　"
                 f"{deal.offer_type}　{deal.offer_price}　"
-                f"{deal.premium_pct}%　{deal.deal_size}")
+                f"{deal.premium_pct}%　{deal.deal_size}　{cost}")
         else:
             log(f"    [{n}/{len(targets)}] [--] {deal.code} {deal.name}　"
-                f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}")
+                f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}"
+                f"　{cost}")
         return deal
 
     # 每完成这么多份就往存档里刷一次。
@@ -1094,13 +1178,20 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             got = opener(deal.pdf_url)
             if isinstance(got, _Fetched):
                 # 下载完了才排队解析 —— 排队的是 CPU，不是网络
+                # 先翻前几页问一句「这文件值得翻完吗」。不值得就不翻 ——
+                # 实跑里绝大多数留存件的结论是「不像要约公告」，而每得出
+                # 一次这个结论都要把一两百页从头解析到尾。
+                staged = dict(probe_pages=_probe_pages(),
+                              promising=extractor.looks_like_offer)
                 if parse_lock is not None:
                     with parse_lock:
                         doc = pdf_source.parse_doc(got.url, got.data,
-                                                   from_cache=got.from_cache)
+                                                   from_cache=got.from_cache,
+                                                   **staged)
                 else:
                     doc = pdf_source.parse_doc(got.url, got.data,
-                                               from_cache=got.from_cache)
+                                               from_cache=got.from_cache,
+                                               **staged)
             else:
                 doc = got                      # 测试注入的假 PDF
             if not doc.has_text_layer:
@@ -1109,7 +1200,18 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
                 deal.verdict, deal.verdict_reason = "unclear", "扫描件无文本层"
                 return deal
 
+            # 全用 getattr：这行只是日志上的一句话，绝不能因为拿不到
+            # 某个属性就把整份公告的抽取搞挂。
+            parsed = getattr(doc, "pages_parsed", 0) or len(doc.pages)
+            total_pages = getattr(doc, "page_count", 0) or parsed
+            deal.pages_note = (f"／{parsed}页" if parsed >= total_pages
+                               else f"／{parsed}页(共{total_pages})")
+
             ex = extractor.extract(row["title"], doc.pages)
+            if getattr(doc, "stopped_early", False):
+                ex.notes.append(
+                    f"只解析了前 {doc.pages_parsed} 页（全文 {doc.page_count} 页）："
+                    f"前几页没有任何要约迹象")
             deal.offeror = ex.offeror
             deal.offeror_fa = ex.offeror_fa
             # 标题没写受要约方全称时退回披露易给的简称 —— 那是它自己的归属，

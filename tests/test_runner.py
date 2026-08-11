@@ -43,10 +43,21 @@ def fake_records(n: int, day: str = "2026-06-01") -> list[dict]:
 
 
 class FakeDoc:
-    """假 PDF：直接给页文本，不联网。"""
+    """假 PDF：直接给页文本，不联网。
 
-    def __init__(self, pages, has_text=True):
+    ⚠️ 属性必须和真的 PdfDoc 对齐。夹具比真接口少一个字段，测出来的
+    就是另一个系统 —— 日期格式那次（ISO vs DD/MM/YYYY）和 stream=True
+    那次都是这么栽的，这已经是第三回了。
+    """
+
+    def __init__(self, pages, has_text=True, page_count=None):
         self.pages, self.has_text_layer = pages, has_text
+        self.page_count = page_count if page_count is not None else len(pages)
+        self.pages_parsed = len(pages)
+        self.stopped_early = False
+        self.extractor = "fake"
+        self.extractor_note = ""
+        self.from_cache = False
 
 
 def fake_open_pdf(url):
@@ -278,28 +289,24 @@ def test_every_bat_uses_crlf_line_endings(name):
     assert raw.count(b"\n") == raw.count(b"\r\n"), f"{name} 里有裸 LF 换行"
 
 
-def test_updater_never_overwrites_what_the_user_produced():
-    """更新脚本必须跳过 data\\ 和 logs\\ —— 覆盖了就是把跑出来的结果删了。
+def test_the_update_bat_does_not_download_anything_itself():
+    """卡巴斯基把原来那个 .bat 判成 PDM:Trojan.Win32.Generic.nblk 删了。
 
-    .venv 也要跳过，否则每次更新都得重装依赖，用户会以为程序坏了。
+    它没冤枉：cmd 调 PowerShell 从互联网下载内容再就地覆盖可执行文件，
+    正是下载器木马的行为特征。这条守着别再写回去 —— 下载和覆盖都归
+    hkexdb\\updater.py，.bat 只负责把它叫起来。
+
+    更新本身的安全性（不碰 data\\、包不对就不写）由 test_updater.py 守。
     """
-    bat = (runner.Path(__file__).parent.parent / "一键更新.bat"
-           ).read_bytes().decode("utf-8")
-    copy_line = next(ln for ln in bat.splitlines() if "robocopy" in ln)
-    for protected in ("data", "logs", ".venv"):
-        assert protected in copy_line.split("/XD")[1], f"更新会覆盖 {protected}"
-
-
-def test_updater_points_at_the_branch_we_actually_push_to():
-    """分支名写错的话，用户点了更新会一直拿到旧代码，而且毫无提示。"""
-    root = runner.Path(__file__).parent.parent
-    bat = (root / "一键更新.bat").read_bytes().decode("utf-8")
-    branch = next(ln for ln in bat.splitlines() if ln.startswith('set "BRANCH='))
-    branch = branch.split("=", 1)[1].rstrip('"')
-    # 解压出来的顶层目录名 = 仓库名 + "-" + 分支名里的 / 换成 -
-    folder = next(ln for ln in bat.splitlines() if ln.startswith('set "FOLDER='))
-    folder = folder.split("=", 1)[1].rstrip('"')
-    assert folder == "hkex-scraper-" + branch.replace("/", "-")
+    text = (runner.Path(__file__).parent.parent / "一键更新.bat"
+            ).read_bytes().decode("utf-8")
+    # 只看会真正执行的行 —— REM 注释里写着这段历史，那是要留的
+    code = "\n".join(ln for ln in text.lower().splitlines()
+                     if not ln.strip().startswith("rem"))
+    for banned in ("powershell", "invoke-webrequest", "curl", "robocopy",
+                   "expand-archive", "codeload"):
+        assert banned not in code, f".bat 里又出现了 {banned}，杀软会再删一次"
+    assert "hkexdb.updater" in code
 
 
 # ---------------------------------------------------------------- 速度旋钮
@@ -919,3 +926,48 @@ def test_different_targets_are_not_capped_against_each_other():
             for i in range(20)]
     keep, skipped = runner._cap_per_target(rows)
     assert len(keep) == 20 and not skipped
+
+
+# ---------------------------------------------------------------- 清理临时文件
+
+def test_the_archive_is_never_on_the_delete_list():
+    """存档是这个工具的本体 —— 公告列表、抽出来的字段、出处引文都在里面。
+
+    把它列进「可删」名单，就等于给用户一个把几小时抓取成果一键清零的按钮。
+    """
+    listed = {rel for rel, _, _ in runner.DISPOSABLE}
+    assert not any(rel.startswith("data/store") for rel in listed)
+
+
+def test_clearing_disposable_files_leaves_the_archive_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "data" / "store").mkdir(parents=True)
+    (tmp_path / "data" / "store" / "listing.csv").write_text("宝贝", encoding="utf-8")
+    (tmp_path / "data" / "cache" / "pdf").mkdir(parents=True)
+    (tmp_path / "data" / "cache" / "pdf" / "a.pdf").write_bytes(b"x" * 100)
+
+    rows = runner.disposable_report()
+    gone, freed = runner.clear_disposable([r[0] for r in rows])
+
+    assert gone == 1 and freed == 100
+    assert (tmp_path / "data" / "store" / "listing.csv").exists()
+
+
+def test_a_path_not_on_the_list_is_refused(tmp_path, monkeypatch):
+    """名单外的路径一律忽略 —— 免得哪天一个笔误把 data/store 端了。"""
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "data" / "store").mkdir(parents=True)
+    (tmp_path / "data" / "store" / "deals.csv").write_text("x", encoding="utf-8")
+
+    assert runner.clear_disposable(["data/store", "data", "."]) == (0, 0)
+    assert (tmp_path / "data" / "store" / "deals.csv").exists()
+
+
+def test_each_file_is_only_counted_once(tmp_path, monkeypatch):
+    """data/cache/pdf 套在 data/cache 里面，两条都在名单上 ——
+    不去重的话报出来的占用会翻倍，用户以为多出一倍垃圾。"""
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "data" / "cache" / "pdf").mkdir(parents=True)
+    (tmp_path / "data" / "cache" / "pdf" / "a.pdf").write_bytes(b"x" * 500)
+
+    assert sum(size for _, _, _, size, _ in runner.disposable_report()) == 500

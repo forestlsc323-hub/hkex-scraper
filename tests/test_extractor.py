@@ -340,6 +340,39 @@ def test_generic_offeror_word_falls_back_to_the_definition_section():
     assert ex.parties_evidence.page == 1
 
 
+# ------------------------------------------------ 分段解析的粗筛（只管要不要往下翻）
+
+def test_the_probe_never_misses_a_real_offer_announcement():
+    """粗筛判错的代价是不对称的：多解析几份没用的只是慢一点，
+    漏判一份就是整单丢掉。所以这里拿真实公告的首页措辞逐条守。
+    """
+    covers = [
+        "強制性無條件現金要約以收購全部已發行股份",
+        "要約價為每股要約股份 0.519 港元",
+        "自願有條件現金要約",
+        "部分要約",
+        "建議以協議安排方式將公司私有化 註銷價每股 63.70 港元",
+        "價值比較 較最後交易日收市價溢價約 15.4%",
+        "根據收購守則第 3.5 條作出的公告",
+        "本聯合公告乃由要約人及本公司聯合發出",
+    ]
+    for text in covers:
+        assert extractor.looks_like_offer({1: text}), text
+
+
+def test_the_probe_says_no_to_an_ordinary_notice():
+    """真正该被挡住的：占了留存桶大头的普通停复牌与程序公告。"""
+    for text in ["董事會會議召開日期", "根據上市規則第 13.51B 條作出的公告",
+                 "截至二零二六年六月三十日止六個月之中期業績", "更換公司秘書"]:
+        assert not extractor.looks_like_offer({1: text}), text
+
+
+def test_the_probe_reads_across_line_breaks():
+    """PDF 会把一句话拦腰劈开。粗筛读的必须是拼回去的文本，
+    否则「每股要約股份\\n0.519 港元」这种就漏了。"""
+    assert extractor.looks_like_offer({1: "每股要約股份\n0.519\n港元"})
+
+
 def test_an_alias_in_the_definition_term_is_not_glued_onto_the_name():
     """释义表是两栏排版，扁平化后词条和定义直接连在一起，而词条常带别名。
 

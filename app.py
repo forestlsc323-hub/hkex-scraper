@@ -328,8 +328,10 @@ def main() -> int:
     btn_check.pack(side="right", padx=8)
     btn_cat = ttk.Button(bottom, text="勘察类别码")
     btn_cat.pack(side="right", padx=4)
-    btn_cache = ttk.Button(bottom, text="原件副本…")
+    btn_cache = ttk.Button(bottom, text="清理临时文件…")
     btn_cache.pack(side="right", padx=4)
+    btn_update = ttk.Button(bottom, text="检查更新")
+    btn_update.pack(side="right", padx=4)
 
     # ---------------- 消息泵 ----------------
     def append(text: str) -> None:
@@ -391,6 +393,8 @@ def main() -> int:
                 state["activity"] = payload
             elif kind == "done":
                 finish(payload)
+            elif kind == "update":
+                show_update(payload)
             elif kind == "checked":
                 state["running"] = False
                 btn_run.configure(state="normal")
@@ -535,29 +539,76 @@ def main() -> int:
         threading.Thread(target=work, daemon=True).start()
 
     def manage_cache() -> None:
-        """公告原件副本占多少地方，要不要删。
+        """跑出来的临时文件占多少地方，要不要删。
 
-        删了不影响已经抽出来的 deals.csv，但重跑要重新下载；而且某份
-        公告若已被披露易换掉，那一单就再也复现不了原样（审计链断在这里）。
+        存档（data\\store）不在名单上 —— 那是这个工具的本体：公告列表、
+        抽出来的字段、每个数字的出处引文都在里面，删了就要从头再抓一遍。
+        这里能删的都是「删了只是要重跑一次」的东西。
         """
         from tkinter import messagebox
-        n, size = runner.cache_info()
-        if not n:
-            messagebox.showinfo("原件副本", "还没有副本。")
+        rows = runner.disposable_report()
+        if not rows:
+            messagebox.showinfo("清理", "没有可清理的临时文件。")
             return
+
+        total = sum(size for _, _, _, size, _ in rows)
+        lines = [f"　{label}：{n} 个文件，{runner.human_size(size)}\n"
+                 f"　　　{rel}　（删了：{cost}）"
+                 for rel, label, n, size, cost in rows]
         if messagebox.askyesno(
-                "原件副本",
-                f"公告原件副本 {n} 份，占 {runner.human_size(size)}。\n"
-                f"位置：{ROOT / runner.CACHE_DIR}\n\n"
-                "留着它才能不重新下载就重跑，也才能在公告被换掉后\n"
-                "复现当初抽出的数字（审计追溯）。\n\n"
-                "要现在删掉腾地方吗？"):
-            gone, freed = runner.clear_cache()
-            append(f"已删除 {gone} 份副本，腾出 {runner.human_size(freed)}")
+                "清理临时文件",
+                f"一共占 {runner.human_size(total)}：\n\n"
+                + "\n\n".join(lines)
+                + "\n\n存档（data\\store）不动 —— 公告列表、抽出来的字段、"
+                  "\n出处引文都在里面，删了要从头再抓一遍。\n\n要现在全删吗？"):
+            gone, freed = runner.clear_disposable([r[0] for r in rows])
+            append(f"已删除 {gone} 个文件，腾出 {runner.human_size(freed)}")
+            messagebox.showinfo(
+                "清理", f"删了 {gone} 个文件，腾出 {runner.human_size(freed)}。")
+
+    def check_update() -> None:
+        """从 GitHub 拉最新版覆盖本文件夹。
+
+        原来这是 一键更新.bat 干的，但那串「cmd 调 PowerShell 下载并
+        覆盖文件」的动作和下载器木马一模一样，卡巴斯基把它当成
+        PDM:Trojan.Win32.Generic.nblk 删掉了。所以改成程序自己更新自己。
+        """
+        from tkinter import messagebox
+        from hkexdb import updater
+
+        btn_update.configure(state="disabled", text="更新中…")
+        append("正在从 GitHub 取最新版…")
+
+        def work():
+            result = updater.update(ROOT)
+            msgs.put(("update", result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_update(result) -> None:
+        from tkinter import messagebox
+        btn_update.configure(state="normal", text="检查更新")
+        if not result.ok:
+            append(f"更新失败：{result.error}")
+            messagebox.showerror("检查更新", result.error)
+            return
+        if not result.written:
+            append("已经是最新版。")
+            messagebox.showinfo("检查更新", "已经是最新版，没有文件需要更新。")
+            return
+        append(f"已更新 {len(result.written)} 个文件：")
+        for rel in result.written[:20]:
+            append(f"      {rel}")
+        messagebox.showinfo(
+            "检查更新",
+            f"更新了 {len(result.written)} 个文件。\n\n"
+            "关掉这个窗口重新打开，新版才生效。\n"
+            "（你的数据和存档没有被动过。）")
 
     btn_run.configure(command=start)
     btn_cat.configure(command=probe_categories)
     btn_cache.configure(command=manage_cache)
+    btn_update.configure(command=check_update)
     btn_check.configure(command=start_self_check)
     btn_stop.configure(command=lambda: (cancel.set(), append("正在停止…")))
     btn_report.configure(

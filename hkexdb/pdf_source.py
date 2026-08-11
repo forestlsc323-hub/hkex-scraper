@@ -61,6 +61,10 @@ class PdfDoc:
     from_cache: bool
     extractor: str = ""          # 实际产出文本的解析器，出处的一部分
     extractor_note: str = ""     # 两个解析器分歧时的说明
+    # 实际翻了几页。小于 page_count 就说明前几页看不出要约迹象、
+    # 提前收工了 —— 这件事必须能被看见，不能悄悄发生（铁律二）。
+    pages_parsed: int = 0
+    stopped_early: bool = False
 
     @property
     def text(self) -> str:
@@ -274,12 +278,41 @@ def extract_html_pages(data: bytes) -> dict[int, str]:
 
 
 def _extract_pdfplumber(data: bytes, max_pages: int) -> tuple[dict[int, str], int]:
+    pages, total, _ = _pdfplumber_staged(data, max_pages)
+    return pages, total
+
+
+def _pdfplumber_staged(data: bytes, max_pages: int, *, probe_pages: int = 0,
+                       promising=None) -> tuple[dict[int, str], int, bool]:
+    """解析 PDF，可以中途停。返回 (页字典, 总页数, 是否提前停了)。
+
+    先翻前 `probe_pages` 页，交给 `promising` 判断值不值得往下翻；
+    判断为不值得就到此为止 —— 一份两百页的文件，只花了十几页的钱。
+
+    页对象解析完就 close()：pdfplumber 默认把每页的字符、线条全缓存在
+    内存里，一份两百页的综合文件能吃掉几百兆。用完即弃的是文件，
+    页缓存也一样。
+    """
     import pdfplumber
 
+    pages: dict[int, str] = {}
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         total = len(pdf.pages)
         limit = min(max_pages, total) if max_pages else total
-        return {i + 1: (pdf.pages[i].extract_text() or "") for i in range(limit)}, total
+
+        def read(upto: int) -> None:
+            for i in range(len(pages), upto):
+                page = pdf.pages[i]
+                pages[i + 1] = page.extract_text() or ""
+                page.close()
+
+        if probe_pages and promising is not None and limit > probe_pages:
+            read(probe_pages)
+            if not promising(pages):
+                return pages, total, True
+
+        read(limit)
+    return pages, total, False
 
 
 def _extract_pypdf(data: bytes, max_pages: int) -> tuple[dict[int, str], int]:
@@ -322,8 +355,9 @@ def extract_pages(data: bytes, max_pages: int = 0, *,
     总量远超任何「文本太少就回退」的阈值。三单里有两单会静默产出空抽取，
     而日志上一切正常。这正是铁律二说的静默污染。
 
-    所以现在的策略是：pdfplumber 出结果，同时用 pypdf 复核一遍。
-    谁的字符多用谁，并在两者差异显著时留下记录 —— 解析器选择本身也是出处。
+    所以现在的策略是：pdfplumber 出结果，**它看着不对劲时**再用 pypdf
+    复核。谁的字符多用谁，并在两者差异显著时留下记录 —— 解析器选择
+    本身也是出处。「不对劲」的判据见 _THIN_CHARS_PER_PAGE。
     """
     pages: dict[int, str] = {}
     total = 0
@@ -336,6 +370,27 @@ def extract_pages(data: bytes, max_pages: int = 0, *,
     except Exception as exc:
         log.warning("pdfplumber 解析失败：%s", exc)
         note = f"pdfplumber 失败({exc})"
+
+    return _cross_check(pages, total, used, note, data, max_pages,
+                        secondary, switch_ratio)
+
+
+# pdfplumber 每页少于这么多字，才值得再跑一遍 pypdf 复核。
+#
+# 复核不是白来的：它把整份文件再解析一遍。而复核要防的是 pdfplumber
+# **失手**（崩掉或吐不出东西），失手的样子就是字数塌下来 ——
+# 1417 那单 pdfplumber 正常发挥是 687 字/页，pypdf 的残缺版是 270。
+# pdfplumber 已经吐出了一页近千字的正文，再跑一遍 pypdf 只是多花时间：
+# 三份实测样本里，复核从来没有翻转过结果。
+_THIN_CHARS_PER_PAGE = 300
+
+
+def _cross_check(pages, total, used, note, data, max_pages,
+                 secondary, switch_ratio):
+    """pdfplumber 的结果看着不对劲时，用 pypdf 复核一遍。"""
+    parsed = len(pages) or 1
+    if used and _chars(pages) / parsed >= _THIN_CHARS_PER_PAGE:
+        return pages, total, used, note
 
     try:
         alt_pages, alt_total = secondary(data, max_pages)
@@ -376,7 +431,8 @@ def open_pdf(url: str, cache_dir: Path, *,
 
 
 def parse_doc(url: str, data: bytes, *, from_cache: bool = False,
-              max_pages: int = 0, min_text_chars: int = 500) -> PdfDoc:
+              max_pages: int = 0, min_text_chars: int = 500,
+              probe_pages: int = 0, promising=None) -> PdfDoc:
     """字节 → 带页码的文本。**纯 CPU，不碰网络。**
 
     和 fetch_bytes 分开是有原因的，实测（12 份真实公告，只算解析）：
@@ -387,20 +443,54 @@ def parse_doc(url: str, data: bytes, *, from_cache: bool = False,
     解析是 CPU 型工作，GIL 决定了它没法真并行 —— 多开线程只是把同样的
     活切碎轮流做，总时间不减反增，还把 Tk 主线程一起拖下水（界面卡顿从
     74 毫秒涨到 328 毫秒）。所以下载并发、解析串行：各取所长。
+
+    `probe_pages` + `promising` 打开分段解析：先翻前几页问一句
+    「这文件值得翻完吗」，不值得就到此为止。实跑那 26 份新公告里
+    有 5/6 的结论是「不像要约公告」—— 而每得出一次这个结论，
+    都要先把一份一两百页的文件从头解析到尾，八十多秒。
     """
     if is_html_link(url):
         pages = extract_html_pages(data)
         return PdfDoc(url=url, pages=pages, page_count=len(pages),
                       has_text_layer=_chars(pages) >= min_text_chars,
                       from_cache=from_cache, extractor="html",
-                      extractor_note="披露易的 .htm 版公告，正文与 PDF 版一致")
+                      extractor_note="披露易的 .htm 版公告，正文与 PDF 版一致",
+                      pages_parsed=len(pages))
 
-    pages, page_count, extractor, note = extract_pages(data, max_pages)
-    has_text = _chars(pages) >= min_text_chars
+    stopped = False
+    if probe_pages and promising is not None:
+        try:
+            pages, page_count, stopped = _pdfplumber_staged(
+                data, max_pages, probe_pages=probe_pages, promising=promising)
+            extractor, note = "pdfplumber", ""
+            if not stopped:
+                pages, page_count, extractor, note = _cross_check(
+                    pages, page_count, extractor, note, data, max_pages,
+                    _extract_pypdf, _SWITCH_RATIO)
+        except Exception as exc:                 # 分段读失败 → 退回整份读
+            log.warning("分段解析失败，改为整份解析：%s", exc)
+            stopped = False
+            pages, page_count, extractor, note = extract_pages(data, max_pages)
+    else:
+        pages, page_count, extractor, note = extract_pages(data, max_pages)
+
+    # 提前收工的不判扫描件 —— 只翻了十几页就说「这份没文本层」是冤枉它。
+    has_text = _chars(pages) >= min_text_chars or stopped
 
     if not has_text:
         log.warning("这份 PDF 没有文本层（疑似扫描件），需 OCR 并强制人工复核：%s", url)
 
+    if stopped:
+        note = (f"前 {len(pages)} 页看不出要约迹象，未再往下解析"
+                f"（全文共 {page_count} 页）" + (f"；{note}" if note else ""))
+    elif max_pages and page_count > len(pages):
+        # 撞上页数上限。同样必须留痕 —— 「缺价值比较」如果是因为它在
+        # 第 120 页而我们只看到第 80 页，那和「公告里根本没有」是两回事。
+        note = (f"只解析了前 {len(pages)} 页（全文共 {page_count} 页，"
+                f"受 config.yaml 里 pdf.max_pages 限制）"
+                + (f"；{note}" if note else ""))
+
     return PdfDoc(url=url, pages=pages, page_count=page_count,
                   has_text_layer=has_text, from_cache=from_cache,
-                  extractor=extractor, extractor_note=note)
+                  extractor=extractor, extractor_note=note,
+                  pages_parsed=len(pages), stopped_early=stopped)

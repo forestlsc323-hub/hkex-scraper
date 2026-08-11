@@ -45,6 +45,122 @@ def make_pdf(lines: list[str]) -> bytes:
     return out.getvalue()
 
 
+def make_pdf_pages(pages: list[list[str]]) -> bytes:
+    """造一份多页 PDF。分段解析的测试要能数清楚翻了几页。"""
+    font_obj = 3 + 2 * len(pages)
+    objs: list[bytes] = []
+    kids = " ".join(f"{3 + 2 * i} 0 R" for i in range(len(pages)))
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(b"<< /Type /Pages /Kids [%s] /Count %d >>"
+                % (kids.encode(), len(pages)))
+    for i, lines in enumerate(pages):
+        ops = "BT /F1 9 Tf 40 780 Td 11 TL\n"
+        for line in lines:
+            safe = line.replace("(", "").replace(")", "").replace("\\", "")
+            ops += f"({safe}) Tj T*\n"
+        ops += "ET"
+        stream = ops.encode()
+        objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+                    b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>"
+                    % (font_obj, 4 + 2 * i))
+        objs.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream
+                    + b"\nendstream")
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for i, obj in enumerate(objs, 1):
+        offsets.append(out.tell())
+        out.write(b"%d 0 obj\n" % i + obj + b"\nendobj\n")
+    xref = out.tell()
+    out.write(b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1))
+    for off in offsets:
+        out.write(b"%010d 00000 n \n" % off)
+    out.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+              % (len(objs) + 1, xref))
+    return out.getvalue()
+
+
+# --------------------------------------------------- 分段解析（先看几页再说）
+
+def _twenty_pages(marker_page: int | None) -> bytes:
+    pages = [[f"page {i} routine filler text"] for i in range(1, 21)]
+    if marker_page:
+        pages[marker_page - 1].append("OFFER PRICE HKD 2.20 per share")
+    return make_pdf_pages(pages)
+
+
+def _has_offer(pages):
+    return "OFFER" in "".join(pages.values())
+
+
+def test_a_document_with_no_offer_sign_in_the_first_pages_stops_there():
+    """一两百页的文件，只为了确认它不值得解析而整份解析 —— 那 80 秒
+    是实跑里最大的一笔浪费（26 份新公告，前 6 份有 5 份是这个结局）。
+    """
+    pages, total, stopped = pdf_source._pdfplumber_staged(
+        _twenty_pages(None), 0, probe_pages=5, promising=_has_offer)
+
+    assert stopped
+    assert total == 20            # 总页数照样如实报出来
+    assert len(pages) == 5        # 只翻了 5 页
+
+
+def test_a_document_that_looks_like_an_offer_gets_parsed_to_the_end():
+    pages, total, stopped = pdf_source._pdfplumber_staged(
+        _twenty_pages(2), 0, probe_pages=5, promising=_has_offer)
+
+    assert not stopped
+    assert len(pages) == total == 20
+
+
+def test_stopping_early_is_written_into_the_document_not_hidden():
+    """铁律二：提前收工是判定的一部分，必须能被看见。"""
+    doc = pdf_source.parse_doc("x.pdf", _twenty_pages(None),
+                               probe_pages=5, promising=_has_offer,
+                               min_text_chars=10)
+
+    assert doc.stopped_early
+    assert doc.pages_parsed == 5 and doc.page_count == 20
+    assert "20 页" in doc.extractor_note and "5 页" in doc.extractor_note
+
+
+def test_an_early_stop_is_never_mistaken_for_a_scanned_document():
+    """只翻了 5 页就说「这份没有文本层、要 OCR」是冤枉它 ——
+    那会把一份正常公告推进人工复核队列。"""
+    doc = pdf_source.parse_doc("x.pdf", _twenty_pages(None),
+                               probe_pages=5, promising=_has_offer,
+                               min_text_chars=100000)
+    assert doc.has_text_layer
+
+
+def test_probe_pages_zero_means_parse_everything():
+    doc = pdf_source.parse_doc("x.pdf", _twenty_pages(None), probe_pages=0,
+                               promising=_has_offer, min_text_chars=10)
+    assert not doc.stopped_early and doc.pages_parsed == 20
+
+
+def test_a_document_shorter_than_the_probe_is_just_parsed_whole():
+    """8 页的文件设 12 页侦察 —— 没有「提前」可言，不该标成早停。"""
+    doc = pdf_source.parse_doc(
+        "x.pdf", make_pdf_pages([[f"page {i}"] for i in range(1, 9)]),
+        probe_pages=12, promising=_has_offer, min_text_chars=10)
+    assert not doc.stopped_early and doc.pages_parsed == 8
+
+
+def test_a_broken_pdf_falls_back_to_whole_document_parsing(monkeypatch):
+    """分段读挂了不能连累这一份 —— 退回原来的整份解析。"""
+    def boom(*a, **kw):
+        raise RuntimeError("分段读崩了")
+
+    monkeypatch.setattr(pdf_source, "_pdfplumber_staged", boom)
+    doc = pdf_source.parse_doc("x.pdf", make_pdf(["hello world"]),
+                               probe_pages=5, promising=_has_offer,
+                               min_text_chars=1)
+    assert doc.pages and not doc.stopped_early
+
+
 class FakeResp:
     """假响应。
 
@@ -192,7 +308,36 @@ def test_pdfplumber_wins_when_pypdf_silently_drops_text():
 
     assert used == "pdfplumber"
     assert pages == RICH
-    assert "46" in note or "40" in note or "%" in note      # 记录了分歧
+
+
+def test_a_healthy_pdfplumber_result_is_not_re_parsed_by_pypdf():
+    """复核不是白来的 —— 它把整份文件再解析一遍。
+
+    复核要防的是 pdfplumber **失手**，而失手的样子是字数塌下来。
+    pdfplumber 已经吐出一页两千字的正文时再跑一遍 pypdf 纯属白花时间：
+    三份实测样本里，复核从来没有翻转过结果。
+    """
+    called = []
+
+    def spy(data, max_pages):
+        called.append(1)
+        return POOR, 10
+
+    _, _, used, _ = pdf_source.extract_pages(
+        b"x", primary=_fake_extractor(RICH), secondary=spy)
+
+    assert used == "pdfplumber"
+    assert not called, "pdfplumber 结果健康时不该再跑一遍 pypdf"
+
+
+def test_a_thin_pdfplumber_result_still_gets_cross_checked():
+    """反过来：字数塌了就必须复核，并把分歧记下来。"""
+    thin = {i: "残 " * 20 for i in range(1, 11)}            # 40 字/页
+    _, _, used, note = pdf_source.extract_pages(
+        b"x", primary=_fake_extractor(thin), secondary=_fake_extractor(RICH))
+
+    assert used == "pypdf"
+    assert "人工抽查" in note
 
 
 def test_small_advantage_does_not_flip_the_extractor():
