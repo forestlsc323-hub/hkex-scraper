@@ -46,23 +46,48 @@ def make_pdf(lines: list[str]) -> bytes:
 
 
 class FakeResp:
-    def __init__(self, content: bytes):
+    """假响应。
+
+    ⚠️ 必须和 requests 的真实接口一致 —— 包括 stream=True 时的
+    iter_content 和 close。夹具和真接口对不上，测的就是另一个系统
+    （日期格式那次已经吃过一回亏了）。
+    """
+
+    def __init__(self, content: bytes, *, chunks: int = 1, on_chunk=None):
         self.content = content
+        self._chunks = chunks
+        self._on_chunk = on_chunk
+        self.closed = False
 
     def raise_for_status(self):
         pass
+
+    def iter_content(self, size=None):
+        step = max(1, len(self.content) // self._chunks) if self.content else 1
+        for i in range(0, len(self.content) or 1, step):
+            if self._on_chunk:
+                self._on_chunk()
+            yield self.content[i:i + step]
+
+    def close(self):
+        self.closed = True
 
 
 class FakeSession:
     """记录被请求了几次 —— 用来验证缓存真的挡住了重复请求。"""
 
-    def __init__(self, content: bytes):
+    def __init__(self, content: bytes, *, chunks: int = 1, on_chunk=None):
         self.content = content
         self.calls: list[str] = []
+        self._chunks = chunks
+        self._on_chunk = on_chunk
+        self.last: FakeResp | None = None
 
-    def get(self, url, headers=None, timeout=None):
+    def get(self, url, headers=None, timeout=None, stream=False):
         self.calls.append(url)
-        return FakeResp(self.content)
+        self.last = FakeResp(self.content, chunks=self._chunks,
+                             on_chunk=self._on_chunk)
+        return self.last
 
 
 VALUE_SECTION = [
@@ -214,3 +239,50 @@ def test_cache_survives_a_new_session_object(tmp_path):
     doc = pdf_source.open_pdf(url, tmp_path, session=fresh)
     assert fresh.calls == []
     assert doc.from_cache and "15.45%" in doc.text
+
+
+# ---------------------------------------------------------------- 下载预算
+
+def test_a_trickling_server_is_cut_off_by_the_wall_clock(tmp_path):
+    """requests 的 timeout=(10, 25) 不是总时长。
+
+    10 = 建立连接最多等多久；25 = **两次收到数据之间**最多等多久。
+    服务端每 24 秒吐一个字节，读超时永远不触发，这次请求可以拖到
+    天荒地老 —— 「85/86 之后一直等」就是这么来的。
+    真正的上界只能自己拿秒表卡。
+    """
+    clock = {"t": 0.0}
+
+    def tick():
+        clock["t"] += 5.0            # 每收一块就过去 5 秒
+
+    session = FakeSession(make_pdf(VALUE_SECTION), chunks=20, on_chunk=tick)
+    monkey = lambda: clock["t"]      # noqa: E731
+
+    with pytest.raises(pdf_source.DownloadTooSlow) as err:
+        pdf_source._read_within(session.get("u", stream=True), budget=12.0,
+                                clock=monkey)
+    assert "12 秒" in str(err.value)
+
+
+def test_the_connection_is_closed_when_we_give_up(tmp_path):
+    """掐断就要真掐断，不能留着连接白占对方的资源。"""
+    clock = {"t": 0.0}
+    session = FakeSession(make_pdf(VALUE_SECTION), chunks=20,
+                          on_chunk=lambda: clock.__setitem__("t", clock["t"] + 5))
+    resp = session.get("u", stream=True)
+    with pytest.raises(pdf_source.DownloadTooSlow):
+        pdf_source._read_within(resp, budget=8.0, clock=lambda: clock["t"])
+    assert resp.closed, "放弃了却没关连接"
+
+
+def test_a_normal_download_is_not_affected(tmp_path):
+    """正常速度的下载一切照旧，预算只是兜底。"""
+    session = FakeSession(make_pdf(VALUE_SECTION), chunks=8)
+    doc = pdf_source.open_pdf("https://x/ok.pdf", tmp_path, session=session)
+    assert doc.pages and doc.has_text_layer
+
+
+def test_the_budget_is_a_named_constant_not_a_magic_number():
+    assert pdf_source.BUDGET_SECONDS > 0
+    assert isinstance(pdf_source.BUDGET_SECONDS, float)

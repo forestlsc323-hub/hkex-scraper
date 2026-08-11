@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 
 import pytest
 
@@ -468,3 +469,68 @@ def test_the_listing_file_is_sorted_by_real_date(isolated):
     rows = list(store.load_listing(isolated).values())
     dates = [store.row_date(r) for r in rows]
     assert dates == sorted(dates, reverse=True), f"存档顺序是乱的：{dates}"
+
+
+def test_stopping_midway_keeps_what_was_already_extracted(isolated, monkeypatch):
+    """卡在最后一份时按「停止」，前面那些不能白费。
+
+    原来是全部跑完才写存档 —— 停一次，85 份的下载和解析全部重来。
+    """
+    from hkexdb import screening as S
+    from tests.test_runner import fake_open_pdf
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 1, "keyword", ["要約"]))
+    event = threading.Event()
+    rows = [{"row_id": f"n{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
+            for i in range(30)]
+
+    seen = {"n": 0}
+
+    def opener(url):
+        seen["n"] += 1
+        if seen["n"] > 22:                 # 抽到第 23 份时用户点了停止
+            event.set()
+        return fake_open_pdf(url)
+
+    with pytest.raises(runner.Cancelled):
+        runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                              event, open_pdf=opener)
+
+    saved = store.load_deals(isolated)
+    assert len(saved) >= 20, f"停下来只存了 {len(saved)} 条，前面的白跑了"
+
+
+def test_a_resumed_run_does_not_re_download_what_was_flushed(isolated, monkeypatch):
+    """停了再跑，已经存下的那些不用重下 —— 这才是增量存档的意义。"""
+    from hkexdb import screening as S
+    from tests.test_runner import fake_open_pdf
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 1, "keyword", ["要約"]))
+    rows = [{"row_id": f"n{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
+            for i in range(30)]
+
+    event = threading.Event()
+    opened = []
+
+    def opener(url):
+        opened.append(url)
+        if len(opened) > 22:
+            event.set()
+        return fake_open_pdf(url)
+
+    with pytest.raises(runner.Cancelled):
+        runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                              event, open_pdf=opener)
+    first_round = len(opened)
+    opened.clear()
+
+    runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
+                          open_pdf=lambda u: (opened.append(u),
+                                              fake_open_pdf(u))[1])
+    assert len(opened) < first_round, "续跑时又把存过的重下了一遍"

@@ -124,30 +124,59 @@ class RateLimiter:
 _TRANSIENT = (requests.ConnectionError, requests.Timeout)
 
 
+class DownloadTooSlow(requests.Timeout):
+    """这份公告拖太久了，放弃它，别拖住整批。"""
+
+
+# 一次下载最多允许占用多少秒（墙上时钟，不是读超时）。
+BUDGET_SECONDS = 30.0
+
+
+def _read_within(resp, budget: float, clock=time.monotonic) -> bytes:
+    """边收边看表，超预算就掐断。
+
+    ⚠️ requests 的 timeout=(10, 25) **不是总时长**：
+        10 = 建立连接最多等多久
+        25 = 两次收到数据之间最多等多久
+    服务端只要每 24 秒吐一个字节，读超时就永远不触发，这次请求可以
+    拖到天荒地老。我原先说的「3 次 × 25 秒 = 80 秒封顶」是错的 ——
+    那只在对方彻底不响应时成立，而「连上了但挤牙膏」恰恰是最常见的那种。
+
+    所以真正的上界只能自己拿秒表卡：流式读，超预算就断开。
+    """
+    deadline = clock() + budget
+    chunks = []
+    for chunk in resp.iter_content(65536):
+        if chunk:
+            chunks.append(chunk)
+        if clock() > deadline:
+            resp.close()
+            raise DownloadTooSlow(
+                f"下载超过 {budget:.0f} 秒仍未取完（已收 "
+                f"{sum(len(c) for c in chunks) / 1024:.0f} KB）")
+    return b"".join(chunks)
+
+
 def _get_with_retry(session, url, headers, timeout, limiter,
                     attempts: int = 3, backoff: float = 1.5, sleeper=time.sleep,
-                    on_retry=None):
-    """带退避重试的 GET。
+                    on_retry=None, budget: float = BUDGET_SECONDS):
+    """带退避重试、**带墙上时钟预算**的 GET。返回字节。
 
-    偶发网络错误不该让那一单永久丢数据，重试一次通常就回来了。
+    偶发网络错误不该让那一单永久丢数据，重试一次通常就回来了；
+    但一份公告最多占用 attempts × budget 秒，到点就放弃，
+    那一行标成失败，剩下的接着跑 —— 一份烂链接不该拖住整批。
 
-    ⚠️ 重试次数 × 读超时 = 一个死链能卡多久，这笔账必须算清楚：
-        读超时 180s × 4 次 = 12 分钟   ← 最早那版，56 份跑了 24 分钟
-        读超时  60s × 3 次 = 3.1 分钟
-        读超时  25s × 3 次 = 80 秒     ← 现在
-    你看到的「85/86 之后一直等」就是最后一份卡在死链上重试。
-
-    `on_retry(第几次, 还剩几次, 异常)` 让上层把重试**说出来** ——
-    界面上一声不吭地等 3 分钟，和卡死没有区别。
+    `on_retry(第几次, 共几次, 异常)` 让上层把重试说出来。
     """
     last = None
     for attempt in range(attempts):
         if limiter is not None:
             limiter.acquire()
         try:
-            resp = session.get(url, headers=headers, timeout=timeout)
+            resp = session.get(url, headers=headers, timeout=timeout,
+                               stream=True)
             resp.raise_for_status()
-            return resp
+            return _read_within(resp, budget)
         except _TRANSIENT as exc:
             last = exc
             if attempt < attempts - 1:
@@ -181,10 +210,9 @@ def fetch_bytes(url: str, cache_dir: Path, *,
                     "若失败请传入检索时用的那个 session", url)
         session = requests.Session()
     headers = dict(HEADERS, **{"User-Agent": user_agent})
-    resp = _get_with_retry(session, url, headers, timeout, limiter,
-                           on_retry=on_retry)
+    content = _get_with_retry(session, url, headers, timeout, limiter,
+                              on_retry=on_retry)
 
-    content = resp.content
     if not is_html_link(url) and not content.startswith(b"%PDF"):
         raise ValueError(
             f"这个链接返回的不是 PDF（开头是 {content[:16]!r}）：{url}")

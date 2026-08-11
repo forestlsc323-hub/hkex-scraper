@@ -907,14 +907,44 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
                 f"{VERDICT_LABEL.get(deal.verdict, '')}：{deal.verdict_reason}")
         return deal
 
-    if workers == 1:
-        deals = [one(r) for r in targets]
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(one, r) for r in targets]
-            deals = []
-            for fut in futures:            # 按提交顺序收，输出稳定可复现
-                deals.append(fut.result())
+    # 每完成这么多份就往存档里刷一次。
+    # 原来是全部跑完才存 —— 卡在最后一份时按「停止」，前面 85 份的
+    # 抽取成果全部白费，下次还得从头再下一遍。
+    FLUSH_EVERY = 10
+    deals: list[Deal] = []
+
+    def flush(rows: list[Deal]) -> None:
+        keep_rows = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
+                      **dict(zip(DEAL_COLUMNS, _deal_row(d)))}
+                     for d in rows if d.news_id]
+        if keep_rows:
+            store.merge_deals(ROOT, keep_rows, DEAL_COLUMNS)
+            store.merge_evidence(ROOT, {d.pdf_url: d.evidence
+                                        for d in rows if d.pdf_url and d.evidence})
+
+    try:
+        if workers == 1:
+            for row in targets:
+                deals.append(one(row))
+                if len(deals) % FLUSH_EVERY == 0:
+                    flush(deals[-FLUSH_EVERY:])
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(one, r) for r in targets]
+                pending = []
+                for fut in futures:        # 按提交顺序收，输出稳定可复现
+                    deal = fut.result()
+                    deals.append(deal)
+                    pending.append(deal)
+                    if len(pending) >= FLUSH_EVERY:
+                        flush(pending)
+                        pending = []
+                flush(pending)
+    except (Cancelled, KeyboardInterrupt):
+        # 停在半路也要把已经抽好的存下来 —— 下次接着跑，不用重下
+        flush(deals)
+        log(f"  已停止，但前 {len(deals)} 份的抽取结果已存档，下次不用重抽。")
+        raise
 
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
