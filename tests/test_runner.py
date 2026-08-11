@@ -234,7 +234,7 @@ def test_app_reads_default_dates_from_config():
 def test_crash_guard_writes_a_file_and_never_dies_silently(tmp_path, monkeypatch):
     """双击后「什么都没发生」是最难排查的失败 —— 必须留下痕迹。
 
-    RUN.bat 曾用 pythonw.exe 启动，它没有控制台：界面若在启动阶段崩掉，
+    一键运行.bat 曾用 pythonw.exe 启动，它没有控制台：界面若在启动阶段崩掉，
     用户看不到任何东西，我也拿不到线索。现在改用 python.exe 保留控制台，
     并加这层兜底：写文件 + 打控制台 + 尽量弹窗。
     """
@@ -260,8 +260,8 @@ def test_crash_guard_passes_through_success(tmp_path, monkeypatch):
 
 
 def test_launcher_keeps_a_console_for_errors():
-    """RUN.bat 不能用 pythonw.exe —— 那样启动失败就是静默的。"""
-    bat = (runner.Path(__file__).parent.parent / "RUN.bat").read_bytes().decode("utf-8")
+    """一键运行.bat 不能用 pythonw.exe —— 那样启动失败就是静默的。"""
+    bat = (runner.Path(__file__).parent.parent / "一键运行.bat").read_bytes().decode("utf-8")
     # 只看真正会执行的行 —— 注释里提到 pythonw 是在说明为什么不用它
     live = [ln for ln in bat.splitlines()
             if ln.strip() and not ln.strip().upper().startswith("REM")]
@@ -270,7 +270,7 @@ def test_launcher_keeps_a_console_for_errors():
     assert any("python.exe app.py" in ln for ln in live)
 
 
-@pytest.mark.parametrize("name", ["RUN.bat", "一键运行.bat", "一键更新.bat"])
+@pytest.mark.parametrize("name", ["一键运行.bat", "一键更新.bat"])
 def test_every_bat_uses_crlf_line_endings(name):
     """LF 换行会让 Windows cmd 解析崩掉，双击后闪一下就关（真踩过）。"""
     raw = (runner.Path(__file__).parent.parent / name).read_bytes()

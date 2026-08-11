@@ -25,7 +25,7 @@ if not defined PY (
   echo         [v] Add python.exe to PATH
   echo         不勾的话装完还是这个提示。
   echo.
-  echo     装完关掉本窗口，重新双击 RUN.bat 即可。
+  echo     装完关掉本窗口，重新双击本文件即可。
   echo.
   echo     如果输 python 会弹出微软商店（那是占位符，不是真 Python）：
   echo       设置 - 应用 - 高级应用设置 - 应用执行别名

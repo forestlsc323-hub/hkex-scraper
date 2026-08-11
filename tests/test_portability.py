@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-BATS = ["RUN.bat", "一键运行.bat", "一键更新.bat"]
+BATS = ["一键运行.bat", "一键更新.bat"]
 
 
 # ---------------------------------------------------------------- 启动器
@@ -31,7 +31,7 @@ def test_bat_files_use_crlf(name):
 
 def test_launcher_keeps_a_console_so_errors_are_visible():
     """pythonw.exe 没有控制台：界面若在启动阶段崩掉，用户什么都看不到。"""
-    bat = (ROOT / "RUN.bat").read_bytes().decode("utf-8")
+    bat = (ROOT / "一键运行.bat").read_bytes().decode("utf-8")
     live = [ln for ln in bat.splitlines()
             if ln.strip() and not ln.strip().upper().startswith("REM")]
     assert not any("pythonw" in ln for ln in live)
