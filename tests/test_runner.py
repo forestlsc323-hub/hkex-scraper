@@ -794,3 +794,83 @@ def test_an_unidentifiable_mirror_pair_is_left_for_a_human():
                     title=title, offeror="毫不相干的離岸公司", verdict="offer")
     assert runner.mark_mirror_filings([a, b]) == 0
     assert a.verdict == b.verdict == "offer"
+
+
+# ---------------------------------------------------------------- 解析串行
+
+def test_parsing_never_runs_two_at_a_time(_isolate, monkeypatch):
+    """解析必须串行。实测 12 份真实公告只算解析：
+
+        1 路 12.13 秒 / 2 路 13.59 秒 / 4 路 20.56 秒
+
+    GIL 让 CPU 型工作没法真并行，多开线程总时间反而涨 70%，
+    还把 Tk 主线程一起拖住 —— 那就是「未响应」的来源。
+    下载并发（I/O，等网络时放开 GIL），解析串行。
+    """
+    import time as _t
+
+    from hkexdb import pdf_source, screening as S
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 4, "keyword", ["要約"]))
+
+    overlap = {"max": 0, "now": 0}
+    guard = threading.Lock()
+    real_parse = pdf_source.parse_doc
+
+    def watched_parse(url, data, **kw):
+        with guard:
+            overlap["now"] += 1
+            overlap["max"] = max(overlap["max"], overlap["now"])
+        _t.sleep(0.05)
+        try:
+            return real_parse(url, data, **kw)
+        finally:
+            with guard:
+                overlap["now"] -= 1
+
+    monkeypatch.setattr(pdf_source, "parse_doc", watched_parse)
+
+    page = ("「要約價」 指 每股要約股份0.519港元 "
+            "價值比較每股要約價為每股0.519港元，較："
+            "(i) 股份於最後交易日在聯交所所報收市價每股1.870港元折讓約72.25%。"
+            "要約人於要約項下須支付的最高現金代價約為5,440萬港元。")
+    pdf = b"%PDF-1.4 " + page.encode("utf-8")
+
+    def fetch_only(url):
+        _t.sleep(0.02)                       # 假装在下载
+        return runner._Fetched(url, pdf, False)
+
+    monkeypatch.setattr(pdf_source, "extract_pages",
+                        lambda data, max_pages=0: ({1: page}, 1, "fake", ""))
+
+    rows = [{"row_id": f"r{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
+            for i in range(8)]
+
+    runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
+                          open_pdf=fetch_only)
+    assert overlap["max"] == 1, \
+        f"同时有 {overlap['max']} 份在解析 —— 解析必须串行"
+
+
+def test_the_activity_line_says_how_long_each_one_has_waited(_isolate, monkeypatch):
+    """并发跑批时最慢的那份必然排最后。消不掉，但要让它可预期：
+    还剩几份、分别是谁、各等了多久、最多还要等多久。"""
+    from hkexdb import screening as S
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 2, "keyword", ["要約"]))
+    notes = []
+    rows = [{"row_id": "r0", "date": "2026-06-15", "code": "00318",
+             "name": "黃河實業", "title": "作出強制性無條件現金要約",
+             "pdf_url": "/x/0.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}]
+
+    runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
+                          open_pdf=fake_open_pdf, on_activity=notes.append)
+
+    text = " ".join(notes)
+    assert "还剩" in text and "00318" in text
+    assert "等了" in text, "不显示每一份等了多久"
+    assert str(runner.MAX_SECONDS_PER_PDF) in text, "不给等待的上界"

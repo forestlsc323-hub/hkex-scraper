@@ -32,6 +32,10 @@ class Cancelled(Exception):
 VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约",
                  "mirror": "镜像重复"}
 
+# 一份公告最多占用多久。3 次尝试 × 25 秒读超时 + 退避 ≈ 80 秒，
+# 这个数字是给用户看的上界：等待有边界，就不是卡死。
+MAX_SECONDS_PER_PDF = 80
+
 
 def _normalise(text: str) -> str:
     import re as _re
@@ -801,13 +805,15 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
                     f"{type(exc).__name__}")
                 on_activity(f"重试第 {attempt}/{total} 次…")
 
-            doc = pdf_source.open_pdf(url, cache, session=client.session,
-                                      limiter=limiter, on_retry=note_retry)
+            data, cached = pdf_source.fetch_bytes(
+                url, cache, session=client.session, limiter=limiter,
+                on_retry=note_retry)
             if not keep:
                 # 用完即弃 —— asso 那份客户端的 download_pdf 就是这么做的
                 # （`return r.content`，从不落盘）。省地方，但审计追溯断了。
                 pdf_source.discard_cached(url, cache)
-            return doc
+            # ⚠️ 解析放在**调用方**串行做，不在这里 —— 见 parse_lock 的注释
+            return _Fetched(url, data, cached)
     else:
         opener = open_pdf
 
@@ -836,17 +842,41 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
 
     done = [0]
     lock = threading.Lock()
-    busy: set = set()
+    busy: dict = {}          # 谁 → 什么时候开始的
 
     def _announce() -> None:
-        """把「正在处理哪几份」告诉界面。
+        """把「正在处理哪几份、各等了多久」告诉界面。
 
-        85/86 之后一声不吭地等三分钟，和卡死没有区别 ——
-        用户唯一能看到的必须是「还活着，在等谁」。
+        「85/86 之后一直等」的真相是：并发跑批时，**最慢的那一份必然排在
+        最后**。85 份早就完事了，你盯着的是剩下那一份在死链上重试。
+        这不是最后一份特别慢，是慢的那份定义上就是最后一份。
+
+        既然消不掉，就让它可预期：显示还剩几份、分别是谁、各等了多久、
+        最多还要等多久。有边界的等待和卡死是两回事。
         """
+        now = time.monotonic()
         with lock:
-            which = "、".join(sorted(str(c) for c in busy)[:3]) or "—"
-        on_activity(f"{done[0]}/{len(targets)} 份　正在处理：{which}")
+            items = sorted(busy.items(), key=lambda kv: kv[1])[:3]
+        if not items:
+            on_activity(f"{done[0]}/{len(targets)} 份")
+            return
+        parts = [f"{who}（等了 {int(now - t0)} 秒）" for who, t0 in items]
+        left = len(targets) - done[0]
+        tail = f"　最多再等 {MAX_SECONDS_PER_PDF} 秒" if left <= 3 else ""
+        on_activity(f"{done[0]}/{len(targets)} 份　还剩 {left} 份："
+                    + "、".join(parts) + tail)
+
+    # 解析全程持有这把锁 —— 也就是说**同一时刻只有一份公告在解析**。
+    #
+    # 这不是保守，是实测出来的：12 份真实公告只算解析，
+    #   1 路 12.13 秒 / 2 路 13.59 秒 / 4 路 20.56 秒
+    # 解析是 CPU 型工作，GIL 让它没法真并行，多开线程只是把同样的活
+    # 切碎轮流做 —— 总时间反而涨 70%，还把 Tk 主线程一起拖住
+    # （界面卡顿从 74 毫秒涨到 328 毫秒，这就是「未响应」的来源）。
+    #
+    # 下载是 I/O 型工作，等网络时会释放 GIL，那才是并发真正能赚到的地方。
+    # 所以：下载并发、解析串行。
+    parse_lock = threading.Lock()
 
     def one(row) -> Deal:
         # 增删和读取必须同一把锁 —— 一个线程在 sorted(busy) 的同时
@@ -854,14 +884,14 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         # 而那是在 4 路并发里偶发的，最难复现的那种。
         who = row.get("code") or row.get("row_id")
         with lock:
-            busy.add(who)
+            busy[who] = time.monotonic()
         _announce()
         try:
             deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
-                                selectors, validators)
+                                selectors, validators, parse_lock)
         finally:
             with lock:
-                busy.discard(who)
+                busy.pop(who, None)
             _announce()
         with lock:
             done[0] += 1
@@ -963,8 +993,17 @@ def _deal_from_row(row: dict) -> Deal:
     return deal
 
 
+class _Fetched:
+    """刚下回来、还没解析的公告字节。"""
+
+    __slots__ = ("url", "data", "from_cache")
+
+    def __init__(self, url, data, from_cache):
+        self.url, self.data, self.from_cache = url, data, from_cache
+
+
 def _extract_one(row, opener, cancel_event, extractor, pdf_source,
-                 selectors, validators) -> Deal:
+                 selectors, validators, parse_lock=None) -> Deal:
     """抽一份公告。抽挂了变成 Deal 上的一条备注，不能连累其余几百份。"""
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
@@ -980,7 +1019,18 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
                 title=row["title"], pdf_url=pdf_source.full_url(row["pdf_url"]))
     if True:
         try:
-            doc = opener(deal.pdf_url)
+            got = opener(deal.pdf_url)
+            if isinstance(got, _Fetched):
+                # 下载完了才排队解析 —— 排队的是 CPU，不是网络
+                if parse_lock is not None:
+                    with parse_lock:
+                        doc = pdf_source.parse_doc(got.url, got.data,
+                                                   from_cache=got.from_cache)
+                else:
+                    doc = pdf_source.parse_doc(got.url, got.data,
+                                               from_cache=got.from_cache)
+            else:
+                doc = got                      # 测试注入的假 PDF
             if not doc.has_text_layer:
                 deal.notes = "扫描件无文本层，需 OCR 并人工复核"
                 deal.confidence = "low"
