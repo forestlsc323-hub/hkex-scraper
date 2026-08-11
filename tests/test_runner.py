@@ -1090,3 +1090,147 @@ def test_the_ninety_seconds_we_promise_is_the_one_we_enforce(_isolate):
     assert runner._parse_timeout() == runner.MAX_SECONDS_PER_PDF
     # 子进程真的会用上这个数字
     assert "timeout" in inspect.signature(parsepool.ParsePool).parameters
+
+
+def test_two_deals_years_apart_on_one_company_both_get_opened():
+    """跨年份抓取时这是**必需**的，不是优化。
+
+    原来按股票代码在整个日期范围里数上限，抓一年看不出问题；一旦抓
+    2024~2026，一家公司 2024 年那单的四份公告会把名额全占掉，
+    2026 年那单一份都打不开 —— 而日志上只显示「跳过 N 份」，
+    看不出丢掉的是一整单交易。
+    """
+    rows = ([{"row_id": f"a{i}", "code": "00195", "date": f"2024-03-{i + 1:02d}"}
+             for i in range(6)]
+            + [{"row_id": f"b{i}", "code": "00195", "date": f"2026-05-{i + 1:02d}"}
+               for i in range(6)])
+
+    keep, skipped = runner._cap_per_target(rows)
+
+    years = {r["date"][:4] for r in keep}
+    assert years == {"2024", "2026"}, "有一整单交易被名额挤掉了"
+    assert len([r for r in keep if r["date"].startswith("2024")]) == 4
+    assert len([r for r in keep if r["date"].startswith("2026")]) == 4
+    assert skipped == {"00195": 4}
+
+
+def test_the_same_deals_two_offers_a_quarter_apart_are_separated():
+    """02362 金川：2026-03 一单 MGO，2026-05 一单 PO，隔 86 天。
+
+    用户自己的手册写着「同一家公司被不同要约人先后发要约要分开记」。
+    """
+    rows = ([{"row_id": f"m{i}", "code": "02362", "date": f"2026-03-{i + 2:02d}"}
+             for i in range(5)]
+            + [{"row_id": f"p{i}", "code": "02362", "date": f"2026-05-{i + 27:02d}"}
+               for i in range(2)])
+
+    keep, _ = runner._cap_per_target(rows)
+
+    assert len([r for r in keep if r["date"].startswith("2026-05")]) == 2, \
+        "后面那单 PO 被前面那单的名额挤掉了"
+
+
+def test_follow_ups_inside_one_deal_are_still_capped():
+    """别为了修跨年份把原来的收益丢了 —— 09638 那 19 份仍然只开最早 4 份。"""
+    rows = [{"row_id": f"r{i}", "code": "09638",
+             "date": f"2026-03-{i % 28 + 1:02d}"} for i in range(19)]
+    keep, skipped = runner._cap_per_target(rows)
+    assert len(keep) == 4 and skipped == {"09638": 15}
+
+
+def test_the_gap_that_starts_a_new_deal_is_configurable(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "listing:\n  max_per_target: 2\n  new_deal_gap_days: 5\n", encoding="utf-8")
+
+    rows = [{"row_id": "a", "code": "00001", "date": "2026-01-01"},
+            {"row_id": "b", "code": "00001", "date": "2026-01-02"},
+            {"row_id": "c", "code": "00001", "date": "2026-01-03"},
+            {"row_id": "d", "code": "00001", "date": "2026-02-20"}]
+
+    keep, _ = runner._cap_per_target(rows)
+    assert [r["row_id"] for r in keep] == ["a", "b", "d"]
+
+
+def test_rows_without_a_usable_date_are_not_dropped():
+    """没有日期的照样要进抽取 —— 静默丢行是这一层最不该犯的错。"""
+    rows = [{"row_id": "x", "code": "00001", "date": ""},
+            {"row_id": "y", "code": "00001", "date": "不是日期"}]
+    keep, _ = runner._cap_per_target(rows)
+    assert len(keep) == 2
+
+
+def test_a_chunk_that_hits_the_row_limit_is_split_and_re_queried(
+        monkeypatch, tmp_path, _isolate):
+    """一个 (月, 关键词) 只发一个请求、rowRange=500、不翻页。
+
+    某个月超过 500 条，多出来的一声不响就没了 —— 而**日志上一切正常**：
+    那一段照样显示「返回 500 条」，没人看得出后面还有。抓一年碰不上，
+    抓 2024~2026 迟早撞上。用户要的是任意年份都能爬，所以这是必修的。
+    """
+    import sys
+    import types
+
+    cap = 4
+    cfg = types.ModuleType("config")
+    cfg.ROW_RANGE_STEP = cap
+    cfg.SLEEP_BETWEEN_REQUESTS = 0
+    cfg.REQUEST_TIMEOUT = (1, 1)
+    cfg.HKEX_SEARCH_URL = "https://x/titleSearchServlet.do"
+
+    # 6 月 1~10 号每天两条。整月一次问只能拿回 4 条（顶到上限）。
+    everything = [
+        {"NEWS_ID": f"n{d}{i}", "DATE_TIME": f"{d:02d}/06/2026 08:00",
+         "STOCK_CODE": "00001", "STOCK_NAME": "公司", "TITLE": "作出要約",
+         "FILE_LINK": f"/x/{d}{i}.pdf"}
+        for d in range(1, 11) for i in range(2)]
+
+    def within(a, b):
+        lo, hi = int(a), int(b)
+        out = []
+        for rec in everything:
+            d, m, y = rec["DATE_TIME"].split()[0].split("/")
+            if lo <= int(f"{y}{m}{d}") <= hi:
+                out.append(rec)
+        return out
+
+    calls = []
+
+    class Resp:
+        def __init__(self, p):
+            self._p = p
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._p
+
+    class Session:
+        cookies: list = []
+
+        def get(self, url, params=None, timeout=None):
+            calls.append((params["fromDate"], params["toDate"]))
+            hit = within(params["fromDate"], params["toDate"])[:cap]
+            return Resp({"result": json.dumps(hit) if hit else "null"})
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.session = Session()
+
+        @staticmethod
+        def _clean(rec):
+            return dict(rec)
+
+    mod = types.ModuleType("hkex_client")
+    mod.HKEXClient = FakeClient
+    monkeypatch.setitem(sys.modules, "config", cfg)
+    monkeypatch.setitem(sys.modules, "hkex_client", mod)
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (cap, 1, "keyword", ["要約"]))
+
+    got = runner._fetch(dt.date(2026, 6, 1), dt.date(2026, 6, 30),
+                        lambda *_: None, lambda *_: None, None)
+
+    assert len(got) == 20, f"劈段没劈干净，只拿回 {len(got)} 条"
+    assert len(calls) > 1, "顶到上限却没有劈段重查"

@@ -46,28 +46,68 @@ MAX_SECONDS_PER_PDF = 90
 MAX_PER_TARGET = 4
 
 
+# 同一家公司的两份公告隔了这么久，就当成**两单不同的交易**。
+#
+# 一单要约从 T0 到收官通常三四个月，中间的进展公告隔几天到几周；
+# 而同一家公司的前后两单要约往往隔一年以上。60 天是个偏保守的切法：
+# 切多了只是多下几份 PDF，切少了会整单丢掉 —— 代价完全不对等。
+#
+# 02362 金川就是活例子：2026-03 一单 MGO，2026-05 一单 PO，隔 86 天。
+NEW_DEAL_GAP_DAYS = 60
+
+
+def _cluster_key(rows: list, gap_days: int) -> list:
+    """把一个标的的公告按时间间隔切成若干单。返回 [(第几单, row), …]。"""
+    out, cluster, prev = [], 0, None
+    for row in rows:
+        day = None
+        try:
+            day = dt.date.fromisoformat(str(row.get("date", ""))[:10])
+        except ValueError:
+            pass
+        if prev is not None and day is not None and (day - prev).days > gap_days:
+            cluster += 1
+        if day is not None:
+            prev = day
+        out.append((cluster, row))
+    return out
+
+
 def _cap_per_target(rows: list) -> tuple[list, dict]:
-    """同一标的只展开最早的几份，其余先放着。
+    """同一标的的**同一单**交易只展开最早的几份，其余先放着。
 
     返回 (要抽的, {代码: 跳过几份})。跳过的**不是删除** —— 它们仍在
     筛查表里，只是这一轮不下载。需要时把 max_per_target 调大重跑。
+
+    ⚠️ 「同一单」这三个字是这一版补上的，而它在跨年份抓取时是**必需**的。
+    原来是按股票代码在整个日期范围里数，抓一年还看不出问题；一旦抓
+    2024~2026，一家公司 2024 年那单的四份公告会把名额全占掉，
+    2026 年那单**一份都打不开**，而且日志上只显示「跳过 N 份」，
+    看不出丢掉的是一整单交易。用户的目标是任意年份都能爬，
+    所以这不是优化，是修 bug。
     """
-    cap = MAX_PER_TARGET
+    cfg = _listing_config()
+    cap, gap = MAX_PER_TARGET, NEW_DEAL_GAP_DAYS
     try:
-        cap = int(_listing_config().get("max_per_target", cap))
+        cap = int(cfg.get("max_per_target", cap))
+        gap = int(cfg.get("new_deal_gap_days", gap))
     except (TypeError, ValueError):
         pass
 
-    ordered = sorted(rows, key=lambda r: (r.get("date", ""), r.get("row_id", "")))
-    seen: dict = {}
+    by_code: dict = {}
+    for row in sorted(rows, key=lambda r: (r.get("date", ""), r.get("row_id", ""))):
+        by_code.setdefault(row.get("code") or row.get("row_id"), []).append(row)
+
     keep, skipped = [], {}
-    for row in ordered:
-        code = row.get("code") or row.get("row_id")
-        seen[code] = seen.get(code, 0) + 1
-        if seen[code] <= cap:
-            keep.append(row)
-        else:
-            skipped[code] = skipped.get(code, 0) + 1
+    for code, group in by_code.items():
+        seen: dict = {}
+        for cluster, row in _cluster_key(group, gap):
+            seen[cluster] = seen.get(cluster, 0) + 1
+            if seen[cluster] <= cap:
+                keep.append(row)
+            else:
+                skipped[code] = skipped.get(code, 0) + 1
+    keep.sort(key=lambda r: (r.get("date", ""), r.get("row_id", "")))
     return keep, skipped
 
 
@@ -279,25 +319,45 @@ def _fetch_by_keyword(client, vendor_config, keywords: list[str],
     done = 0
     per_keyword: dict[str, int] = {k: 0 for k in keywords}
 
+    cap = int(vendor_config.ROW_RANGE_STEP)
+
+    def ask(a: dt.date, b: dt.date, kw: str) -> list:
+        """问一段日期。**返回条数顶到上限就把这段劈成两半再问。**
+
+        ⚠️ 一个 (月, 关键词) 只发一个请求、rowRange=500、不翻页 ——
+        某个月要是超过 500 条，多出来的一声不响就没了。抓一年碰不上，
+        抓 2024~2026 迟早撞上，而且撞上时**日志上一切正常**：
+        那一段照样显示「返回 500 条」，没人看得出后面还有。
+
+        接口不给总数，所以只能反过来判：条数正好等于上限，就当它被截了，
+        对半劈开重问，一直劈到单日。多发几个请求换「不漏」，值。
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+        params = {
+            "sortDir": "0", "sortByOptions": "DateTime", "category": "0",
+            "market": "SEHK", "stockId": "-1", "documentType": "-1",
+            "fromDate": a.strftime("%Y%m%d"), "toDate": b.strftime("%Y%m%d"),
+            "title": kw, "searchType": "0",
+            "t1code": "-2", "t2Gcode": "-2", "t2code": "-2",
+            "rowRange": str(cap), "lang": "zh",
+        }
+        resp = client.session.get(vendor_config.HKEX_SEARCH_URL, params=params,
+                                  timeout=vendor_config.REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        raw = resp.json().get("result")
+        records = _json.loads(raw) if raw not in (None, "null") else []
+        time.sleep(vendor_config.SLEEP_BETWEEN_REQUESTS)
+
+        if len(records) < cap or a >= b:
+            return records
+        mid = a + (b - a) // 2
+        log(f"      {a}~{b}「{kw}」顶到 {cap} 条上限，劈成两段重查（怕漏）")
+        return ask(a, mid, kw) + ask(mid + dt.timedelta(days=1), b, kw)
+
     for c1, c2 in chunks:
         for kw in keywords:
-            if cancel_event is not None and cancel_event.is_set():
-                raise Cancelled()
-            params = {
-                "sortDir": "0", "sortByOptions": "DateTime", "category": "0",
-                "market": "SEHK", "stockId": "-1", "documentType": "-1",
-                "fromDate": c1.strftime("%Y%m%d"), "toDate": c2.strftime("%Y%m%d"),
-                "title": kw, "searchType": "0",
-                "t1code": "-2", "t2Gcode": "-2", "t2code": "-2",
-                "rowRange": str(vendor_config.ROW_RANGE_STEP), "lang": "zh",
-            }
-            resp = client.session.get(vendor_config.HKEX_SEARCH_URL,
-                                      params=params,
-                                      timeout=vendor_config.REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            payload = resp.json()
-            raw = payload.get("result")
-            records = _json.loads(raw) if raw not in (None, "null") else []
+            records = ask(c1, c2, kw)
             new = 0
             for rec in records:
                 nid = rec["NEWS_ID"]
@@ -310,7 +370,6 @@ def _fetch_by_keyword(client, vendor_config, keywords: list[str],
             log(f"  [{done}/{total}] {c1:%Y-%m}　「{kw}」返回 {len(records)} 条，"
                 f"新增 {new}　累计 {len(found)}")
             on_step(0, done / max(1, total))
-            time.sleep(vendor_config.SLEEP_BETWEEN_REQUESTS)
 
     dead = [k for k, n in per_keyword.items() if n == 0]
     if dead:
@@ -522,13 +581,6 @@ DISPOSABLE = [
     ("data/probe", "勘察产物", "点「勘察类别码」会重新生成"),
     ("logs", "运行日志", "只影响事后翻旧账"),
 ]
-
-
-def _tree_info(path: Path) -> tuple[int, int]:
-    if not path.exists():
-        return 0, 0
-    files = [f for f in path.rglob("*") if f.is_file()]
-    return len(files), sum(f.stat().st_size for f in files)
 
 
 def disposable_report() -> list[tuple[str, str, int, int, str]]:
