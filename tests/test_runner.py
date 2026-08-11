@@ -971,3 +971,51 @@ def test_each_file_is_only_counted_once(tmp_path, monkeypatch):
     (tmp_path / "data" / "cache" / "pdf" / "a.pdf").write_bytes(b"x" * 500)
 
     assert sum(size for _, _, _, size, _ in runner.disposable_report()) == 500
+
+
+def test_a_mirror_pair_is_caught_even_when_the_titles_differ():
+    """同日同标题这个键太脆。
+
+    实跑年初至今，表里明明有两组镜像（東曜/藥明合聯、巨騰/藍思），
+    只标出来一组 —— 双方各自归档时标题可能差一个字（代号后缀、
+    括号里的英文名），日期也可能差一天。
+
+    「要约价、交易规模、要约方三样完全相同」是比标题强得多的证据：
+    两行讲的就是同一单。
+    """
+    target = runner.Deal(code="01875", name="東曜藥業－Ｂ", date="2026-06-02",
+                         title="聯合公告 自願性有條件全面現金要約",
+                         offeror="藥明合聯生物技術有限公司* (WuXi XDC Cayman Inc.)",
+                         offer_price="4.00", deal_size="2790300000",
+                         verdict="offer")
+    offeror = runner.Deal(code="02268", name="藥明合聯", date="2026-06-03",
+                          title="聯合公告 自願性有條件全面現金要約 及 恢復買賣",
+                          offeror="藥明合聯生物技術有限公司* (WuXi XDC Cayman Inc.)",
+                          offer_price="4.00", deal_size="2790300000",
+                          verdict="offer")
+
+    assert runner.mark_mirror_filings([target, offeror]) == 1
+    assert offeror.verdict == "mirror"
+    assert target.verdict == "offer", "受要约方那一行必须留着"
+
+
+def test_identical_numbers_alone_do_not_merge_two_unrelated_companies():
+    """数字撞车但两家都不是要约方 —— 谁也不能标，交人工。
+
+    手册说这一步不许自动猜受要约方。
+    """
+    a = runner.Deal(code="01417", name="浦江中國", date="2026-06-15", title="甲",
+                    offeror="第三方控股有限公司", offer_price="1.00",
+                    deal_size="100000000", verdict="offer")
+    b = runner.Deal(code="03336", name="巨騰國際", date="2026-06-15", title="乙",
+                    offeror="第三方控股有限公司", offer_price="1.00",
+                    deal_size="100000000", verdict="offer")
+    assert runner.mark_mirror_filings([a, b]) == 0
+
+
+def test_a_mirror_row_is_only_marked_once():
+    """两个键都能命中同一行时，不能重复计数 —— 日志上的数字会对不上。"""
+    target, offeror = _mirror_pair()
+    target.offer_price = offeror.offer_price = "2.20"
+    target.deal_size = offeror.deal_size = "1905849908.60"
+    assert runner.mark_mirror_filings([target, offeror]) == 1

@@ -197,12 +197,24 @@ def extract_offer_type(title: str, pages: dict[int, str]) -> tuple[str, Evidence
 
 # ---------------------------------------------------------------- 要约价
 
+# ⚠️ 「面值」是这里最阴险的陷阱。港股公司章程里满篇都是
+# 「每股面值 0.01 港元」，而它和要约价长得一模一样：都是「每股 X 港元」。
+#
+# 02362 金川國際实跑抽出要约价 0.01、溢价 -98.38% —— 那不是要约价，
+# 是股份面值。数字本身「自洽」（0.01 对 0.617 确实是 -98.4%），所以
+# 校验器一个都拦不住，人看报表也只觉得这单折让离谱而已。
+# 这正是铁律二说的静默污染：错得很像对的。
+#
+# 所以宽松的那几条必须逐字符挡住「面值」，不能只在开头挡 ——
+# 「要約價…較每股面值0.01港元」这种写法会从中间绕过去。
+_NOT_PAR = r"(?:(?!面值|票面|股本面值)[^。；])"
+
 _OFFER_PRICE = [
     re.compile(r"「要約價」[^0-9]{0,40}?每股要約股份\s*([\d.]+)\s*港元"),
-    re.compile(r"「要約價」[^0-9]{0,60}?([\d.]+)\s*港元"),
+    re.compile(rf"「要約價」{_NOT_PAR}{{0,60}}?([\d.]+)\s*港元"),
     re.compile(r"要約價為?每股要約股份\s*([\d.]+)\s*港元"),
-    re.compile(r"每股要約股份[^0-9]{0,12}?([\d.]+)\s*港元"),
-    re.compile(r"要約價[^0-9]{0,20}?([\d.]+)\s*港元"),
+    re.compile(rf"每股要約股份{_NOT_PAR}{{0,12}}?([\d.]+)\s*港元"),
+    re.compile(rf"要約價{_NOT_PAR}{{0,20}}?([\d.]+)\s*港元"),
 ]
 
 
@@ -233,6 +245,34 @@ def looks_like_offer(pages: dict[int, str]) -> bool:
     真正的判定还是 Extraction.verdict()，口径一点没变。
     """
     return any(_OFFER_HINT.search(_flat(t)) for t in pages.values())
+
+
+# 交易规模至少得是「要约价 × 这么多股」。
+# 港股最小的要约也涉及百万级股数，1000 股留了三个数量级的余量 ——
+# 这道闸不是用来判断规模对不对的，只用来拦住「总额等于每股价」这种
+# 定义上就不可能的数：02362 实跑抽出要约价 0.01、交易规模 0.01。
+_MIN_SHARES_IN_A_DEAL = 1000
+
+
+def _drop_impossible_deal_size(result) -> None:
+    """总代价不可能等于每股价。对不上就把规模清掉，绝不留一个假数。
+
+    铁律三：没有出处的字段一律留空。抽到一个**定义上就不可能**的数字，
+    比留空坏得多 —— 留空会被人补上，错数会被人直接粘进底稿。
+    """
+    try:
+        price = float(result.offer_price)
+        size = float(result.deal_size)
+    except (TypeError, ValueError):
+        return
+    if price <= 0 or size <= 0:
+        return
+    if size < price * _MIN_SHARES_IN_A_DEAL:
+        result.notes.append(
+            f"抽到的交易规模 {result.deal_size} 与每股 {result.offer_price} "
+            f"港元不相称（总代价不可能这么接近每股价），已作废，需人工读原文")
+        result.deal_size = ""
+        result.deal_size_evidence = Evidence()
 
 
 def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
@@ -511,9 +551,14 @@ _FA_LEFT = re.compile(r"[(（]\s*(?:\d{1,2}|[ivxIVX]{1,4})\s*[)）]|由|及|and\
 # 这些不是名字，是公告里的通称。抽到它们等于没抽到 ——
 # 表里出现一个叫「要約人」的要约方，比留空更糟：它看着像抽到了。
 _PLACEHOLDER = {"要約人", "要约人", "本公司", "該公司", "买方", "買方",
-                "offeror", "the offeror", "有限公司", "公司"}
-# 要约人段的右边界：接下来必然是动词或介词
-_OFFEROR_RIGHT = re.compile(r"就|提出|作出|向|對|以|，|。|,")
+                "offeror", "the offeror", "有限公司", "公司",
+                # 08220 比高集團实跑抽出「認購人可能」——「認購人」和
+                # 「要約人」一样是通称，配股清洗豁免那类公告里满篇都是。
+                "認購人", "认购人", "收購方", "投資者", "賣方", "卖方"}
+# 要约人段的右边界：接下来必然是动词、助动词或介词。
+# 「可能」是从 08220 那单补的：标题写「…代表認購人可能須提出…」，
+# 不挡住它就会把助动词粘进公司名里。
+_OFFEROR_RIGHT = re.compile(r"就|提出|作出|向|對|以|可能|須|需|，|。|,")
 
 # 标题里常有两处「收購」——「部分收購要約以收購綠科科技…」。
 # 非贪婪从第一处起匹配会把「要約以收購」一起吃进公司名里，
@@ -828,6 +873,8 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         extract_conditionality(title, pages)
     result.debt_conversion, result.debt_conversion_evidence = \
         extract_debt_conversion(pages)
+
+    _drop_impossible_deal_size(result)
 
     if not result.offer_type:
         result.notes.append("要约类型未识别，需人工判定")

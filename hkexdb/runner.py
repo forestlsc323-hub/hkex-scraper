@@ -91,10 +91,21 @@ def mark_mirror_filings(deals: list) -> int:
     """
     groups: dict[tuple, list] = {}
     for d in deals:
-        groups.setdefault((d.date, _normalise(d.title)), []).append(d)
+        groups.setdefault(("题", d.date, _normalise(d.title)), []).append(d)
+        # 再按**抽出来的数字**分一次组。同日同标题这个键太脆：实跑里
+        # 两组镜像明明都在表内，却只标出来一组 —— 双方各自归档时标题
+        # 可能差一个字（代号后缀、括号里的英文名），日期也可能差一天。
+        #
+        # 而「要约价、交易规模、要约方三样完全相同」是比标题强得多的
+        # 证据：两行讲的就是同一单。
+        if d.offer_price and d.deal_size and d.offeror:
+            groups.setdefault(("数", d.offer_price, d.deal_size,
+                               _normalise(d.offeror)), []).append(d)
 
     marked = 0
+    seen: set[int] = set()
     for group in groups.values():
+        group = [d for d in group if id(d) not in seen]
         if len(group) < 2 or len({d.code for d in group}) < 2:
             continue
         offeror = _normalise(next((d.offeror for d in group if d.offeror), ""))
@@ -106,8 +117,9 @@ def mark_mirror_filings(deals: list) -> int:
             if name and len(name) >= 2 and name in offeror:
                 d.verdict = "mirror"
                 d.verdict_reason = (
-                    f"与同日同标题的另一条重复；本行的公司「{d.name}」就是要约方，"
+                    f"与另一条重复；本行的公司「{d.name}」就是要约方，"
                     f"受要约方是同组另一条。合并记一单（坑⑨）")
+                seen.add(id(d))
                 marked += 1
     return marked
 

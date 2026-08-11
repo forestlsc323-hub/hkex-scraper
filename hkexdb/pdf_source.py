@@ -133,11 +133,13 @@ class DownloadTooSlow(requests.Timeout):
 
 
 # 一次下载最多允许占用多少秒（墙上时钟，不是读超时）。
-BUDGET_SECONDS = 30.0
+BUDGET_SECONDS = 180.0     # 总时长天花板：再大的文件也不该超过这个数
+STALL_SECONDS = 20.0       # 一个字节都不来，等这么久就判它挂了
 
 
-def _read_within(resp, budget: float, clock=time.monotonic) -> bytes:
-    """边收边看表，超预算就掐断。
+def _read_within(resp, budget: float, clock=time.monotonic,
+                 stall: float = STALL_SECONDS) -> bytes:
+    """边收边看表。**卡住**就掐断，慢但在动就让它下完。
 
     ⚠️ requests 的 timeout=(10, 25) **不是总时长**：
         10 = 建立连接最多等多久
@@ -146,18 +148,36 @@ def _read_within(resp, budget: float, clock=time.monotonic) -> bytes:
     拖到天荒地老。我原先说的「3 次 × 25 秒 = 80 秒封顶」是错的 ——
     那只在对方彻底不响应时成立，而「连上了但挤牙膏」恰恰是最常见的那种。
 
-    所以真正的上界只能自己拿秒表卡：流式读，超预算就断开。
+    但只卡总时长又会误伤：09880 優必選那份实跑收了 7,104 KB 才撞上
+    30 秒上限，三次重试全废，最后整单丢掉 —— 那是一份**正在正常下载**
+    的大文件，只是它大。用总时长判死刑，等于按文件大小歧视。
+
+    要分清的是「慢」和「停」。所以两把尺子一起量：
+        stall  —— 距上一次收到数据超过这么久，判定连接挂了
+        budget —— 总时长的天花板，防病态情况无限拖
     """
     deadline = clock() + budget
+    last_data = clock()
     chunks = []
+    got = 0
     for chunk in resp.iter_content(65536):
-        if chunk:
-            chunks.append(chunk)
-        if clock() > deadline:
+        now = clock()
+        # ⚠️ 先量这一块等了多久，**再**记下它到了。顺序反过来
+        # （收到就先刷新 last_data）等于每块都把间隔清零，这把尺子
+        # 永远量不出东西来。
+        if now - last_data > stall:
             resp.close()
             raise DownloadTooSlow(
-                f"下载超过 {budget:.0f} 秒仍未取完（已收 "
-                f"{sum(len(c) for c in chunks) / 1024:.0f} KB）")
+                f"下载卡住：{stall:.0f} 秒没有收到任何数据"
+                f"（已收 {got / 1024:.0f} KB）")
+        if chunk:
+            chunks.append(chunk)
+            got += len(chunk)
+            last_data = now
+        if now > deadline:
+            resp.close()
+            raise DownloadTooSlow(
+                f"下载超过 {budget:.0f} 秒仍未取完（已收 {got / 1024:.0f} KB）")
     return b"".join(chunks)
 
 

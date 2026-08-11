@@ -515,3 +515,89 @@ def test_deal_size_is_never_smaller_than_the_offer_price():
            "倘要約獲悉數接納，要約人須支付的最高現金代價為7,000,000港元。"})
     assert ex.offer_price == "0.01"
     assert float(ex.deal_size) > float(ex.offer_price)
+
+
+# ---------------------------------------------------------------- 面值陷阱
+
+def test_par_value_is_never_mistaken_for_the_offer_price():
+    """「每股面值 0.01 港元」满篇都是，和要约价长得一模一样。
+
+    02362 金川國際实跑抽出要约价 0.01、溢价 -98.38% —— 那不是要约价，
+    是股份面值。数字还「自洽」（0.01 对 0.617 确实是 -98.4%），
+    所以校验器一个都拦不住，人看报表也只当这单折让离谱。
+    错得很像对的，这正是铁律二说的静默污染。
+    """
+    price, _ = extractor.extract_offer_price(
+        {1: "本公司股本中每股面值0.01港元之普通股。"
+            "要約價為每股要約股份0.617港元。"})
+    assert price == "0.617"
+
+
+def test_par_value_written_mid_sentence_is_also_blocked():
+    """「要約價…每股面值0.01港元」这种写法会从中间绕过开头的挡板。"""
+    price, _ = extractor.extract_offer_price(
+        {1: "要約價指就每股要約股份（每股面值0.01港元）應付之現金價格。"})
+    assert price != "0.01"
+
+
+def test_a_normal_offer_price_still_comes_through():
+    for text, want in [
+        ("「要約價」 指 每股要約股份0.519港元", "0.519"),
+        ("要約價為每股要約股份 2.20 港元", "2.20"),
+        ("每股要約股份0.276港元", "0.276"),
+    ]:
+        assert extractor.extract_offer_price({1: text})[0] == want, text
+
+
+# ---------------------------------------------------------------- 规模的量级闸
+
+def test_a_deal_size_equal_to_the_per_share_price_is_thrown_away():
+    """总代价不可能等于每股价 —— 定义上就不可能。
+
+    实跑 02362 那一行是「PO 0.01 -98.38% 0.01」：要约价和交易规模
+    一模一样。留一个假数比留空坏得多，留空会被人补上，
+    错数会被人直接粘进底稿。
+    """
+    ex = extractor.Extraction()
+    ex.offer_price, ex.deal_size = "0.01", "0.01"
+    extractor._drop_impossible_deal_size(ex)
+
+    assert ex.deal_size == ""
+    assert any("不相称" in n for n in ex.notes), "作废了必须说一声"
+
+
+def test_a_real_deal_size_survives_the_gate():
+    ex = extractor.Extraction()
+    ex.offer_price, ex.deal_size = "0.519", "54400000"
+    extractor._drop_impossible_deal_size(ex)
+    assert ex.deal_size == "54400000"
+
+
+def test_the_gate_stays_quiet_when_either_number_is_missing():
+    """抽不到就是抽不到，不该因为缺一个数就再作废另一个。"""
+    for price, size in [("", "54400000"), ("0.519", ""), ("", "")]:
+        ex = extractor.Extraction()
+        ex.offer_price, ex.deal_size = price, size
+        extractor._drop_impossible_deal_size(ex)
+        assert ex.deal_size == size and not ex.notes
+
+
+def test_a_generic_subscriber_is_not_taken_as_the_offeror():
+    """08220 比高集團实跑抽出要约方「認購人可能」。
+
+    「認購人」和「要約人」一样是通称，配股清洗豁免那类公告里满篇都是；
+    后面还粘了个助动词「可能」。表里出现一个叫「認購人可能」的要约方，
+    比留空糟得多 —— 它看着像抽到了。
+    """
+    ex = extractor.extract(
+        "公告 由某證券有限公司代表認購人可能須提出強制性無條件現金要約", {})
+    assert ex.offeror == ""
+    assert any("要约方" in n for n in ex.notes)
+
+
+def test_a_real_name_is_not_chopped_by_the_new_boundaries():
+    """新加的边界词不能误伤真名字。"""
+    ex = extractor.extract(
+        "聯合公告 由中國銀河國際證券(香港)有限公司代表 ABC LIMITED "
+        "提出強制性無條件現金要約", {})
+    assert ex.offeror == "ABC LIMITED"

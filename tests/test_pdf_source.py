@@ -431,3 +431,38 @@ def test_a_normal_download_is_not_affected(tmp_path):
 def test_the_budget_is_a_named_constant_not_a_magic_number():
     assert pdf_source.BUDGET_SECONDS > 0
     assert isinstance(pdf_source.BUDGET_SECONDS, float)
+
+
+def test_a_big_file_that_is_still_flowing_is_not_killed():
+    """09880 優必選实跑收了 7,104 KB 才撞上 30 秒上限，三次重试全废，
+    整单丢掉 —— 那是一份**正在正常下载**的大文件，只是它大。
+    用总时长判死刑，等于按文件大小歧视。
+    """
+    clock = {"t": 0.0}
+    session = FakeSession(make_pdf(VALUE_SECTION), chunks=40,
+                          on_chunk=lambda: clock.__setitem__("t", clock["t"] + 2))
+    data = pdf_source._read_within(session.get("u", stream=True), budget=180.0,
+                                   clock=lambda: clock["t"], stall=20.0)
+    assert data, "一直在收数据的下载不该被掐断"
+
+
+def test_a_download_that_stops_sending_is_cut_off():
+    """反过来：连上了但不吐数据，等 stall 秒就判它挂了，不必耗满总预算。"""
+    clock = {"t": 0.0}
+    session = FakeSession(make_pdf(VALUE_SECTION), chunks=20,
+                          on_chunk=lambda: clock.__setitem__("t", clock["t"] + 30))
+    with pytest.raises(pdf_source.DownloadTooSlow) as err:
+        pdf_source._read_within(session.get("u", stream=True), budget=999.0,
+                                clock=lambda: clock["t"], stall=20.0)
+    assert "卡住" in str(err.value)
+
+
+def test_the_total_ceiling_still_exists_for_pathological_cases():
+    """慢而不停也不能无限拖 —— 总时长天花板照样在。"""
+    clock = {"t": 0.0}
+    session = FakeSession(make_pdf(VALUE_SECTION), chunks=100,
+                          on_chunk=lambda: clock.__setitem__("t", clock["t"] + 10))
+    with pytest.raises(pdf_source.DownloadTooSlow) as err:
+        pdf_source._read_within(session.get("u", stream=True), budget=50.0,
+                                clock=lambda: clock["t"], stall=20.0)
+    assert "50 秒" in str(err.value)
