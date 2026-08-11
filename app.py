@@ -13,6 +13,7 @@ import datetime as dt
 import queue
 import subprocess
 import sys
+import time
 import threading
 from pathlib import Path
 
@@ -78,7 +79,8 @@ def main() -> int:
 
     msgs: queue.Queue = queue.Queue()
     cancel = threading.Event()
-    state = {"running": False, "result": None}
+    state = {"running": False, "result": None,
+             "activity": "", "frame": 0, "started": 0.0}
 
     tabs = ttk.Notebook(root)
     tabs.pack(fill="both", expand=True)
@@ -292,8 +294,19 @@ def main() -> int:
 
     status = ttk.Label(mid, text="就绪")
     status.pack(anchor="w")
+
+    # 上面这条是**真进度**（determinate，按完成比例走）。
     bar = ttk.Progressbar(mid, mode="determinate", maximum=100)
-    bar.pack(fill="x", pady=(4, 8))
+    bar.pack(fill="x", pady=(4, 2))
+
+    # 下面这条细的是**活着的证据**（indeterminate，一直来回跑）。
+    # 两条分开是有意的：真进度可能几分钟不动（最后一份卡在死链上重试），
+    # 那时候唯一能让人分清「还在跑」和「已经死了」的就是这条。
+    pulse = ttk.Progressbar(mid, mode="indeterminate", length=100)
+    pulse.pack(fill="x", pady=(0, 2))
+
+    activity = ttk.Label(mid, text="", foreground="#666")
+    activity.pack(anchor="w", pady=(0, 6))
 
     logbox = tk.Text(mid, wrap="none", height=20,
                      font=("Consolas" if sys.platform.startswith("win")
@@ -326,6 +339,25 @@ def main() -> int:
         logbox.see("end")
         logbox.configure(state="disabled")
 
+    # 转圈的那个小符号 —— 纯 ASCII，cp936 控制台也编得出来
+    SPINNER = "|/-\\"
+
+    def tick() -> None:
+        """每 200 毫秒走一格：转圈 + 已等多久。
+
+        进度条不动的时候，这两样是用户唯一能确认程序还活着的东西。
+        """
+        if state["running"]:
+            state["frame"] += 1
+            secs = int(time.monotonic() - state["started"])
+            spin = SPINNER[state["frame"] % len(SPINNER)]
+            note = state["activity"]
+            mins, s_ = divmod(secs, 60)
+            elapsed = f"{mins} 分 {s_} 秒" if mins else f"{s_} 秒"
+            activity.configure(
+                text=f"{spin}  已运行 {elapsed}" + (f"　·　{note}" if note else ""))
+        root.after(200, tick)
+
     def pump() -> None:
         while True:
             try:
@@ -339,6 +371,8 @@ def main() -> int:
                 bar["value"] = min(100, (index + frac) / len(runner.STEPS) * 100)
                 status.configure(text=f"[{index + 1}/{len(runner.STEPS)}] "
                                       f"{runner.STEPS[index]}")
+            elif kind == "activity":
+                state["activity"] = payload
             elif kind == "done":
                 finish(payload)
             elif kind == "checked":
@@ -352,6 +386,9 @@ def main() -> int:
     def finish(result) -> None:
         state["running"] = False
         state["result"] = result
+        pulse.stop()
+        secs = int(time.monotonic() - state["started"])
+        activity.configure(text=f"用时 {secs // 60} 分 {secs % 60} 秒")
         btn_run.configure(state="normal")
         btn_stop.configure(state="disabled")
         bar["value"] = 100 if result.ok else bar["value"]
@@ -399,18 +436,28 @@ def main() -> int:
         logbox.configure(state="disabled")
         cancel.clear()
         state["running"] = True
+        state["started"] = time.monotonic()
+        state["activity"] = ""
         btn_run.configure(state="disabled")
         btn_stop.configure(state="normal")
         btn_report.configure(state="disabled")
         btn_diag.configure(state="disabled")
         bar["value"] = 0
+        pulse.start(30)
+
+        # ⚠️ tkinter 的变量只能在主线程读。原来 force_var.get() 写在
+        # work() 里，那是工作线程 —— 轻则读到脏值，重则直接
+        # RuntimeError: main thread is not in main loop。
+        # 在这里（主线程）读成普通 bool，再传进去。
+        force = bool(force_var.get())
 
         def work() -> None:
             result = runner.run(
                 d1, d2,
                 on_log=lambda t: msgs.put(("log", t)),
                 on_step=lambda i, f: msgs.put(("step", (i, f))),
-                cancel_event=cancel, force_refetch=force_var.get())
+                cancel_event=cancel, force_refetch=force,
+                on_activity=lambda t: msgs.put(("activity", t)))
             msgs.put(("done", result))
 
         threading.Thread(target=work, daemon=True).start()
@@ -506,6 +553,7 @@ def main() -> int:
         tabs.select(page_run)         # 还没有数据，先去抓取页
 
     root.after(120, pump)
+    root.after(200, tick)
     root.mainloop()
     return 0
 

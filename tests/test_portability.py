@@ -127,3 +127,43 @@ def test_no_module_imports_something_that_was_deleted():
             mod = dead.split(".")[1]
             assert f"from .{mod} import" not in text, f"{path.name} 还在 import {mod}"
             assert f"from hkexdb import {mod}" not in text, f"{path.name} 还在 import {mod}"
+
+
+# ---------------------------------------------------------------- 线程边界
+
+def test_no_tkinter_variable_is_read_from_a_worker_thread():
+    """tkinter 的变量只能在主线程读。
+
+    原来 force_var.get() 写在 work() 里 —— 那是工作线程，
+    轻则读到脏值，重则 RuntimeError: main thread is not in main loop
+    直接把整个抓取线程干掉，而界面上只看到进度条不动。
+    主线程先读成普通 bool，再传进工作线程。
+    """
+    text = (ROOT / "app.py").read_text(encoding="utf-8")
+    work = text.split("def work() -> None:", 1)
+    assert len(work) == 2, "找不到工作线程函数"
+    body = work[1].split("threading.Thread", 1)[0]
+    for forbidden in ("_var.get()", "force_var", "e_from.get()", "e_to.get()",
+                      "cb_type.get()", "tree.selection()"):
+        assert forbidden not in body, \
+            f"工作线程里读了界面控件：{forbidden}"
+
+
+def test_the_ui_shows_it_is_alive_while_a_step_stalls():
+    """85/86 之后一声不吭地等三分钟，和卡死没有区别。
+
+    所以界面上必须同时有：真进度条、来回跑的活动条、转圈符号 + 已运行时长。
+    """
+    text = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert 'mode="determinate"' in text, "缺真进度条"
+    assert 'mode="indeterminate"' in text, "缺活动条（进度不动时唯一的活着证据）"
+    assert "已运行" in text, "不显示已运行时长"
+    assert "pulse.start(" in text and "pulse.stop()" in text
+
+
+def test_the_spinner_is_ascii_only():
+    """转圈符号也要 cp936 编得出来 —— 它会进日志。"""
+    text = (ROOT / "app.py").read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if "SPINNER" in ln and "=" in ln)
+    line.encode("cp936")
+    assert all(ord(c) < 128 for c in line.split("=")[1].strip().strip('"'))

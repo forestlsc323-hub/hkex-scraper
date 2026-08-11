@@ -608,7 +608,8 @@ def _write_listing(records: list[dict], log) -> Path:
 
 def run(date_from: dt.date, date_to: dt.date, *,
         on_log=None, on_step=None, cancel_event: threading.Event | None = None,
-        fetch=_fetch, open_pdf=None, force_refetch: bool = False) -> Result:
+        fetch=_fetch, open_pdf=None, force_refetch: bool = False,
+        on_activity=None) -> Result:
     """跑完整条流水线。
 
     `fetch` 和 `open_pdf` 都可替换 —— 测试里换成假的，就不会真的联网。
@@ -623,6 +624,14 @@ def run(date_from: dt.date, date_to: dt.date, *,
     def step(index: int, frac: float = 0.0) -> None:
         if on_step:
             on_step(index, frac)
+
+    def activity(text: str) -> None:
+        """长任务的「还活着」信号。界面拿它显示当前在等谁。"""
+        if on_activity:
+            try:
+                on_activity(text)
+            except Exception:
+                pass
 
     result = Result()
     log_path = ROOT / "run_log.txt"
@@ -647,7 +656,8 @@ def run(date_from: dt.date, date_to: dt.date, *,
             step(2, 0.0)
             log(f"\n【3/5】{STEPS[2]}")
             result.deals = _extract_deals(rows, log, step, cancel_event,
-                                          open_pdf=open_pdf)
+                                          open_pdf=open_pdf,
+                                          on_activity=activity)
             _write_deals(result.deals, log)
             step(2, 1.0)
 
@@ -731,7 +741,8 @@ def _screen(records, result: Result, log):
     return recs, rules
 
 
-def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal]:
+def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
+                   on_activity=None) -> list[Deal]:
     """对留存桶里的公告打开 PDF，抽要约字段。
 
     这一步才产出你真正要的东西：要约类型、要约价、溢价率、交易规模。
@@ -746,6 +757,8 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
     import concurrent.futures
 
     from . import extractor, pdf_source, selectors, validators
+
+    on_activity = on_activity or (lambda _text: None)
 
     targets = [r for r in rows if r["verdict"].bucket == "retained"]
     if not targets:
@@ -776,8 +789,13 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
             log("  （config.yaml 里 keep_raw_files=false：原件用完即弃，不留副本）")
 
         def opener(url):
+            def note_retry(attempt, total, exc):
+                log(f"      下载失败（第 {attempt}/{total} 次），稍后重试："
+                    f"{type(exc).__name__}")
+                on_activity(f"重试第 {attempt}/{total} 次…")
+
             doc = pdf_source.open_pdf(url, cache, session=client.session,
-                                      limiter=limiter)
+                                      limiter=limiter, on_retry=note_retry)
             if not keep:
                 # 用完即弃 —— asso 那份客户端的 download_pdf 就是这么做的
                 # （`return r.content`，从不落盘）。省地方，但审计追溯断了。
@@ -812,10 +830,27 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None) -> list[Deal
 
     done = [0]
     lock = threading.Lock()
+    busy: set = set()
+
+    def _announce() -> None:
+        """把「正在处理哪几份」告诉界面。
+
+        85/86 之后一声不吭地等三分钟，和卡死没有区别 ——
+        用户唯一能看到的必须是「还活着，在等谁」。
+        """
+        with lock:
+            which = "、".join(sorted(str(c) for c in busy)[:3]) or "—"
+        on_activity(f"{done[0]}/{len(targets)} 份　正在处理：{which}")
 
     def one(row) -> Deal:
-        deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
-                            selectors, validators)
+        busy.add(row.get("code") or row.get("row_id"))
+        _announce()
+        try:
+            deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
+                                selectors, validators)
+        finally:
+            busy.discard(row.get("code") or row.get("row_id"))
+            _announce()
         with lock:
             done[0] += 1
             n = done[0]

@@ -125,16 +125,20 @@ _TRANSIENT = (requests.ConnectionError, requests.Timeout)
 
 
 def _get_with_retry(session, url, headers, timeout, limiter,
-                    attempts: int = 3, backoff: float = 1.5, sleeper=time.sleep):
+                    attempts: int = 3, backoff: float = 1.5, sleeper=time.sleep,
+                    on_retry=None):
     """带退避重试的 GET。
 
-    实跑 56 份公告时挂了 3 份，全是 ConnectionReset / Max retries ——
-    偶发网络错误不该让那一单永久丢掉数据，重试一次通常就回来了。
+    偶发网络错误不该让那一单永久丢数据，重试一次通常就回来了。
 
-    ⚠️ 重试次数和超时是一对：读超时曾经是 180 秒，配 4 次重试，
-    一个连不上的链接能白烧 12 分钟 —— 那 56 份跑了 24 分钟，
-    一半时间耗在几个死链上。现在超时压到 (10, 60)、重试 3 次，
-    最坏情况约 3 分钟封顶。
+    ⚠️ 重试次数 × 读超时 = 一个死链能卡多久，这笔账必须算清楚：
+        读超时 180s × 4 次 = 12 分钟   ← 最早那版，56 份跑了 24 分钟
+        读超时  60s × 3 次 = 3.1 分钟
+        读超时  25s × 3 次 = 80 秒     ← 现在
+    你看到的「85/86 之后一直等」就是最后一份卡在死链上重试。
+
+    `on_retry(第几次, 还剩几次, 异常)` 让上层把重试**说出来** ——
+    界面上一声不吭地等 3 分钟，和卡死没有区别。
     """
     last = None
     for attempt in range(attempts):
@@ -147,8 +151,10 @@ def _get_with_retry(session, url, headers, timeout, limiter,
         except _TRANSIENT as exc:
             last = exc
             if attempt < attempts - 1:
-                sleeper(backoff * (2 ** attempt))
+                if on_retry:
+                    on_retry(attempt + 1, attempts, exc)
                 log.warning("下载失败第 %d 次，退避后重试：%s", attempt + 1, exc)
+                sleeper(backoff * (2 ** attempt))
     raise last
 
 
@@ -156,7 +162,8 @@ def fetch_bytes(url: str, cache_dir: Path, *,
                 session: requests.Session | None = None,
                 user_agent: str = "hkex-precedent-db/0.1",
                 limiter: "RateLimiter | None" = None,
-                timeout: tuple = (10, 60)) -> tuple[bytes, bool]:
+                timeout: tuple = (10, 25),
+                on_retry=None) -> tuple[bytes, bool]:
     """取 PDF 字节。返回 (内容, 是否来自本地副本)。
 
     ⚠️ `session` 应当传入**已访问过检索页的那个会话**。
@@ -174,7 +181,8 @@ def fetch_bytes(url: str, cache_dir: Path, *,
                     "若失败请传入检索时用的那个 session", url)
         session = requests.Session()
     headers = dict(HEADERS, **{"User-Agent": user_agent})
-    resp = _get_with_retry(session, url, headers, timeout, limiter)
+    resp = _get_with_retry(session, url, headers, timeout, limiter,
+                           on_retry=on_retry)
 
     content = resp.content
     if not is_html_link(url) and not content.startswith(b"%PDF"):
@@ -326,14 +334,15 @@ def extract_pages(data: bytes, max_pages: int = 0, *,
 def open_pdf(url: str, cache_dir: Path, *,
              session: requests.Session | None = None,
              user_agent: str = "hkex-precedent-db/0.1",
-             limiter: "RateLimiter | None" = None,
+             limiter: "RateLimiter | None" = None, on_retry=None,
              max_pages: int = 0, min_text_chars: int = 500) -> PdfDoc:
     """链接进，带页码的文本出。这是本模块唯一需要调用的函数。
 
     .htm 和 .pdf 都收 —— 披露易两种格式都在发，短公告发 .htm。
     """
     data, from_cache = fetch_bytes(url, cache_dir, session=session,
-                                   user_agent=user_agent, limiter=limiter)
+                                   user_agent=user_agent, limiter=limiter,
+                                   on_retry=on_retry)
     if is_html_link(url):
         pages = extract_html_pages(data)
         return PdfDoc(url=url, pages=pages, page_count=len(pages),
