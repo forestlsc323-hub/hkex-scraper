@@ -601,3 +601,59 @@ def test_a_real_name_is_not_chopped_by_the_new_boundaries():
         "聯合公告 由中國銀河國際證券(香港)有限公司代表 ABC LIMITED "
         "提出強制性無條件現金要約", {})
     assert ex.offeror == "ABC LIMITED"
+
+
+# ---------------------------------------------------------------- 类型判错
+
+def test_the_traditional_form_of_partial_is_recognised():
+    """「部份」和「部分」在港交所公告里混用，后者是简体习惯。
+
+    09638 法拉帝实跑被判成 VGO，答案是 PO —— 标题写的是「部份」。
+    类型判错是分类层的错，静默污染（铁律二）。
+    """
+    for title in ["公告 提出附帶先決條件的自願現金部份收購要約",
+                  "公告 提出附帶先決條件的自願現金部分收購要約"]:
+        assert extractor.extract_offer_type(title, {})[0] == "PO", title
+
+
+def test_mandatory_beats_partial_when_both_words_appear():
+    """收購守則規則 26 的强制要约必须就**全部**股份提出 —— 不可能同时
+    是部分要约。两个词一起出现时「強制性」说了算，「部分」多半出现在
+    别处（「部分股東已承諾接納」）。01796 实跑被判成 PO，答案是 MGO。
+    """
+    title = ("聯合公告 強制性無條件現金要約 及 部分股東之不可撤銷承諾")
+    assert extractor.extract_offer_type(title, {})[0] == "MGO"
+
+
+def test_a_genuine_partial_offer_is_still_a_partial_offer():
+    """别为了修上一条把真的部分要约压没了。"""
+    assert extractor.extract_offer_type(
+        "公告 提出附帶先決條件的自願現金部分收購要約", {})[0] == "PO"
+
+
+def test_a_half_chopped_role_word_is_not_an_offeror():
+    """08220 实跑抽出要约方「益人」—— 一个被切了半截的通称。
+
+    比整个通称更危险：「認購人」一眼能认出是通称，「益人」看着像个名字。
+    """
+    for junk in ["益人", "認購人", "受益人", "承配人"]:
+        assert extractor._is_placeholder(junk), junk
+
+
+def test_real_names_are_not_mistaken_for_role_words():
+    for name in ["楊敬堯先生", "Sky Links Group Limited", "大成國際控股有限公司",
+                 "香港偉業軟件股份有限公司"]:
+        assert not extractor._is_placeholder(name), name
+
+
+def test_a_whitewash_waiver_does_not_turn_a_partial_offer_into_an_mgo():
+    """「強制性全面要約」最常见的出处其实是**清洗豁免**：
+
+        申請豁免…須提出強制性全面要約的責任
+
+    那句话说的是这单**不必**做强制要约。拿它去压过「部分要约」正好压反 ——
+    修一个类型错的时候造出另一个类型错，是这一层最容易犯的病。
+    """
+    title = ("公告 (1) 自願現金部分收購要約 及 "
+             "(2) 申請豁免須提出強制性全面要約的責任")
+    assert extractor.extract_offer_type(title, {})[0] == "PO"

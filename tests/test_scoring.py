@@ -131,3 +131,71 @@ def test_the_shipped_answer_key_loads_and_is_checked():
     assert len(rows) == 25
     assert rows[0]["股票代码"].startswith("0"), "代码列前导零被吞了"
     assert any("01875" in p for p in S.sanity_check(rows))
+
+
+# ------------------------------------------------- 配对：日期差几天还是同一单
+
+def _row(code, date, **kw):
+    return {"股票代码": code, "公告日期": date, **kw}
+
+
+def test_the_same_deal_filed_a_few_days_apart_still_counts_as_matched():
+    """实跑那份报告把 13 单算成「漏检」，其中至少 8 单程序明明抽到了 ——
+    只是日期差几天：
+
+        01780  答案 05-15，程序 05-07（差 8 天）
+        01953  答案 04-22，程序 04-24（差 2 天）
+
+    用户记的是 T0，程序打开的是那一单里最早的**留存**公告，未必同一天。
+    结果同一单被同时记成一次漏检和一次多余，分母凭空缩水一半。
+    量错了的准确率比没有准确率更糟：它会指挥人去修不存在的问题。
+    """
+    got = [_row("01780", "2026-05-07", **{"要约类型": "MGO"})]
+    answer = [_row("01780", "2026-05-15", **{"要约类型": "MGO"})]
+
+    report = scoring.score(got, answer)
+
+    assert not report.missing_deals, "同一单被算成漏检了"
+    assert not report.extra_deals, "同一单又被算成多余了"
+    assert report.scores[0].right == 1
+
+
+def test_a_loose_pairing_is_always_reported():
+    """会自己放宽的比对器，如果不说，比严格的更危险。"""
+    got = [_row("01780", "2026-05-07", **{"要约类型": "MGO"})]
+    answer = [_row("01780", "2026-05-15", **{"要约类型": "MGO"})]
+
+    report = scoring.score(got, answer)
+
+    assert report.loose_pairs and report.loose_pairs[0][2] == 8
+    assert "差 8 天" in report.text()
+
+
+def test_two_separate_deals_on_one_company_are_paired_one_to_one():
+    """02362 金川同期有 MGO 和 PO 两单 —— 绝不能让一行去顶两个答案。"""
+    got = [_row("02362", "2026-03-26", **{"要约类型": "MGO"}),
+           _row("02362", "2026-05-22", **{"要约类型": "PO"})]
+    answer = [_row("02362", "2026-03-02", **{"要约类型": "MGO"}),
+              _row("02362", "2026-05-27", **{"要约类型": "PO"})]
+
+    report = scoring.score(got, answer)
+
+    assert not report.missing_deals and not report.extra_deals
+    assert report.scores[0].right == 2, "两单各配各的，都该对上"
+
+
+def test_a_date_far_away_is_not_forced_into_a_pair():
+    """半年前的另一单不是同一单 —— 硬配上就是把准确率做假。"""
+    got = [_row("01780", "2025-11-01", **{"要约类型": "MGO"})]
+    answer = [_row("01780", "2026-05-15", **{"要约类型": "MGO"})]
+
+    report = scoring.score(got, answer)
+
+    assert report.missing_deals and report.extra_deals
+
+
+def test_a_genuinely_missing_deal_is_still_reported_as_missing():
+    """放宽配对不能把真漏检也一起放过 —— 那才是最该看见的东西。"""
+    report = scoring.score([], [_row("00195", "2026-05-29",
+                                     **{"要约类型": "PO"})])
+    assert len(report.missing_deals) == 1

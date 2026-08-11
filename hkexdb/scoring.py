@@ -65,6 +65,9 @@ class Report:
     scores: list
     missing_deals: list     # 答案表里有、程序没抽到的单
     extra_deals: list       # 程序抽到、答案表里没有的单（不算错，只列出来）
+    # 按「同代码、日期最近」配上的（不是同一天）。放宽了配对就必须
+    # 逐条报出来 —— 一个会自己放宽的比对器，如果不说，比严格的更危险。
+    loose_pairs: list = field(default_factory=list)
 
     def text(self) -> str:
         lines = ["字段级准确率", "=" * 56, ""]
@@ -91,6 +94,17 @@ class Report:
             if not any_wrong:
                 lines.append("（没有错项）")
 
+        if self.loose_pairs:
+            lines += ["", f"按「同代码、日期最近」配上的 {len(self.loose_pairs)} 单",
+                      "-" * 56]
+            for key, got_date, gap in sorted(self.loose_pairs,
+                                             key=lambda x: -x[2]):
+                lines.append(f"  {'/'.join(key)}　←→　程序 {got_date}"
+                             f"（差 {gap} 天）")
+            lines.append("  ↑ 你记的是 T0，程序打开的是那一单里最早的留存公告，"
+                         "未必同一天。")
+            lines.append("    差得太多的要人工确认一下是不是同一单。")
+
         if self.missing_deals:
             lines += ["", f"答案表里有、但程序没抽到的 {len(self.missing_deals)} 单",
                       "-" * 56]
@@ -103,20 +117,78 @@ class Report:
         return "\n".join(lines)
 
 
+# 同一单交易，你答案表里记的是 T0 的日期，程序打开的可能是几天后的
+# 后续公告 —— 日期对不上，但讲的是同一单。差这么多天以内就认为是一单。
+NEAR_DAYS = 45
+
+
+def _date(row: dict):
+    import datetime as _dt
+    text = str(row.get("公告日期", "")).strip()
+    try:
+        return _dt.date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def pair_up(got_rows: list[dict], answer_rows: list[dict],
+            near_days: int = NEAR_DAYS):
+    """把程序抽的和答案表按「同代码、日期最近」配对。
+
+    ⚠️ 原来是拿 (代码, 公告日期) 精确配的，于是这份报告里 13 单被算成
+    「漏检」—— 而其中至少 8 单**程序明明抽到了**，只是日期差几天：
+
+        01780  答案 05-15，程序 05-07（差 8 天）
+        01953  答案 04-22，程序 04-24（差 2 天）
+        02362  答案 05-27，程序 05-22（差 5 天）
+
+    你记的是 T0，程序打开的是那一单里最早的**留存**公告，两者未必同一天。
+    结果同一单被同时记成一次漏检和一次多余，准确率的分母凭空缩水一半。
+    量错了的准确率比没有准确率更糟：它会指挥我去修不存在的问题。
+
+    同一家公司可能有两单不同的要约（02362 就是 MGO + PO），所以按代码
+    分组之后仍要一对一配，每个程序行只能被用掉一次。
+    """
+    pool: dict[str, list] = {}
+    for row in got_rows:
+        pool.setdefault(str(row.get("股票代码", "")).strip(), []).append(row)
+
+    pairs, misses = [], []
+    for want in sorted(answer_rows, key=lambda r: str(r.get("公告日期", ""))):
+        code = str(want.get("股票代码", "")).strip()
+        want_date = _date(want)
+        best, best_gap = None, None
+        for cand in pool.get(code, []):
+            gap = 0
+            cand_date = _date(cand)
+            if want_date and cand_date:
+                gap = abs((cand_date - want_date).days)
+                if gap > near_days:
+                    continue
+            if best_gap is None or gap < best_gap:
+                best, best_gap = cand, gap
+        if best is None:
+            misses.append(want)
+        else:
+            pool[code].remove(best)
+            pairs.append((want, best, best_gap or 0))
+
+    leftovers = [r for rows in pool.values() for r in rows]
+    return pairs, misses, leftovers
+
+
 def score(got_rows: list[dict], answer_rows: list[dict]) -> Report:
     """逐字段比对。答案表里留空的格子不计分。"""
-    got_by_key = {_key(r): r for r in got_rows}
+    pairs, miss_rows, leftovers = pair_up(got_rows, answer_rows)
     scores: dict[str, FieldScore] = {}
-    missing = []
+    missing = [_key(r) for r in miss_rows
+               if any(str(v).strip() for k, v in r.items()
+                      if k not in KEY_COLUMNS)]
+    loose = [(_key(w), b.get("公告日期", ""), gap)
+             for w, b, gap in pairs if gap]
 
-    for want_row in answer_rows:
+    for want_row, got_row, _gap in pairs:
         key = _key(want_row)
-        got_row = got_by_key.get(key)
-        if got_row is None:
-            if any(str(v).strip() for k, v in want_row.items()
-                   if k not in KEY_COLUMNS):
-                missing.append(key)
-            continue
         for field_name, want in want_row.items():
             if field_name in KEY_COLUMNS or not str(want).strip():
                 continue          # 空格＝没有标准答案，不计分
@@ -128,9 +200,8 @@ def score(got_rows: list[dict], answer_rows: list[dict]) -> Report:
             else:
                 s.wrong.append((key, str(got), str(want)))
 
-    answer_keys = {_key(r) for r in answer_rows}
-    extra = [k for k in got_by_key if k not in answer_keys]
-    return Report(list(scores.values()), missing, extra)
+    extra = [_key(r) for r in leftovers]
+    return Report(list(scores.values()), missing, extra, loose)
 
 
 def write_template(columns: list[str], path: Path) -> Path:

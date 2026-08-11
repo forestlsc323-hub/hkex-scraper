@@ -28,14 +28,30 @@ PREMIUM, DISCOUNT = "premium", "discount"
 # —— 多是风险警示语「要約未必會成為無條件要約」。全文词频会得出相反答案。
 # 所以类型只在**标题**和**明确的类型短语**里判。
 
+# ⚠️ 「部份」和「部分」在港交所公告里是混用的，后者是简体习惯，
+# 前者才是港式繁体的常见写法。只认「部分」会把一单部分要约判成别的类型 ——
+# 09638 法拉帝实跑被判成 VGO（应为 PO），标题写的是「部份」。
 _TYPE_PHRASES = [
     # 顺序即优先级：部分要约最特殊，先判
-    (PO, re.compile(r"部分(?:收購)?要約|partial\s+offer", re.I)),
+    (PO, re.compile(r"部[分份](?:收購)?要約|partial\s+offer", re.I)),
     (MGO, re.compile(r"強制性[^，。；]{0,10}要約|強制[^，。；]{0,6}現金要約|"
                      r"mandatory\s+(?:unconditional\s+)?(?:cash\s+)?offer", re.I)),
     (VGO, re.compile(r"自願性?[^，。；]{0,12}要約|voluntary\s+(?:conditional\s+)?"
                      r"(?:cash\s+)?offer", re.I)),
 ]
+
+# 「強制性」和「部分」不可能同时成立：收購守則規則 26 要求的强制要约
+# 必须向**全体**股东、就**全部**股份提出；部分要约要执行人员同意，
+# 本质上是自願的。两个词一起出现时，「強制性」是那个说了算的 ——
+# 「部分」多半出现在别处（例如「部分股東已承諾接納」）。
+# 01796 实跑被判成 PO，答案是 MGO。
+_MANDATORY = _TYPE_PHRASES[1][1]
+
+# ⚠️ 但「強制性全面要約」这个词组最常见的出处其实是**清洗豁免**：
+# 「申請豁免…須提出強制性全面要約的責任」。那种句子说的是这单
+# **不必**做强制要约，拿它去压过「部分要约」正好压反。
+# 所以只有在附近没有豁免字样时，「強制性」才算数。
+_WAIVER = re.compile(r"豁免|免除|清洗|寬免|whitewash", re.I)
 
 # 规则 26.1 = 强制性全面要约的法律依据，比措辞更硬
 _RULE_26 = re.compile(r"規則\s*26\.1|rule\s*26\.1", re.I)
@@ -177,18 +193,25 @@ def extract_offer_type(title: str, pages: dict[int, str]) -> tuple[str, Evidence
 
     绝不做全文词频 —— 3336 那单会被判成相反的类型。
     """
-    for kind, pattern in _TYPE_PHRASES:
-        m = pattern.search(title or "")
-        if m:
-            return kind, Evidence(0, m.group(0))
-
-    head = _flat("".join(pages.get(p, "") for p in sorted(pages)[:3]))
-    for kind, pattern in _TYPE_PHRASES:
-        m = pattern.search(head)
-        if m:
-            page = _find_page(pages, m.group(0)) or 1
+    for text, page in ((title or "", 0),
+                       (_flat("".join(pages.get(p, "")
+                                      for p in sorted(pages)[:3])), 1)):
+        for kind, pattern in _TYPE_PHRASES:
+            m = pattern.search(text)
+            if not m:
+                continue
+            # 「強制性」压过「部分」：规则 26 的强制要约必须就全部股份提出，
+            # 不可能同时是部分要约。见 _MANDATORY 处的说明。
+            if kind is PO:
+                hard = _MANDATORY.search(text)
+                if hard and not _WAIVER.search(text[max(0, hard.start() - 30):
+                                                    hard.end()]):
+                    m, kind = hard, MGO
+            if page == 0:
+                return kind, Evidence(0, m.group(0))
             start = max(0, m.start() - 30)
-            return kind, Evidence(page, head[start:m.end() + 30].strip())
+            return kind, Evidence(_find_page(pages, m.group(0)) or 1,
+                                  text[start:m.end() + 30].strip())
 
     if _RULE_26.search(_flat("".join(pages.values()))):
         return MGO, Evidence(_find_page(pages, "規則26.1"), "收購守則規則26.1")
@@ -588,8 +611,18 @@ def _cut_fa(before: str) -> str:
     return before[left:].strip(" 　-–—")
 
 
+# 通称几乎都长这样：两三个字 + 「人」（要約人/認購人/受益人/承配人/
+# 獨立第三方…）。08220 实跑抽出「益人」—— 一个被切了半截的通称，
+# 比整个通称更像名字，也就更危险。真名字要么带「有限公司/Limited」，
+# 要么带「先生/女士」，要么长得多。
+_SHORT_ROLE = re.compile(r"^.{0,3}人$")
+
+
 def _is_placeholder(name: str) -> bool:
-    return name.strip().lower() in _PLACEHOLDER
+    text = name.strip()
+    if text.lower() in _PLACEHOLDER:
+        return True
+    return bool(_SHORT_ROLE.match(text))
 
 
 def extract_parties(title: str, pages: dict[int, str]) -> dict:
