@@ -32,9 +32,43 @@ class Cancelled(Exception):
 VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约",
                  "mirror": "镜像重复"}
 
-# 一份公告最多占用多久。3 次尝试 × 25 秒读超时 + 退避 ≈ 80 秒，
-# 这个数字是给用户看的上界：等待有边界，就不是卡死。
-MAX_SECONDS_PER_PDF = 80
+# 一份公告最多占用多久（给用户看的上界，真正的硬闸在 pdf_source 里）
+MAX_SECONDS_PER_PDF = 90
+
+# 同一个标的最多展开几份公告。
+#
+# 实跑 71 份里，09638 法拉帝一家占了 19 份（27%）—— 全是同一单 PO 的
+# 后续公告，而你的答案表里它只有一单。一单交易只有一个 T0，其余都是
+# 程序公告；把它们逐份下下来，等于花 27% 的时间去下不需要的东西。
+#
+# 取最早的几份（T0 一定在最前），4 份的余量足够覆盖「同一标的先后
+# 两单不同交易」的情形 —— 金川國際在你答案表里就有 MGO 和 PO 各一单。
+MAX_PER_TARGET = 4
+
+
+def _cap_per_target(rows: list) -> tuple[list, dict]:
+    """同一标的只展开最早的几份，其余先放着。
+
+    返回 (要抽的, {代码: 跳过几份})。跳过的**不是删除** —— 它们仍在
+    筛查表里，只是这一轮不下载。需要时把 max_per_target 调大重跑。
+    """
+    cap = MAX_PER_TARGET
+    try:
+        cap = int(_listing_config().get("max_per_target", cap))
+    except (TypeError, ValueError):
+        pass
+
+    ordered = sorted(rows, key=lambda r: (r.get("date", ""), r.get("row_id", "")))
+    seen: dict = {}
+    keep, skipped = [], {}
+    for row in ordered:
+        code = row.get("code") or row.get("row_id")
+        seen[code] = seen.get(code, 0) + 1
+        if seen[code] <= cap:
+            keep.append(row)
+        else:
+            skipped[code] = skipped.get(code, 0) + 1
+    return keep, skipped
 
 
 def _normalise(text: str) -> str:
@@ -775,6 +809,14 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     if not targets:
         log("  留存桶为空，没有要抽的公告。")
         return []
+
+    targets, skipped = _cap_per_target(targets)
+    if skipped:
+        log(f"  同一标的的后续公告先不展开，跳过 {len(skipped)} 份：")
+        for code, n in sorted(skipped.items(), key=lambda kv: -kv[1])[:6]:
+            log(f"      {code} 还有 {n} 份（已取最早的 {MAX_PER_TARGET} 份）")
+        log(f"      —— 一单交易只有一个 T0，其余是后续公告。"
+            f"改 config.yaml 的 max_per_target 可放宽。")
 
     _step, workers, _mode, _kw = _speed_settings()
     workers = max(1, min(workers, len(targets)))

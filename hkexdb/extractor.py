@@ -705,7 +705,7 @@ _UNIT = {"萬": 10_000, "万": 10_000, "億": 100_000_000, "亿": 100_000_000,
 
 # 量词要按长度倒序排进正则，否则「百萬」会被「萬」先吃掉一半
 _UNIT_ALT = "|".join(sorted(_UNIT, key=len, reverse=True))
-_AMOUNT = rf"([\d,]+\.?\d*)\s*({_UNIT_ALT})?\s*港元"
+_AMOUNT = rf"(?P<num>[\d,]+\.?\d*)\s*(?P<unit>{_UNIT_ALT})?\s*港元"
 
 # 实跑年初至今，12 单里有 6 单交易规模是空的 —— 原来只认三种措辞太窄。
 # 顺序即优先级：越明确写「最高」的越靠前。
@@ -723,7 +723,13 @@ _DEAL_SIZE = [
     # 「須支付的現金代價總額為92,000,000港元」
     re.compile(rf"(?:現金)?(?:代價|款項)總額[^0-9]{{0,24}}?{_AMOUNT}"),
     # 「倘要約獲悉數接納，應付總額約為…」
-    re.compile(rf"(?:悉數接納|全數接納|全部接納)[^。；]{{0,60}}?{_AMOUNT}"),
+    #
+    # ⚠️ 这条最松，必须挡住「每股」——「倘要約獲悉數接納，按每股要約股份
+    # 0.01港元計算」会被它抓成交易规模 0.01。实跑里 02362 金川國際那单
+    # 的交易规模就是这么变成 0.01 的（答案是 7,000,000）。
+    # 每股价永远不是交易规模：一个是单价，一个是总额。
+    re.compile(rf"(?:悉數接納|全數接納|全部接納)"
+               rf"((?:(?!每股)[^。；]){{0,60}}?){_AMOUNT}"),
     # 「要約項下之總代價約為…」
     re.compile(rf"要約(?:項下)?(?:之|的)?(?:總代價|總價值)"
                rf"[^0-9]{{0,24}}?{_AMOUNT}"),
@@ -744,8 +750,8 @@ def extract_deal_size(pages: dict[int, str]) -> tuple[str, Evidence]:
         for pattern in _DEAL_SIZE:
             m = pattern.search(flat)
             if m:
-                raw = m.group(1).replace(",", "")
-                unit_char = m.group(2) or ""
+                raw = m.group("num").replace(",", "")
+                unit_char = m.group("unit") or ""
                 start = max(0, m.start() - 40)
                 evidence = Evidence(page, flat[start:m.end() + 10].strip())
                 if not unit_char:

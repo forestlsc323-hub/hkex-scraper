@@ -424,3 +424,35 @@ def test_total_shares_is_extracted_not_computed():
     ex = extractor.extract("", P3336)
     assert ex.total_shares == "1200008445"
     assert ex.total_shares_evidence.page > 0
+
+
+# ---------------------------------------------------------------- 交易规模
+
+def test_a_per_share_price_is_never_taken_as_the_deal_size():
+    """实跑里 02362 金川國際的交易规模抽成了 0.01 —— 那是每股价。
+
+    「倘要約獲悉數接納，按每股要約股份0.01港元計算」被最松的那条兜底
+    规则抓中了。每股价是单价，交易规模是总额，两者永远不能互相顶替。
+    答案表里那单是 7,000,000。
+    """
+    for text in ["倘要約獲悉數接納，按每股要約股份0.01港元計算",
+                 "假設要約獲全數接納，每股0.01港元",
+                 "倘要約獲悉數接納，價格為每股0.40港元"]:
+        got, _ = extractor.extract_deal_size({1: text})
+        assert got == "", f"把每股价当成了交易规模：{got}　原文：{text}"
+
+
+def test_the_real_total_is_still_found_in_the_same_sentence_shape():
+    got, _ = extractor.extract_deal_size(
+        {1: "倘要約獲悉數接納，要約人須支付的最高現金代價為7,000,000港元。"})
+    assert got == "7000000"
+
+
+def test_deal_size_is_never_smaller_than_the_offer_price():
+    """总额小于单价在算术上说不通 —— 这类错必须看得出来。"""
+    ex = extractor.extract("", {
+        1: "「要約價」 指 每股要約股份0.01港元",
+        2: "價值比較要約價每股0.01港元較最後交易日收市價每股0.62港元折讓約98.38%。"
+           "倘要約獲悉數接納，要約人須支付的最高現金代價為7,000,000港元。"})
+    assert ex.offer_price == "0.01"
+    assert float(ex.deal_size) > float(ex.offer_price)

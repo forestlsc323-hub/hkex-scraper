@@ -874,3 +874,48 @@ def test_the_activity_line_says_how_long_each_one_has_waited(_isolate, monkeypat
     assert "还剩" in text and "00318" in text
     assert "等了" in text, "不显示每一份等了多久"
     assert str(runner.MAX_SECONDS_PER_PDF) in text, "不给等待的上界"
+
+
+# ---------------------------------------------------------------- 同标的封顶
+
+def test_only_the_earliest_few_announcements_per_target_are_opened(_isolate):
+    """实跑 71 份里 09638 法拉帝一家占 19 份，全是同一单 PO 的后续公告 ——
+    27% 的时间花在下不需要的东西上，而答案表里它只有一单。
+
+    一单交易只有一个 T0，T0 一定是最早那份，所以按日期取最早的几份。
+    """
+    rows = [{"row_id": f"r{i}", "date": f"2026-0{1 + i // 9}-{1 + i % 9:02d}",
+             "code": "09638"} for i in range(19)]
+    keep, skipped = runner._cap_per_target(rows)
+
+    assert len(keep) == runner.MAX_PER_TARGET
+    assert skipped == {"09638": 19 - runner.MAX_PER_TARGET}
+    assert [r["date"] for r in keep] == sorted(r["date"] for r in keep)
+    assert keep[0]["date"] == "2026-01-01", "T0 是最早那份，必须留住"
+
+
+def test_two_different_deals_on_one_company_both_survive_the_cap():
+    """金川國際在答案表里有 MGO 和 PO 各一单，相隔近三个月 ——
+    封顶取的是最早几份，不能把第二单挤掉。"""
+    rows = [{"row_id": "a", "date": "2026-03-02", "code": "02362"},
+            {"row_id": "b", "date": "2026-03-05", "code": "02362"},
+            {"row_id": "c", "date": "2026-03-26", "code": "02362"},
+            {"row_id": "d", "date": "2026-05-27", "code": "02362"}]
+    keep, skipped = runner._cap_per_target(rows)
+    assert len(keep) == 4 and not skipped
+
+
+def test_the_cap_is_configurable(_isolate):
+    (_isolate / "config.yaml").write_text(
+        "listing:\n  max_per_target: 2\n", encoding="utf-8")
+    rows = [{"row_id": f"r{i}", "date": f"2026-01-{1 + i:02d}", "code": "09638"}
+            for i in range(6)]
+    keep, skipped = runner._cap_per_target(rows)
+    assert len(keep) == 2 and skipped == {"09638": 4}
+
+
+def test_different_targets_are_not_capped_against_each_other():
+    rows = [{"row_id": f"r{i}", "date": "2026-01-01", "code": f"{i:05d}"}
+            for i in range(20)]
+    keep, skipped = runner._cap_per_target(rows)
+    assert len(keep) == 20 and not skipped
