@@ -226,6 +226,17 @@ def _probe_pages() -> int:
         return PROBE_PAGES
 
 
+def _parse_timeout() -> float:
+    """一份公告最多允许解析多久。到点子进程会被真的杀掉。"""
+    from .config import section
+    try:
+        return max(10.0, float(section("config.yaml", key="pdf", root=ROOT)
+                               .get("parse_timeout_seconds",
+                                    MAX_SECONDS_PER_PDF)))
+    except (TypeError, ValueError, AttributeError):
+        return float(MAX_SECONDS_PER_PDF)
+
+
 def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
     """按月切段。照抄你 asso 那份文件 search_by_category 的做法，
     连理由都一样：「类别筛选后记录数远小于上限，无需按天」。
@@ -1011,6 +1022,24 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     # 所以：下载并发、解析串行。
     parse_lock = threading.Lock()
 
+    # 而且解析要在**另一个进程**里跑。
+    #
+    # 一次实跑「一个小时没动」：日志停在 27/68，界面标题「未响应」，
+    # 界面上「已运行」的秒数冻在 8 分 38 秒 —— 秒数冻住本身就是证据，
+    # 主线程被一起拖死了，不是慢，是停。
+    #
+    # MAX_SECONDS_PER_PDF 那 90 秒从来没被执行过，它只被拿去拼了一句
+    # 「最多再等 90 秒」给用户看。Python 没有办法中断一个线程：
+    # pdfplumber 一旦在某份文件上陷进去，那个线程永远回不来，
+    # 而它还攥着上面那把解析锁，后面 41 份全部堵死。
+    #
+    # 线程杀不掉，进程杀得掉。
+    # 没有要新抽的就别起 —— 存档全命中时一份 PDF 都不用开，
+    # 为了零份公告 spawn 一个进程纯属浪费。
+    from .parsepool import ParsePool
+    pool = ParsePool(timeout=_parse_timeout(),
+                     on_note=lambda t: log(f"  【注意】{t}")) if targets else None
+
     def one(row) -> Deal:
         # 增删和读取必须同一把锁 —— 一个线程在 sorted(busy) 的同时
         # 另一个线程 add，会抛 RuntimeError: Set changed size during iteration，
@@ -1022,7 +1051,7 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         _announce()
         try:
             deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
-                                selectors, validators, parse_lock)
+                                selectors, validators, parse_lock, pool)
         finally:
             with lock:
                 busy.pop(who, None)
@@ -1067,8 +1096,10 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
                 if len(deals) % FLUSH_EVERY == 0:
                     flush(deals[-FLUSH_EVERY:])
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(one, r) for r in targets]
+            # 这里的 threads 是**下载**的并发；解析归上面那个子进程。
+            # 原来这个变量也叫 pool，两个 pool 撞在一起是最不该有的那种 bug。
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as threads:
+                futures = [threads.submit(one, r) for r in targets]
                 pending = []
                 for fut in futures:        # 按提交顺序收，输出稳定可复现
                     deal = fut.result()
@@ -1083,6 +1114,11 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         flush(deals)
         log(f"  已停止，但前 {len(deals)} 份的抽取结果已存档，下次不用重抽。")
         raise
+    finally:
+        # 解析子进程一定要收掉。留一个孤儿进程在后台啃 PDF，
+        # 用户关了窗口还听见风扇响 —— 那是最招人烦的那种 bug。
+        if pool is not None:
+            pool.close()
 
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
@@ -1171,7 +1207,7 @@ class _Fetched:
 
 
 def _extract_one(row, opener, cancel_event, extractor, pdf_source,
-                 selectors, validators, parse_lock=None) -> Deal:
+                 selectors, validators, parse_lock=None, pool=None) -> Deal:
     """抽一份公告。抽挂了变成 Deal 上的一条备注，不能连累其余几百份。"""
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
@@ -1190,20 +1226,15 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             got = opener(deal.pdf_url)
             if isinstance(got, _Fetched):
                 # 下载完了才排队解析 —— 排队的是 CPU，不是网络
-                # 先翻前几页问一句「这文件值得翻完吗」。不值得就不翻 ——
-                # 实跑里绝大多数留存件的结论是「不像要约公告」，而每得出
-                # 一次这个结论都要把一两百页从头解析到尾。
-                staged = dict(probe_pages=_probe_pages(),
-                              promising=extractor.looks_like_offer)
+                # 解析放在子进程里，而且外层仍然串行 —— 见 parse_lock 的注释。
+                # 先翻前几页问一句「这文件值得翻完吗」，不值得就不翻。
+                probe = _probe_pages()
                 if parse_lock is not None:
                     with parse_lock:
-                        doc = pdf_source.parse_doc(got.url, got.data,
-                                                   from_cache=got.from_cache,
-                                                   **staged)
+                        doc = pool.parse(got.url, got.data, probe_pages=probe)
                 else:
-                    doc = pdf_source.parse_doc(got.url, got.data,
-                                               from_cache=got.from_cache,
-                                               **staged)
+                    doc = pool.parse(got.url, got.data, probe_pages=probe)
+                doc.from_cache = got.from_cache
             else:
                 doc = got                      # 测试注入的假 PDF
             if not doc.has_text_layer:
@@ -1301,9 +1332,21 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
         except Cancelled:
             raise
         except Exception as exc:
-            deal.notes = f"抽取失败：{type(exc).__name__}: {exc}"
-            deal.confidence = "low"
-            deal.verdict, deal.verdict_reason = "unclear", f"抽取失败：{exc}"
+            # 解析超时单独说 —— 它和「链接坏了」「不是 PDF」是完全不同的
+            # 一件事：文件好好的，是这份太难啃。人看到这行才知道该去
+            # 手工打开它，而不是以为下载失败了。
+            from .parsepool import ParseTimeout
+            if isinstance(exc, ParseTimeout):
+                deal.notes = f"解析超时：{exc}"
+                deal.confidence = "low"
+                deal.verdict = "unclear"
+                deal.verdict_reason = (
+                    f"解析超时：{exc}。这份公告太难解析，已跳过，请手工打开原文；"
+                    f"想给它更多时间就调 config.yaml 的 pdf.parse_timeout_seconds")
+            else:
+                deal.notes = f"抽取失败：{type(exc).__name__}: {exc}"
+                deal.confidence = "low"
+                deal.verdict, deal.verdict_reason = "unclear", f"抽取失败：{exc}"
     return deal
 
 

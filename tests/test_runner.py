@@ -816,27 +816,30 @@ def test_parsing_never_runs_two_at_a_time(_isolate, monkeypatch):
     """
     import time as _t
 
-    from hkexdb import pdf_source, screening as S
+    from hkexdb import parsepool, pdf_source, screening as S
 
     monkeypatch.setattr(runner, "_speed_settings",
                         lambda: (4000, 4, "keyword", ["要約"]))
 
+    # 数并发的地方是 ParsePool.parse —— 真正的解析已经搬进子进程了，
+    # 在本进程给 pdf_source.parse_doc 打桩根本拦不到（打了也不会触发，
+    # 那样这条测试会「通过」但什么都没测）。
     overlap = {"max": 0, "now": 0}
     guard = threading.Lock()
-    real_parse = pdf_source.parse_doc
+    real_parse = parsepool.ParsePool.parse
 
-    def watched_parse(url, data, **kw):
+    def watched_parse(self, url, data, **kw):
         with guard:
             overlap["now"] += 1
             overlap["max"] = max(overlap["max"], overlap["now"])
         _t.sleep(0.05)
         try:
-            return real_parse(url, data, **kw)
+            return real_parse(self, url, data, **kw)
         finally:
             with guard:
                 overlap["now"] -= 1
 
-    monkeypatch.setattr(pdf_source, "parse_doc", watched_parse)
+    monkeypatch.setattr(parsepool.ParsePool, "parse", watched_parse)
 
     page = ("「要約價」 指 每股要約股份0.519港元 "
             "價值比較每股要約價為每股0.519港元，較："
@@ -848,8 +851,11 @@ def test_parsing_never_runs_two_at_a_time(_isolate, monkeypatch):
         _t.sleep(0.02)                       # 假装在下载
         return runner._Fetched(url, pdf, False)
 
-    monkeypatch.setattr(pdf_source, "extract_pages",
-                        lambda data, max_pages=0: ({1: page}, 1, "fake", ""))
+    monkeypatch.setattr(parsepool, "_worker",
+                        lambda *a: {"pages": {1: page}, "page_count": 1,
+                                    "has_text_layer": True, "extractor": "fake",
+                                    "extractor_note": "", "pages_parsed": 1,
+                                    "stopped_early": False})
 
     rows = [{"row_id": f"r{i}", "date": "2026-06-15", "code": f"{i:05d}",
              "name": f"公司{i}", "title": "作出強制性無條件現金要約",
@@ -1019,3 +1025,68 @@ def test_a_mirror_row_is_only_marked_once():
     target.offer_price = offeror.offer_price = "2.20"
     target.deal_size = offeror.deal_size = "1905849908.60"
     assert runner.mark_mirror_filings([target, offeror]) == 1
+
+
+def test_a_document_that_hangs_the_parser_does_not_hang_the_whole_batch(
+        _isolate, monkeypatch):
+    """一份卡死的公告只能毁掉它自己那一行。
+
+    实跑撞上过：日志停在 27/68，界面标题「未响应」，界面上「已运行」
+    的秒数冻在 8 分 38 秒 —— 秒数冻住本身就是证据，主线程被一起拖死了。
+    用户等了一个小时才强杀程序。
+
+    根因是那 90 秒从来没被执行过（只拿去拼了一句话给用户看），
+    而 Python 没有办法中断一个线程。
+    """
+    from hkexdb import parsepool, screening as S
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 2, "keyword", ["要約"]))
+
+    page = ("「要約價」 指 每股要約股份0.519港元 "
+            "價值比較每股要約價為每股0.519港元，較："
+            "(i) 股份於最後交易日在聯交所所報收市價每股1.870港元折讓約72.25%。"
+            "要約人於要約項下須支付的最高現金代價約為5,440萬港元。")
+    good = {"pages": {1: page}, "page_count": 1, "has_text_layer": True,
+            "extractor": "fake", "extractor_note": "", "pages_parsed": 1,
+            "stopped_early": False}
+
+    def parse(self, url, data, **kw):
+        if "/stuck" in url:
+            raise parsepool.ParseTimeout("解析超过 90 秒，已掐断")
+        from hkexdb.pdf_source import PdfDoc
+        return PdfDoc(url=url, from_cache=False, **good)
+
+    monkeypatch.setattr(parsepool.ParsePool, "parse", parse)
+
+    rows = [{"row_id": f"r{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": "/stuck.pdf" if i == 2 else f"/x/{i}.pdf",
+             "verdict": S.Verdict(bucket=S.RETAINED)} for i in range(6)]
+
+    deals = runner._extract_deals(
+        rows, lambda *_: None, lambda *_: None, None,
+        open_pdf=lambda url: runner._Fetched(url, b"%PDF-1.4", False))
+
+    assert len(deals) == 6, "卡住一份就少一批 —— 那正是要修的东西"
+    assert sum(1 for d in deals if d.verdict == "offer") == 5
+    stuck = deals[2]
+    assert "解析超时" in stuck.verdict_reason
+    assert "手工打开原文" in stuck.verdict_reason, "得告诉人下一步该干嘛"
+
+
+def test_the_ninety_seconds_we_promise_is_the_one_we_enforce(_isolate):
+    """界面上写「最多再等 90 秒」，就必须真的最多 90 秒。
+
+    这句话曾经是假的：那个常数只被拿去拼字符串，没有任何地方执行它。
+    对用户说了一个做不到的保证，比不说更坏。
+    """
+    import inspect
+
+    from hkexdb import parsepool
+
+    src = inspect.getsource(runner._extract_deals)
+    assert "ParsePool" in src, "解析必须交给能被掐断的子进程"
+    assert runner._parse_timeout() == runner.MAX_SECONDS_PER_PDF
+    # 子进程真的会用上这个数字
+    assert "timeout" in inspect.signature(parsepool.ParsePool).parameters

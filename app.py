@@ -672,4 +672,9 @@ def _crash_guard() -> int:
 
 
 if __name__ == "__main__":
+    # Windows 上子进程是 spawn 出来的 —— 它会把这个文件重新 import 一遍。
+    # 没有这一句，被 spawn 的子进程会再开一个界面窗口，然后它自己再 spawn，
+    # 无限套娃直到内存耗尽。解析挪进子进程之后这句就是必需的。
+    import multiprocessing
+    multiprocessing.freeze_support()
     raise SystemExit(_crash_guard())
