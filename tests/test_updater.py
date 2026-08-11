@@ -119,3 +119,98 @@ def test_no_tmp_files_are_left_behind(tmp_path):
 def test_the_download_url_points_at_the_right_branch(branch):
     assert branch in updater.zip_url(branch=branch)
     assert updater.REPO in updater.zip_url(branch=branch)
+
+
+# ---------------------------------------------------------------- 偶发重置
+
+def test_a_connection_reset_is_retried_not_surfaced(tmp_path):
+    """用户点「检查更新」撞上 ConnectionResetError(10054，远程主机强迫
+    关闭了一个现有的连接) —— 典型的偶发重置。
+
+    这个项目里所有别的网络调用都带退避重试，唯独更新器当初是光杆一发
+    get，于是一次抖动就变成一句红色报错，而用户能做的只有再点一次。
+    那正是重试该干的活。
+    """
+    import requests
+
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kw):
+            self.calls += 1
+            if self.calls < 3:
+                raise requests.ConnectionError("远程主机强迫关闭了一个现有的连接")
+            return Resp(make_zip({"app.py": b"new"}))
+
+    class Resp:
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+    sess = Flaky()
+    blob = updater.download("u", session=sess, sleeper=lambda _: None)
+
+    assert sess.calls == 3
+    assert blob
+
+
+def test_it_gives_up_after_the_configured_attempts(tmp_path):
+    """一直连不上就说人话，别把 WinError 10054 原样甩到用户脸上。"""
+    import requests
+
+    class Dead:
+        def get(self, url, **kw):
+            raise requests.ConnectionError("10054")
+
+    result = updater.update(
+        tmp_path,
+        fetch=lambda url: updater.download(url, session=Dead(),
+                                           sleeper=lambda _: None))
+
+    assert not result.ok
+    assert "重试" in result.error and "热点" in result.error
+
+
+def test_a_404_is_not_retried(tmp_path):
+    """分支名写错重试一百次也还是 404 —— 白等四轮退避没有意义。"""
+    import requests
+
+    class NotFound:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kw):
+            self.calls += 1
+            return self
+
+        def raise_for_status(self):
+            raise requests.HTTPError("404 Not Found")
+
+    sess = NotFound()
+    with pytest.raises(requests.HTTPError):
+        updater.download("u", session=sess, sleeper=lambda _: None)
+    assert sess.calls == 1
+
+
+def test_each_retry_is_announced(tmp_path):
+    """重试要说出来 —— 界面上什么都不动，用户会以为程序死了。"""
+    import requests
+
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kw):
+            self.calls += 1
+            raise requests.ConnectionError("重置")
+
+    said = []
+    try:
+        updater.download("u", session=Flaky(), sleeper=lambda _: None,
+                         on_retry=lambda a, t, e: said.append(a))
+    except requests.ConnectionError:
+        pass
+    assert said == [1, 2, 3]        # 最后一次失败不报「稍后重试」

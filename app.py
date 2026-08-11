@@ -580,7 +580,11 @@ def main() -> int:
         append("正在从 GitHub 取最新版…")
 
         def work():
-            result = updater.update(ROOT)
+            def note_retry(attempt, total, exc):
+                msgs.put(("log", f"      连接被重置（第 {attempt}/{total} 次），"
+                                 f"稍后重试：{type(exc).__name__}"))
+
+            result = updater.update(ROOT, on_retry=note_retry)
             msgs.put(("update", result))
 
         threading.Thread(target=work, daemon=True).start()

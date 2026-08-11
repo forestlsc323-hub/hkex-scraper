@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import os
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,11 +50,42 @@ class UpdateResult:
     error: str = ""
 
 
-def download(url: str, *, session=None, timeout: int = 120) -> bytes:
+# 重试几次、每次退避多久。和 pdf_source 那边同一套路数。
+ATTEMPTS = 4
+BACKOFF = 1.5
+
+# 连接被对方重置、超时、被代理掐断 —— 这些重试一次通常就回来了。
+# HTTP 4xx 不在其列：分支名写错重试一百次也还是 404。
+_TRANSIENT = (requests.ConnectionError, requests.Timeout,
+              requests.exceptions.ChunkedEncodingError)
+
+
+def download(url: str, *, session=None, timeout: int = 120,
+             attempts: int = ATTEMPTS, sleeper=time.sleep, on_retry=None) -> bytes:
+    """取 zip。**偶发的连接重置要自己扛下来，别丢给用户。**
+
+    用户点「检查更新」撞上
+    `ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接')` ——
+    典型的偶发重置（防火墙、代理、GitHub 那头随手掐一条连接都会这样）。
+    这个项目里所有别的网络调用都带退避重试，唯独更新器是光杆一发 get，
+    于是一次抖动就变成一句红色报错，而用户能做的只有再点一次。
+    那正是重试该干的活。
+    """
     sess = session or requests.Session()
-    resp = sess.get(url, timeout=timeout)
-    resp.raise_for_status()
-    return resp.content
+    last = None
+    for attempt in range(attempts):
+        try:
+            resp = sess.get(url, timeout=timeout,
+                            headers={"User-Agent": "hkex-precedent-db-updater"})
+            resp.raise_for_status()
+            return resp.content
+        except _TRANSIENT as exc:
+            last = exc
+            if attempt < attempts - 1:
+                if on_retry:
+                    on_retry(attempt + 1, attempts, exc)
+                sleeper(BACKOFF * (2 ** attempt))
+    raise last
 
 
 def _entries(zf: zipfile.ZipFile) -> dict[str, str]:
@@ -111,11 +143,19 @@ def apply_zip(data: bytes, root: Path) -> UpdateResult:
 
 
 def update(root: Path, *, session=None, repo: str = REPO,
-           branch: str = BRANCH, fetch=None) -> UpdateResult:
+           branch: str = BRANCH, fetch=None, on_retry=None) -> UpdateResult:
     """下载并覆盖。网络出错变成一句人话，不往上抛。"""
-    getter = fetch or (lambda url: download(url, session=session))
+    getter = fetch or (lambda url: download(url, session=session,
+                                            on_retry=on_retry))
     try:
         blob = getter(zip_url(repo, branch))
+    except _TRANSIENT as exc:
+        # 重试了 ATTEMPTS 次还是不行，那多半不是抖动。给一句能照着做的话，
+        # 而不是把 WinError 10054 原样甩到用户脸上。
+        return UpdateResult(False, error=(
+            f"连不上 GitHub（重试 {ATTEMPTS} 次都失败）：{exc}\n\n"
+            "多半是网络或代理挡住了 codeload.github.com。\n"
+            "换个网络（比如手机热点）再点一次通常就好。"))
     except requests.RequestException as exc:
         return UpdateResult(False, error=f"连不上 GitHub：{exc}")
     except OSError as exc:
