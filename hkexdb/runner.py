@@ -558,18 +558,25 @@ def _fetch_incrementally(d1: dt.date, d2: dt.date, log, on_step,
         log(f"这段 {total_days} 天存档里都没有，全抓。")
 
     fetched: list[dict] = []
+    added_total = 0
     for i, (r1, r2) in enumerate(ranges, 1):
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
         log(f"\n补抓第 {i}/{len(ranges)} 段：{r1} ~ {r2}")
-        fetched += fetch(r1, r2, log,
-                         lambda _i, f, i=i: on_step(0, (i - 1 + f) / len(ranges)),
-                         cancel_event)
-        # 一段抓完就记一段 —— 中途失败也不用从头再来
+        part = fetch(r1, r2, log,
+                     lambda _i, f, i=i: on_step(0, (i - 1 + f) / len(ranges)),
+                     cancel_event)
+        fetched += part
+        # ⚠️ 顺序不能反：**先落盘，落盘成功了才记覆盖**。
+        # 原来是每段先记覆盖、全部抓完才统一写存档 —— 第二段一炸，
+        # 第一段的记录还在内存里就没了，而覆盖范围已经写下「抓过了」，
+        # 下次再跑直接跳过，那几天永久丢失，而且完全无声。
+        added, total = store.merge_listing(ROOT, part)
+        added_total += added
         store.mark_covered(ROOT, r1, r2, key)
+        log(f"  这一段新增 {added} 条，存档现有 {total} 条。")
 
-    added, total = store.merge_listing(ROOT, fetched)
-    log(f"\n新增 {added} 条公告进存档，存档现有 {total} 条。")
+    log(f"\n本次共新增 {added_total} 条公告进存档。")
 
     rows = store.listing_between(ROOT, d1, d2)
     if fetched and not rows:
@@ -820,13 +827,12 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     if reused_rows:
         log(f"  留存桶 {len(targets)} 条，其中 {len(reused_rows)} 条存档里已抽过"
             f"（版本 {store.EXTRACTOR_VERSION}），直接复用。")
-    if not todo:
-        log("  没有需要新抽的公告，一份 PDF 都不用下。")
-        return [_deal_from_row(r) for r in reused_rows]
-
     targets = todo
-    log(f"  需要新抽 {len(targets)} 条，{workers} 路并发打开 PDF"
-        f"（共用会话与限速闸，失败自动重试）…")
+    if not targets:
+        log("  没有需要新抽的公告，一份 PDF 都不用下。")
+    else:
+        log(f"  需要新抽 {len(targets)} 条，{workers} 路并发打开 PDF"
+            f"（共用会话与限速闸，失败自动重试）…")
 
     done = [0]
     lock = threading.Lock()
@@ -843,13 +849,19 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         on_activity(f"{done[0]}/{len(targets)} 份　正在处理：{which}")
 
     def one(row) -> Deal:
-        busy.add(row.get("code") or row.get("row_id"))
+        # 增删和读取必须同一把锁 —— 一个线程在 sorted(busy) 的同时
+        # 另一个线程 add，会抛 RuntimeError: Set changed size during iteration，
+        # 而那是在 4 路并发里偶发的，最难复现的那种。
+        who = row.get("code") or row.get("row_id")
+        with lock:
+            busy.add(who)
         _announce()
         try:
             deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
                                 selectors, validators)
         finally:
-            busy.discard(row.get("code") or row.get("row_id"))
+            with lock:
+                busy.discard(who)
             _announce()
         with lock:
             done[0] += 1
@@ -877,21 +889,30 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
 
-    # 新抽的并进存档，下次同一段日期就不用再下 PDF 了
-    fresh = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
-              **dict(zip(DEAL_COLUMNS, _deal_row(d)))}
-             for d in deals if d.news_id]
-    if fresh:
-        total = store.merge_deals(ROOT, fresh, DEAL_COLUMNS)
-        store.merge_evidence(ROOT, {d.pdf_url: d.evidence
-                                    for d in deals if d.pdf_url and d.evidence})
-        log(f"  已存档 {len(fresh)} 条抽取结果，存档现有 {total} 条。")
-
+    # ⚠️ 三步的顺序是有讲究的：先合并，再标镜像，最后才存档。
+    #
+    # 原来是「先存档、再标镜像」，于是存档里永远记的是**没标过**的结果；
+    # 加上「全部可复用就早退」那条路径跳过了标记，同一份数据第一遍记
+    # 1 单、第二遍记 2 单 —— 做中位数时这一单的权重凭空翻倍，
+    # 而两次运行的日志都显示「成功」。
+    fresh_ids = {d.news_id for d in deals if d.news_id}
     deals = [_deal_from_row(r) for r in reused_rows] + deals
 
     mirrors = mark_mirror_filings(deals)
     if mirrors:
         log(f"  发现 {mirrors} 条镜像归档（要约方自己那一边），已标出不重复计数")
+
+    # 存的是标记之后的结果。镜像那一行也要更新回存档，
+    # 否则下次复用出来又是重复的。
+    to_save = [d for d in deals
+               if d.news_id and (d.news_id in fresh_ids or d.verdict == "mirror")]
+    if to_save:
+        rows = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
+                 **dict(zip(DEAL_COLUMNS, _deal_row(d)))} for d in to_save]
+        total = store.merge_deals(ROOT, rows, DEAL_COLUMNS)
+        store.merge_evidence(ROOT, {d.pdf_url: d.evidence
+                                    for d in to_save if d.pdf_url and d.evidence})
+        log(f"  已存档 {len(rows)} 条抽取结果，存档现有 {total} 条。")
 
     n, size = cache_info()
     if n:

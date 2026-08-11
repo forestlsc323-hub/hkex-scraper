@@ -79,8 +79,9 @@ def main() -> int:
 
     msgs: queue.Queue = queue.Queue()
     cancel = threading.Event()
-    state = {"running": False, "result": None,
-             "activity": "", "frame": 0, "started": 0.0}
+    state = {"running": False, "result": None, "activity": "",
+             "frame": 0, "started": 0.0, "moved": 0.0,
+             "progress": 0.0, "pulsing": False}
 
     tabs = ttk.Notebook(root)
     tabs.pack(fill="both", expand=True)
@@ -295,15 +296,13 @@ def main() -> int:
     status = ttk.Label(mid, text="就绪")
     status.pack(anchor="w")
 
-    # 上面这条是**真进度**（determinate，按完成比例走）。
+    # 一条进度条，两种状态：
+    #   进度在动 → determinate，老老实实走完成比例
+    #   进度卡住 → 自动切成 indeterminate 来回跑，说明「还活着，在等」
+    # ttk 的进度条不能同时又走比例又有动画，所以用切模式实现，
+    # 切换点是「进度连续 2 秒没动」。
     bar = ttk.Progressbar(mid, mode="determinate", maximum=100)
     bar.pack(fill="x", pady=(4, 2))
-
-    # 下面这条细的是**活着的证据**（indeterminate，一直来回跑）。
-    # 两条分开是有意的：真进度可能几分钟不动（最后一份卡在死链上重试），
-    # 那时候唯一能让人分清「还在跑」和「已经死了」的就是这条。
-    pulse = ttk.Progressbar(mid, mode="indeterminate", length=100)
-    pulse.pack(fill="x", pady=(0, 2))
 
     activity = ttk.Label(mid, text="", foreground="#666")
     activity.pack(anchor="w", pady=(0, 6))
@@ -342,20 +341,37 @@ def main() -> int:
     # 转圈的那个小符号 —— 纯 ASCII，cp936 控制台也编得出来
     SPINNER = "|/-\\"
 
-    def tick() -> None:
-        """每 200 毫秒走一格：转圈 + 已等多久。
+    STALL_SECONDS = 2.0        # 进度不动多久就切成动画
 
-        进度条不动的时候，这两样是用户唯一能确认程序还活着的东西。
-        """
+    def set_progress(value: float) -> None:
+        """进度动了：切回真进度条，并记下这一刻。"""
+        if state["pulsing"]:
+            bar.stop()
+            bar.configure(mode="determinate", maximum=100)
+            state["pulsing"] = False
+        bar["value"] = value
+        state["progress"] = value
+        state["moved"] = time.monotonic()
+
+    def tick() -> None:
+        """每 200 毫秒走一格：转圈、已运行多久、进度卡住就让进度条动起来。"""
         if state["running"]:
             state["frame"] += 1
-            secs = int(time.monotonic() - state["started"])
+            now = time.monotonic()
+            secs = int(now - state["started"])
+            mins, rest = divmod(secs, 60)
+            elapsed = f"{mins} 分 {rest} 秒" if mins else f"{rest} 秒"
             spin = SPINNER[state["frame"] % len(SPINNER)]
             note = state["activity"]
-            mins, s_ = divmod(secs, 60)
-            elapsed = f"{mins} 分 {s_} 秒" if mins else f"{s_} 秒"
             activity.configure(
                 text=f"{spin}  已运行 {elapsed}" + (f"　·　{note}" if note else ""))
+
+            # 进度条本身也得动起来 —— 否则最后一份卡在死链上重试的那
+            # 一两分钟，界面看上去和死机一模一样。
+            if not state["pulsing"] and now - state["moved"] > STALL_SECONDS:
+                bar.configure(mode="indeterminate")
+                bar.start(25)
+                state["pulsing"] = True
         root.after(200, tick)
 
     def pump() -> None:
@@ -368,7 +384,7 @@ def main() -> int:
                 append(payload)
             elif kind == "step":
                 index, frac = payload
-                bar["value"] = min(100, (index + frac) / len(runner.STEPS) * 100)
+                set_progress(min(100, (index + frac) / len(runner.STEPS) * 100))
                 status.configure(text=f"[{index + 1}/{len(runner.STEPS)}] "
                                       f"{runner.STEPS[index]}")
             elif kind == "activity":
@@ -386,12 +402,14 @@ def main() -> int:
     def finish(result) -> None:
         state["running"] = False
         state["result"] = result
-        pulse.stop()
+        bar.stop()
+        bar.configure(mode="determinate", maximum=100)
+        state["pulsing"] = False
         secs = int(time.monotonic() - state["started"])
         activity.configure(text=f"用时 {secs // 60} 分 {secs % 60} 秒")
         btn_run.configure(state="normal")
         btn_stop.configure(state="disabled")
-        bar["value"] = 100 if result.ok else bar["value"]
+        bar["value"] = 100 if result.ok else state["progress"]
         if result.error:
             status.configure(text=f"结束：{result.error}")
         else:
@@ -442,8 +460,11 @@ def main() -> int:
         btn_stop.configure(state="normal")
         btn_report.configure(state="disabled")
         btn_diag.configure(state="disabled")
+        state["pulsing"] = False
+        bar.stop()
+        bar.configure(mode="determinate")
         bar["value"] = 0
-        pulse.start(30)
+        state["moved"] = time.monotonic()
 
         # ⚠️ tkinter 的变量只能在主线程读。原来 force_var.get() 写在
         # work() 里，那是工作线程 —— 轻则读到脏值，重则直接

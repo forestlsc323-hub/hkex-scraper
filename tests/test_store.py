@@ -352,3 +352,119 @@ def test_force_refetch_ignores_the_archive(isolated):
     runner.run(D(2026, 6, 1), D(2026, 6, 7), fetch=fetch,
                open_pdf=fake_open_pdf, force_refetch=True)
     assert calls == [(D(2026, 6, 1), D(2026, 6, 7))], "勾了强制却没重抓"
+
+
+# ================================================================
+# 这一节的每条测试都是先写出来看它挂，再去修的
+# ================================================================
+
+def test_a_crash_midway_does_not_mark_unsaved_days_as_covered(isolated):
+    """抓了两段，第二段炸了 —— 第一段的记录必须已经落盘。
+
+    原来是「每段抓完先标覆盖，全部抓完才统一写存档」：
+    第二段一炸，第一段的记录还在内存里就没了，而覆盖范围已经写下
+    「这些天抓过了」。下次再跑直接跳过，那几天永久丢失，而且无声。
+    """
+    from tests.test_runner import fake_records
+
+    calls = []
+
+    def flaky(d1, d2, log, on_step, cancel_event):
+        calls.append(d1)
+        if len(calls) == 2:
+            raise ConnectionError("第二段炸了")
+        return fake_records(4, day=d1.isoformat())
+
+    # 缺两段：1月 和 3月（2月已抓过）
+    key = store.coverage_key("keyword", ["要約", "收購", "私有化"])
+    store.mark_covered(isolated, D(2026, 2, 1), D(2026, 2, 28), key)
+    runner.run(D(2026, 1, 1), D(2026, 3, 31), fetch=flaky,
+               open_pdf=lambda u: None)
+
+    saved = store.load_listing(isolated)
+    covered = store.load_coverage(isolated).get(key, set())
+    assert saved, "第一段抓到的记录一条都没落盘"
+    assert "2026-01-01" in covered, "第一段成功了却没记覆盖"
+    assert "2026-03-01" not in covered, "第二段炸了却把它标成抓过 —— 会永久丢数据"
+
+
+def test_mirror_filings_stay_marked_when_everything_is_reused(isolated):
+    """第二遍全部走存档时，镜像标记不能丢。
+
+    原来「全部可复用」是一条早退路径，直接 return，跳过了镜像标记 ——
+    同一份数据第一遍记 1 单、第二遍记 2 单，中位数跟着变。
+    """
+    from tests.test_runner import fake_open_pdf
+
+    title = ("聯合公告 由某證券代表藍思科技股份有限公司提出"
+             "自願性有條件全面現金要約")
+    records = [
+        {"NEWS_ID": "t", "DATE_TIME": "18/05/2026 08:00", "STOCK_CODE": "03336",
+         "STOCK_NAME": "巨騰國際", "TITLE": title, "FILE_LINK": "/x/t.pdf"},
+        {"NEWS_ID": "o", "DATE_TIME": "18/05/2026 08:00", "STOCK_CODE": "06613",
+         "STOCK_NAME": "藍思科技", "TITLE": title, "FILE_LINK": "/x/o.pdf"},
+    ]
+
+    first = runner.run(D(2026, 5, 1), D(2026, 5, 31),
+                       fetch=lambda *a: records, open_pdf=fake_open_pdf)
+    second = runner.run(D(2026, 5, 1), D(2026, 5, 31),
+                        fetch=lambda *a: records, open_pdf=fake_open_pdf)
+
+    def offers(result):
+        return sum(1 for d in result.deals if d.verdict == "offer")
+
+    assert offers(first) == offers(second), \
+        f"同一份数据两遍算出不同的单数：{offers(first)} vs {offers(second)}"
+    assert any(d.verdict == "mirror" for d in second.deals), "镜像标记丢了"
+
+
+def test_the_archive_itself_records_the_mirror_verdict(isolated):
+    """存档里存的必须是**标记之后**的结果，否则复用出来还是重复的。"""
+    from tests.test_runner import fake_open_pdf
+
+    title = "聯合公告 由某證券代表藍思科技股份有限公司提出自願性有條件全面現金要約"
+    records = [
+        {"NEWS_ID": "t", "DATE_TIME": "18/05/2026 08:00", "STOCK_CODE": "03336",
+         "STOCK_NAME": "巨騰國際", "TITLE": title, "FILE_LINK": "/x/t.pdf"},
+        {"NEWS_ID": "o", "DATE_TIME": "18/05/2026 08:00", "STOCK_CODE": "06613",
+         "STOCK_NAME": "藍思科技", "TITLE": title, "FILE_LINK": "/x/o.pdf"},
+    ]
+    runner.run(D(2026, 5, 1), D(2026, 5, 31),
+               fetch=lambda *a: records, open_pdf=fake_open_pdf)
+
+    archived = store.load_deals(isolated)
+    assert archived["o"]["判定"] == "镜像重复", "存档里没记下镜像标记"
+
+
+def test_the_listing_file_is_written_atomically(isolated, monkeypatch):
+    """写到一半被杀，存档不能变成半截文件。
+
+    2594 行的 CSV 重写一遍要一会儿，这个窗口是真实存在的。
+    """
+    store.merge_listing(isolated, [_rec("a"), _rec("b")])
+    good = (isolated / store.STORE_DIR / store.LISTING_FILE).read_text(
+        encoding="utf-8-sig")
+
+    real_replace = __import__("os").replace
+
+    def boom(src, dst):
+        raise KeyboardInterrupt("写到一半被杀")
+
+    monkeypatch.setattr("os.replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        store.merge_listing(isolated, [_rec("c")])
+    monkeypatch.setattr("os.replace", real_replace)
+
+    after = (isolated / store.STORE_DIR / store.LISTING_FILE).read_text(
+        encoding="utf-8-sig")
+    assert after == good, "存档被写坏了 —— 应该原子替换，失败就保持原样"
+
+
+def test_the_listing_file_is_sorted_by_real_date(isolated):
+    """按 DD/MM/YYYY 字符串排序等于乱排：04/06 会排在 18/05 前面。"""
+    store.merge_listing(isolated, [_rec("a", "2026-05-18"),
+                                   _rec("b", "2026-06-04"),
+                                   _rec("c", "2026-01-09")])
+    rows = list(store.load_listing(isolated).values())
+    dates = [store.row_date(r) for r in rows]
+    assert dates == sorted(dates, reverse=True), f"存档顺序是乱的：{dates}"

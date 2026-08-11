@@ -27,6 +27,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import json
+import os
 from pathlib import Path
 
 # 抽取器版本。**改了抽取/校验逻辑就要改这个号**，否则旧结果会被当成
@@ -79,6 +80,22 @@ def row_date(row: dict) -> str:
         row.get("DATE_TIME", ""))
 
 
+def _write_csv(path: Path, columns: list[str], rows) -> None:
+    """先写临时文件，再原子改名。
+
+    存档动辄几千行，重写一遍有个真实的时间窗口。写到一半被杀（关窗口、
+    断电、任务管理器），原地写就会留下半截 CSV —— 下次读出来少一半数据，
+    而且完全无声。os.replace 在 Windows 和 POSIX 上都是原子的。
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    os.replace(tmp, path)
+
+
 def _dir(root: Path) -> Path:
     path = root / STORE_DIR
     path.mkdir(parents=True, exist_ok=True)
@@ -109,10 +126,16 @@ def load_coverage(root: Path) -> dict[str, set[str]]:
     return {k: set(v) for k, v in raw.items() if isinstance(v, list)}
 
 
+def _write_json(path: Path, payload) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def save_coverage(root: Path, coverage: dict[str, set[str]]) -> None:
-    payload = {k: sorted(v) for k, v in coverage.items()}
-    (_dir(root) / COVERAGE_FILE).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    _write_json(_dir(root) / COVERAGE_FILE,
+                {k: sorted(v) for k, v in coverage.items()})
 
 
 def _days(d1: dt.date, d2: dt.date) -> list[dt.date]:
@@ -186,13 +209,10 @@ def merge_listing(root: Path, records: list[dict]) -> tuple[int, int]:
         }
         added += 1
 
-    path = _dir(root) / LISTING_FILE
-    with path.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.DictWriter(fh, fieldnames=LISTING_COLUMNS, extrasaction="ignore")
-        w.writeheader()
-        for row in sorted(store.values(),
-                          key=lambda r: r.get("DATE_TIME", ""), reverse=True):
-            w.writerow(row)
+    # 按**真实日期**排，不是按 DATE_TIME 字符串 ——
+    # DD/MM/YYYY 按字符串排等于乱排：04/06 会跑到 18/05 前面。
+    _write_csv(_dir(root) / LISTING_FILE, LISTING_COLUMNS,
+               sorted(store.values(), key=row_date, reverse=True))
     return added, len(store)
 
 
@@ -232,13 +252,7 @@ def reusable(row: dict, version: str | None = None) -> bool:
 
 
 def save_deals(root: Path, rows: list[dict], columns: list[str]) -> None:
-    path = _dir(root) / DEALS_FILE
-    header = ["NEWS_ID", "抽取器版本", *columns]
-    with path.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
-        w.writeheader()
-        for row in rows:
-            w.writerow(row)
+    _write_csv(_dir(root) / DEALS_FILE, ["NEWS_ID", "抽取器版本", *columns], rows)
 
 
 def merge_deals(root: Path, new_rows: list[dict], columns: list[str]) -> int:
@@ -270,5 +284,4 @@ def merge_evidence(root: Path, new_evidence: dict) -> None:
     """
     store = load_evidence(root)
     store.update(new_evidence)
-    (_dir(root) / EVIDENCE_FILE).write_text(
-        json.dumps(store, ensure_ascii=False, indent=1), encoding="utf-8")
+    _write_json(_dir(root) / EVIDENCE_FILE, store)

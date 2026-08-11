@@ -149,16 +149,25 @@ def test_no_tkinter_variable_is_read_from_a_worker_thread():
             f"工作线程里读了界面控件：{forbidden}"
 
 
-def test_the_ui_shows_it_is_alive_while_a_step_stalls():
-    """85/86 之后一声不吭地等三分钟，和卡死没有区别。
+def test_there_is_exactly_one_progress_bar_on_the_run_page():
+    """两条进度条并成一条：进度在动就走比例，卡住就自己动起来。"""
+    text = (ROOT / "app.py").read_text(encoding="utf-8")
+    created = [ln for ln in text.splitlines()
+               if "ttk.Progressbar(" in ln and not ln.strip().startswith("#")]
+    assert len(created) == 1, f"抓取页应该只有一条进度条，找到 {len(created)} 条"
 
-    所以界面上必须同时有：真进度条、来回跑的活动条、转圈符号 + 已运行时长。
+
+def test_the_bar_animates_itself_when_progress_stalls():
+    """85/86 之后一声不吭地等几分钟，和卡死没有区别。
+
+    进度条必须能从「走比例」切成「来回跑」，切回来时还要恢复真实进度。
     """
     text = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert 'mode="determinate"' in text, "缺真进度条"
-    assert 'mode="indeterminate"' in text, "缺活动条（进度不动时唯一的活着证据）"
+    assert 'configure(mode="indeterminate")' in text, "卡住时进度条不会动"
+    assert 'mode="determinate"' in text, "动完不切回真进度"
+    assert "bar.start(" in text and "bar.stop()" in text
+    assert "STALL_SECONDS" in text, "切换阈值应该是个有名字的常量"
     assert "已运行" in text, "不显示已运行时长"
-    assert "pulse.start(" in text and "pulse.stop()" in text
 
 
 def test_the_spinner_is_ascii_only():
@@ -167,3 +176,12 @@ def test_the_spinner_is_ascii_only():
     line = next(ln for ln in text.splitlines() if "SPINNER" in ln and "=" in ln)
     line.encode("cp936")
     assert all(ord(c) < 128 for c in line.split("=")[1].strip().strip('"'))
+
+
+def test_the_bar_never_loses_the_real_progress_when_it_animates():
+    """切成动画再切回来，不能把已完成的比例清零 ——
+    那会让人以为白跑了。所以真实进度另存一份。"""
+    text = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert 'state["progress"]' in text, "没有单独保存真实进度"
+    finish = text.split("def finish(result)", 1)[1].split("def ", 1)[0]
+    assert 'state["progress"]' in finish, "结束时没有用回真实进度"
