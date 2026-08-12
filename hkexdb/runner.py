@@ -30,7 +30,7 @@ class Cancelled(Exception):
 
 
 VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约",
-                 "mirror": "镜像重复"}
+                 "mirror": "镜像重复", "duplicate": "同单重复"}
 
 # 一份公告最多占用多久（给用户看的上界，真正的硬闸在 pdf_source 里）
 MAX_SECONDS_PER_PDF = 90
@@ -164,6 +164,46 @@ def mark_mirror_filings(deals: list) -> int:
                     f"受要约方是同组另一条。合并记一单（坑⑨）")
                 seen.add(id(d))
                 marked += 1
+    return marked
+
+
+def mark_duplicate_filings(deals: list) -> int:
+    """同一单交易被两份文件各记一遍，留最早那份。
+
+    一单要约通常至少两份文件写着完整字段：先出**联合公告**，几周后出
+    **综合文件**。两份的要约价、溢价、规模一模一样 —— 直接进表就是把
+    同一单记了两遍，做中位数时权重凭空翻倍。
+
+    实跑 2025 全年撞上一批：
+        02442 怡俊集團  24 页的公告 + 80 页的综合文件，两行完全相同
+        00195 綠科 / 01428 耀才 / 01863 中國龍天 / 02623 愛德  同理
+
+    和镜像归档（坑⑨）不是一回事：那个是**同一份**公告在双方代码下各
+    归档一次，这个是**同一单**交易的两份不同文件。判据也不同 ——
+    这里要求同代码、同要约价、同规模。
+
+    留最早那份，因为 T0 才是这单的日期。后面那份标出来但不删（软删除，
+    铁律二）—— 综合文件里有公告没有的东西（时间表、独立意见），
+    人可能正想看它。
+    """
+    groups: dict[tuple, list] = {}
+    for d in deals:
+        if d.verdict != "offer":
+            continue
+        groups.setdefault(
+            (d.code, d.offer_price, d.deal_size, d.premium_pct), []).append(d)
+
+    marked = 0
+    for key, group in groups.items():
+        if len(group) < 2 or not key[0]:
+            continue
+        group.sort(key=lambda d: (d.date or "9999", d.news_id))
+        for d in group[1:]:
+            d.verdict = "duplicate"
+            d.verdict_reason = (
+                f"与 {group[0].date} 那份是同一单（要约价、溢价、规模都相同），"
+                f"多半是先公告、后综合文件。已合并记一单，此行不重复计数")
+            marked += 1
     return marked
 
 
@@ -1226,10 +1266,15 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     if mirrors:
         log(f"  发现 {mirrors} 条镜像归档（要约方自己那一边），已标出不重复计数")
 
+    dupes = mark_duplicate_filings(deals)
+    if dupes:
+        log(f"  发现 {dupes} 条同单重复（先公告、后综合文件），已合并记一单")
+
     # 存的是标记之后的结果。镜像那一行也要更新回存档，
     # 否则下次复用出来又是重复的。
     to_save = [d for d in deals
-               if d.news_id and (d.news_id in fresh_ids or d.verdict == "mirror")]
+               if d.news_id and (d.news_id in fresh_ids
+                                 or d.verdict in ("mirror", "duplicate"))]
     if to_save:
         rows = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
                  **dict(zip(DEAL_COLUMNS, _deal_row(d)))} for d in to_save]

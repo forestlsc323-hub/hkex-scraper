@@ -316,6 +316,41 @@ def _num_or_none(value):
         return None
 
 
+# 要约价最多能比六个月最高价高这么多倍。
+# 溢价 100%~200% 的单子真实存在（08413 亞洲富思 +136%），所以闸要开得松；
+# 它防的不是「溢价高」，是「数量级错了」。
+_PRICE_SANITY_MULTIPLE = 10
+
+
+def _drop_impossible_offer_price(result) -> None:
+    """要约价高出六个月最高价一个数量级 —— 那不是要约价，是别的数字。
+
+    ⚠️ 这条防的不是正则写得松，是**PDF 的文字顺序乱了**。
+    09929 澳達控股那份把数字放在独立的文字层，pdfplumber 顺序读出来是：
+
+        按每股要約股0.11份 港元的要約價計算
+        按每股要約股份220.0港元的要約價計算，本公司的已發行股本總額將為 百萬港元
+
+    真实句子是「每股要約股份 0.11 港元…已發行股本總額將為 220.0 百萬港元」。
+    数字被搬到了错的位置，于是 220.0（股本总额，单位百万）被当成了要约价。
+    00834 康大食品同一个病。
+
+    正则救不了排版错乱，但**算术能**：这家公司六个月最高价 0.116 港元，
+    要约价 220 是它的一千九百倍。留一个这样的数比留空坏得多。
+    """
+    price = _num_or_none(result.offer_price)
+    high = _num_or_none(result.six_month_high)
+    if not price or not high or high <= 0:
+        return
+    if price > high * _PRICE_SANITY_MULTIPLE:
+        result.notes.append(
+            f"抽到的要约价 {result.offer_price} 是六个月最高价 {result.six_month_high} "
+            f"的 {price / high:.0f} 倍（数量级不对，多半是 PDF 里数字与文字错位），"
+            f"已作废，需人工读原文")
+        result.offer_price = ""
+        result.offer_price_evidence = Evidence()
+
+
 def _drop_impossible_deal_size(result) -> None:
     """总代价不可能等于每股价。对不上就把规模清掉，绝不留一个假数。
 
@@ -1123,6 +1158,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.debt_conversion, result.debt_conversion_evidence = \
         extract_debt_conversion(pages)
 
+    _drop_impossible_offer_price(result)
     _drop_impossible_deal_size(result)
 
     if not result.offer_type:

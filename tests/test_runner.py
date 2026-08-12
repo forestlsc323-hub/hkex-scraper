@@ -1371,3 +1371,62 @@ def test_export_writes_a_file_even_when_a_download_fails(_isolate, monkeypatch):
 def test_a_row_without_a_link_is_skipped_not_crashed(_isolate):
     path = runner.export_wording([{"股票代码": "00001", "PDF链接": ""}])
     assert "没有 PDF 链接" in path.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------ 同一单交易的两份文件
+
+def test_the_composite_document_does_not_double_count_the_deal():
+    """一单要约通常至少两份文件写着完整字段：先出联合公告，几周后出
+    综合文件。两份的要约价、溢价、规模一模一样。
+
+    实跑 2025 全年撞上一批 —— 02442 怡俊集團 24 页的公告和 80 页的
+    综合文件在表里各占一行，用户一眼就看出来了。直接进表就是把同一单
+    记了两遍，做中位数时这一单的权重凭空翻倍。
+    """
+    early = runner.Deal(code="02442", name="怡俊集團控股", date="2025-12-02",
+                        offer_price="0.7517", deal_size="76673400",
+                        premium_pct="-77.80", verdict="offer", news_id="a")
+    late = runner.Deal(code="02442", name="怡俊集團控股", date="2025-12-30",
+                       offer_price="0.7517", deal_size="76673400",
+                       premium_pct="-77.80", verdict="offer", news_id="b")
+
+    assert runner.mark_duplicate_filings([late, early]) == 1
+    assert early.verdict == "offer", "T0 那份要留着"
+    assert late.verdict == "duplicate"
+    assert "同一单" in late.verdict_reason
+
+
+def test_the_duplicate_row_stays_in_the_table():
+    """铁律二：软删除。综合文件里有公告没有的东西（时间表、独立意见），
+    人可能正想看它。"""
+    a = runner.Deal(code="02442", date="2025-12-02", offer_price="0.75",
+                    deal_size="1", premium_pct="-1", verdict="offer")
+    b = runner.Deal(code="02442", date="2025-12-30", offer_price="0.75",
+                    deal_size="1", premium_pct="-1", verdict="offer")
+    runner.mark_duplicate_filings([a, b])
+    assert runner._deal_row(b)[0] == "同单重复"
+
+
+def test_two_genuinely_different_deals_are_not_merged():
+    """同一家公司先后两单要约，价钱不同 —— 绝不能合并。"""
+    a = runner.Deal(code="02362", date="2026-03-02", offer_price="0.01",
+                    deal_size="7000000", premium_pct="-98", verdict="offer")
+    b = runner.Deal(code="02362", date="2026-05-27", offer_price="0.02",
+                    deal_size="39000000", premium_pct="-51", verdict="offer")
+    assert runner.mark_duplicate_filings([a, b]) == 0
+
+
+def test_rows_that_are_not_offers_are_left_alone():
+    """非要约那些行本来就不进统计，别去动它们。"""
+    a = runner.Deal(code="00195", date="2025-01-14", verdict="not_offer")
+    b = runner.Deal(code="00195", date="2025-01-20", verdict="not_offer")
+    assert runner.mark_duplicate_filings([a, b]) == 0
+
+
+def test_rows_without_a_code_are_never_merged():
+    """披露易没给代码的那两条，谁也不知道是不是同一单。"""
+    a = runner.Deal(code="", date="2025-01-14", offer_price="1",
+                    deal_size="1", premium_pct="1", verdict="offer")
+    b = runner.Deal(code="", date="2025-01-20", offer_price="1",
+                    deal_size="1", premium_pct="1", verdict="offer")
+    assert runner.mark_duplicate_filings([a, b]) == 0

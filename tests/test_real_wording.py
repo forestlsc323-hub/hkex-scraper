@@ -263,3 +263,37 @@ def test_candidates_are_listed_when_there_is_more_than_one():
     """候选多于一个时要说出来 —— 「这里有得选」必须看得见。"""
     ex = extractor.extract("", P_SPA)
     assert any("候选" in n for n in ex.notes) or ex.deal_size == "52007328"
+
+
+def test_a_price_far_above_the_six_month_high_is_thrown_away():
+    """09929 澳達控股抽到要约价 220.00，而它六个月最高价是 0.116。
+
+    这不是正则写松了，是 PDF 的文字顺序乱了：那份把数字放在独立文字层，
+    顺序读出来变成「按每股要約股份220.0港元的要約價計算，本公司的
+    已發行股本總額將為 百萬港元」—— 真实句子是「每股 0.11 港元…
+    股本總額 220.0 百萬港元」。数字被搬到了错的位置。
+
+    正则救不了排版错乱，但算术能。
+    """
+    ex = extractor.Extraction()
+    ex.offer_price, ex.six_month_high = "220.00", "0.116"
+    extractor._drop_impossible_offer_price(ex)
+
+    assert ex.offer_price == ""
+    assert any("数量级" in n for n in ex.notes)
+
+
+def test_a_genuinely_high_premium_offer_is_not_thrown_away():
+    """08413 亞洲富思那单溢价 +136%，08403 天平道合 +187% —— 都是真的。
+    这道闸防的是数量级错，不是溢价高。"""
+    ex = extractor.Extraction()
+    ex.offer_price, ex.six_month_high = "0.258", "0.141"
+    extractor._drop_impossible_offer_price(ex)
+    assert ex.offer_price == "0.258"
+
+
+def test_the_price_gate_stays_quiet_without_a_six_month_high():
+    ex = extractor.Extraction()
+    ex.offer_price, ex.six_month_high = "220.00", ""
+    extractor._drop_impossible_offer_price(ex)
+    assert ex.offer_price == "220.00"
