@@ -190,21 +190,66 @@ def mark_duplicate_filings(deals: list) -> int:
     for d in deals:
         if d.verdict != "offer":
             continue
-        groups.setdefault(
-            (d.code, d.offer_price, d.deal_size, d.premium_pct), []).append(d)
+        # ⚠️ 键里**不能带溢价率**。两份文件写的是同一单，但抽出来的东西
+        # 可能一多一少：00372 保德那单，公告那份有 -2.23%，综合文件那份
+        # 溢价是空的。把溢价放进键里，这两行就永远配不上 ——
+        # 于是既没合并，打分时还可能配到空的那一行去。
+        # 同代码 + 同要约价 + 同规模已经足够断定是同一单。
+        groups.setdefault((d.code, d.offer_price, d.deal_size), []).append(d)
 
     marked = 0
     for key, group in groups.items():
-        if len(group) < 2 or not key[0]:
+        if len(group) < 2 or not key[0] or not key[1]:
             continue
         group.sort(key=lambda d: (d.date or "9999", d.news_id))
-        for d in group[1:]:
+        keeper, rest = group[0], group[1:]
+        filled = _fill_blanks_from(keeper, rest)
+        for d in rest:
             d.verdict = "duplicate"
             d.verdict_reason = (
-                f"与 {group[0].date} 那份是同一单（要约价、溢价、规模都相同），"
+                f"与 {keeper.date} 那份是同一单（要约价、规模相同），"
                 f"多半是先公告、后综合文件。已合并记一单，此行不重复计数")
             marked += 1
+        if filled:
+            keeper.notes = "；".join(
+                x for x in (keeper.notes,
+                            f"这些字段取自同一单的另一份文件：{'、'.join(filled)}") if x)
     return marked
+
+
+# 可以跨同一单的两份文件互补的字段。
+# 出处（evidence）跟着一起过来，所以铁律三没有破 —— 引文还是那句原话，
+# 只是它印在这单的另一份文件上。补了哪几个字段会写进备注。
+_FILLABLE = ("premium_pct", "premium_basis", "deal_size", "offer_price",
+             "offeror", "offeror_fa", "target_full", "total_shares",
+             "nav_per_share", "six_month_low", "six_month_high",
+             "last_trading_day", "listing_intent", "consideration")
+
+
+def _fill_blanks_from(keeper, others: list) -> list[str]:
+    """同一单的两份文件信息互补，把空着的格子补上。返回补了哪几个字段。
+
+    00372 保德那单：公告那份抽到溢价 -2.23%，综合文件那份溢价是空的。
+    两份讲的是同一单，人看的时候当然会把它们合起来读 ——
+    程序没理由摆一个空格子在那里。
+    """
+    filled = []
+    for name in _FILLABLE:
+        if str(getattr(keeper, name, "") or "").strip():
+            continue
+        for other in others:
+            value = str(getattr(other, name, "") or "").strip()
+            if value:
+                setattr(keeper, name, value)
+                filled.append(name)
+                break
+    if not keeper.premium_ladder:
+        for other in others:
+            if other.premium_ladder:
+                keeper.premium_ladder = dict(other.premium_ladder)
+                filled.append("premium_ladder")
+                break
+    return filled
 
 
 @dataclass

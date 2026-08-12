@@ -162,6 +162,12 @@ def _date(row: dict):
         return None
 
 
+def _filled(row: dict) -> int:
+    """这一行填了几个正经字段。用来在日期打平时挑更完整的那行。"""
+    return sum(1 for k, v in row.items()
+               if k not in KEY_COLUMNS and str(v or "").strip())
+
+
 def pair_up(got_rows: list[dict], answer_rows: list[dict],
             near_days: int = NEAR_DAYS):
     """把程序抽的和答案表按「同代码、日期最近」配对。
@@ -193,7 +199,7 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
     for want in sorted(answer_rows, key=lambda r: str(r.get("公告日期", ""))):
         code = normalise_code(want.get("股票代码", ""))
         want_date = _date(want)
-        best, best_gap = None, None
+        best, best_gap, best_rank = None, None, None
         for cand in pool.get(code, []):
             if id(cand) in used:
                 continue
@@ -203,8 +209,12 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
                 gap = abs((cand_date - want_date).days)
                 if gap > near_days:
                     continue
-            if best_gap is None or gap < best_gap:
-                best, best_gap = cand, gap
+            # 日期一样近时挑**信息全**的那一行。同一单的两份文件抽出来的
+            # 东西可能一多一少，配到空的那一行就白丢一分 —— 而那一分
+            # 程序其实是答对了的。
+            rank = (gap, -_filled(cand))
+            if best_rank is None or rank < best_rank:
+                best, best_gap, best_rank = cand, gap, rank
         if best is None:
             misses.append(want)
         else:

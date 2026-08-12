@@ -1430,3 +1430,53 @@ def test_rows_without_a_code_are_never_merged():
     b = runner.Deal(code="", date="2025-01-20", offer_price="1",
                     deal_size="1", premium_pct="1", verdict="offer")
     assert runner.mark_duplicate_filings([a, b]) == 0
+
+
+def test_two_filings_of_one_deal_fill_in_each_others_blanks():
+    """同一单的两份文件信息互补，不该在表里留一个本来有答案的空格。
+
+    实跑 2025：00372 保德那单，公告那份抽到溢价 -2.23%（正是答案），
+    综合文件那份溢价是空的。原来的去重键里带着溢价率，一空一有就配不上
+    —— 既没合并，打分时还可能配到空的那一行去，白丢一分。
+    """
+    early = runner.Deal(code="00372", date="2025-04-16", offer_price="0.175",
+                        deal_size="37544924.20", premium_pct="",
+                        offeror="", verdict="offer", news_id="a")
+    late = runner.Deal(code="00372", date="2025-04-24", offer_price="0.175",
+                       deal_size="37544924.20", premium_pct="-2.23",
+                       offeror="MARCHING GREAT LIMITED", verdict="offer",
+                       news_id="b")
+
+    assert runner.mark_duplicate_filings([early, late]) == 1
+    assert early.premium_pct == "-2.23", "另一份有答案，却留了个空格"
+    assert early.offeror == "MARCHING GREAT LIMITED"
+    assert "另一份文件" in early.notes, "补了字段必须说出来"
+
+
+def test_a_field_the_keeper_already_has_is_never_overwritten():
+    """留下的那份自己有值就以它为准 —— T0 才是这单的准星。"""
+    early = runner.Deal(code="00372", date="2025-04-16", offer_price="0.175",
+                        deal_size="1", premium_pct="-2.23", verdict="offer")
+    late = runner.Deal(code="00372", date="2025-04-24", offer_price="0.175",
+                       deal_size="1", premium_pct="-9.99", verdict="offer")
+    runner.mark_duplicate_filings([early, late])
+    assert early.premium_pct == "-2.23"
+
+
+def test_the_premium_ladder_comes_along_too():
+    early = runner.Deal(code="00372", date="2025-04-16", offer_price="0.175",
+                        deal_size="1", verdict="offer")
+    late = runner.Deal(code="00372", date="2025-04-24", offer_price="0.175",
+                       deal_size="1", verdict="offer",
+                       premium_ladder={"最后交易日收市价": "-2.23"})
+    runner.mark_duplicate_filings([early, late])
+    assert early.premium_ladder == {"最后交易日收市价": "-2.23"}
+
+
+def test_rows_without_an_offer_price_are_never_merged():
+    """两行都没抽到要约价时，「同代码同规模」不足以断定是同一单。"""
+    a = runner.Deal(code="00195", date="2025-01-14", offer_price="",
+                    deal_size="", verdict="offer")
+    b = runner.Deal(code="00195", date="2025-06-20", offer_price="",
+                    deal_size="", verdict="offer")
+    assert runner.mark_duplicate_filings([a, b]) == 0

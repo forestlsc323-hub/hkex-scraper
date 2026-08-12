@@ -283,3 +283,18 @@ def test_an_official_column_is_not_clobbered_by_an_alias(tmp_path):
     """表里同时有「股票代码」和「股份代码」时，正式那列说了算。"""
     row = scoring.normalise_row({"股票代码": "00195", "股份代码": "999"})
     assert row["股票代码"] == "00195"
+
+
+def test_the_more_complete_row_wins_when_the_dates_tie():
+    """同一单的两份文件抽出来的东西可能一多一少（00372 保德那单，
+    公告有溢价、综合文件没有）。配到空的那一行就白丢一分 ——
+    而那一分程序其实是答对了的。"""
+    empty = _row("00372", "2025-04-16", **{"要约类型": "VGO",
+                                            "主值溢价率(%)": ""})
+    full = _row("00372", "2025-04-16", **{"要约类型": "VGO",
+                                           "主值溢价率(%)": "-2.23"})
+    report = scoring.score([empty, full],
+                           [_row("00372", "2025-04-16",
+                                 **{"要约类型": "VGO", "主值溢价率(%)": "-2.23"})])
+    rate = {s.field: s.right for s in report.scores}
+    assert rate["主值溢价率(%)"] == 1, "配到空的那一行去了"
