@@ -366,39 +366,85 @@ _BENCHMARK = re.compile(
 _PCT = re.compile(r"(溢價|折讓|折價)\s*(?:約)?(?:為)?\s*([\d.]+)\s*%")
 
 _ANCHORS = [
-    ("undisturbed", re.compile(r"未受干擾日")),
+    # ⚠️「未受干擾日」和「不受干擾日期」两种写法都有 —— 一字之差。
+    # 08439 新百利用的是「不」，于是那 5 条全被判成「最後交易日」，
+    # 而锚点判错不会报错，只会让主值溢价率取到另一条，看着完全正常。
+    ("undisturbed", re.compile(r"[未不]受干擾日")),
     ("pre_rule37", re.compile(r"規則\s*3\.7")),
     ("nav", re.compile(r"資產淨值|淨資產|資產價值")),
     ("last_trading_day", re.compile(r"最後交易日")),
 ]
 
+# ⚠️ 表格排版会把「…的三十(30)個交易日」拦腰劈开，扁平化后变成
+# 「…的三 0.356 129.8% 157.9%十(30)個交易日」—— 中文数字和括号数字之间
+# 插进了三列数据。所以括号里那个数字必须能**单独**认出来，
+# 不能只认「三十(30)個」这种连在一起的完整写法。
+# 08439 新百利那张表里 5 条比较的窗口全判成了「收市价」，就是这么来的。
 _WINDOWS = [
-    ("180d", re.compile(r"180\s*個|一百八十")),
-    ("30d", re.compile(r"三十\s*\(?30\)?\s*個|30\s*個|三十個")),
-    ("10d", re.compile(r"十\s*\(?10\)?\s*個|10\s*個|十個")),
-    ("5d", re.compile(r"五\s*\(?5\)?\s*個|5\s*個|五個")),
+    ("180d", re.compile(r"一百八十|\(?\s*180\s*\)?\s*個")),
+    ("60d", re.compile(r"六十|\(?\s*60\s*\)?\s*個")),
+    ("30d", re.compile(r"三十|\(?\s*30\s*\)?\s*個")),
+    ("10d", re.compile(r"十\s*\(?10\)?\s*個|\(?\s*10\s*\)?\s*個|十個")),
+    ("5d", re.compile(r"五\s*\(?5\)?\s*個|\(?\s*5\s*\)?\s*個|五個")),
 ]
 
 
 # 条目编号：(i) (ii) … 或 1. 2. …
-_MARK = re.compile(r"\(\s*(?:[ivx]+|\d{1,2})\s*\)|(?<![\d.])\d{1,2}\s*\.\s")
+# ⚠️ 港交所公告的价值比较用**三种**编号，不是两种：
+#     (i)(ii)…      1417、00195、02362
+#     1. 2. 3.      3336
+#     (a)(b)(c)…    01875 東曜藥業   ← 这一种漏了
+# 漏一种的后果不是少抽几条，是整节切不开：01875 那节有 12 条比较，
+# 只抽出来 1 条（第一条），主值溢价率因此取到 99.00%（未受干扰日收市价）
+# 而不是 114.67%（未受干扰日前 30 日均价）—— 差 15 个百分点，
+# 而且看起来完全正常。
+#
+# 罗马数字和字母序号在 (i) 上撞车：i 既是罗马数字 1，也是字母表第 9 个。
+# 靠「必须连号」化解 —— 见 _split_items。
+_MARK = re.compile(r"\(\s*(?:[ivx]+|[a-z]|\d{1,2})\s*\)|(?<![\d.])\d{1,2}\s*\.\s")
 
 _ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
           "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12}
+_LETTER = {chr(ord("a") + i): i + 1 for i in range(26)}
 
 
-def _mark_value(text: str) -> int | None:
-    """把 (iv) / 7. 这样的编号转成序号。认不出返回 None。"""
-    core = text.strip().strip("().． ").strip()
+def _mark_value(text: str, alphabetic: bool = False) -> int | None:
+    """把 (iv) / 7. / (c) 这样的编号转成序号。认不出返回 None。
+
+    `alphabetic` 决定单个字母按哪套算：(i) 在罗马编号里是 1，
+    在字母编号里是第 9 个。两种解释都试一遍，谁能连成序列就用谁。
+    """
+    core = text.strip().strip("().． ").strip().lower()
     if core.isdigit():
         return int(core)
-    return _ROMAN.get(core.lower())
+    if alphabetic and len(core) == 1:
+        return _LETTER.get(core)
+    return _ROMAN.get(core)
+
+
+def _consecutive_marks(section: str, alphabetic: bool) -> list:
+    """找出真正连号的那串编号。接不上序列的一律不算。"""
+    marks, expected = [], None
+    for m in _MARK.finditer(section):
+        value = _mark_value(m.group(0), alphabetic)
+        if value is None:
+            continue
+        if expected is None:
+            if value != 1:          # 条目总是从 1 / i / a 开始
+                continue
+            marks.append(m)
+            expected = 2
+        elif value == expected:
+            marks.append(m)
+            expected += 1
+    return marks
 
 
 def _split_items(section: str) -> list[str]:
     """把「价值比较」一节按编号拆成一条条。
 
-    三份样本用了两种编号：(i)(ii)…（1417、00195）和 1. 2. 3.（3336）。
+    实测三种编号：(i)(ii)…（1417 / 00195 / 02362）、1. 2. 3.（3336）、
+    (a)(b)(c)…（01875 東曜藥業）。
 
     ⚠️ 条文内部本身就带括号数字，会伪装成条目编号：
         「前五(5)個連續交易日」「前三十(30)個連續交易日」
@@ -406,26 +452,22 @@ def _split_items(section: str) -> list[str]:
     劈错的后果不只是漏抽 —— 两条粘在一起时锚点会判成错的那个，
     产出一个看起来正常的错数字。
 
-    判据用「必须连号」：真条目是 1,2,3… 或 i,ii,iii…，逐个递增；
-    夹在句子里的 (5) (10) (30) (i) (ii) 接不上序列，一律不算。
+    判据用「必须连号」：真条目是 1,2,3… 或 i,ii,iii… 或 a,b,c…，逐个
+    递增；夹在句子里的 (5) (10) (30) (i) (ii) 接不上序列，一律不算。
+
+    罗马和字母两套解释在 (i) 上撞车（罗马的 1 ＝ 字母的第 9 个），
+    所以两套各切一遍，谁切出来的条目多就用谁 —— 连号本身就是判据，
+    接不上的那套自然切不出东西。
     """
-    candidates = [(m, _mark_value(m.group(0))) for m in _MARK.finditer(section)]
+    best: list = []
+    for alphabetic in (False, True):
+        marks = _consecutive_marks(section, alphabetic)
+        if len(marks) > len(best):
+            best = marks
 
-    marks, expected = [], None
-    for m, value in candidates:
-        if value is None:
-            continue
-        if expected is None:
-            if value != 1:          # 条目总是从 1 或 i 开始
-                continue
-            marks.append(m)
-            expected = 2
-        elif value == expected:
-            marks.append(m)
-            expected += 1
-
-    if not marks:
+    if not best:
         return [section]
+    marks = best
     items = []
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(section)
@@ -538,6 +580,11 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
             stated_pct=pct.group(2),
             stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
             page=page_at(pos), quote=item.strip()[:220]))
+
+    # 小标题在、但一条都没切出来 → 多半是表格排版（08439 就是），
+    # 换一套读法再试一次。绝不放着一个「有小标题却零条比较」的结果不管。
+    if not out:
+        out = _comparisons_from_table(section, page_at(0))
     return out
 
 
@@ -557,6 +604,41 @@ def _build(clause: str, page: int) -> Comparison | None:
         stated_pct=pct.group(2),
         stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
         page=page, quote=clause.strip()[:220])
+
+
+# 表格形式的价值比较。08439 新百利就是这么排的 —— 一张表，不是一句句话。
+# 扁平化之后长这样（列头和折行的字都混在里面）：
+#
+#   (vi) 於2026年4月28日（最後交易日） 0.860 (4.9)% 6.7%
+#   (ix) 直至及包括最後交易日的三十(30)個交易日 0.581 40.8% 58.0%
+#
+# 三处和句子形式不一样，缺一条都抽不出来：
+#   · 基准价**不带「港元」**，就是个光秃秃的数字；
+#   · 没有「溢價／折讓」两个字，靠**括号**表示负数：(4.9)% 是折让 4.9%；
+#   · 后面还跟着第二个百分比（计入特别股息后的口径），要的是**第一个**。
+_TABLE_ROW = re.compile(
+    r"(?P<bench>\d+\.\d{2,4})\s*(?P<neg>[（(])?\s*(?P<pct>\d+\.?\d*)\s*[)）]?\s*%")
+
+
+def _comparisons_from_table(section: str, page: int) -> list[Comparison]:
+    """把表格排版的价值比较捞出来。"""
+    out: list[Comparison] = []
+    for item in _split_items(section):
+        m = _TABLE_ROW.search(item)
+        if not m:
+            continue
+        anchor, window = _classify(item)
+        if anchor == "unknown" and window == "unknown":
+            continue
+        bench = m.group("bench")
+        out.append(Comparison(
+            anchor=anchor, window=window,
+            benchmark=bench, benchmark_decimals=_decimals(bench),
+            benchmark_is_exact=True,          # 表格里印的就是精确值
+            stated_pct=m.group("pct"),
+            stated_direction=DISCOUNT if m.group("neg") else PREMIUM,
+            page=page, quote=item.strip()[:220]))
+    return out
 
 
 def _comparisons_from_scan(joined: str, page_of: dict[int, int]) -> list[Comparison]:
@@ -859,27 +941,41 @@ _AMOUNT = rf"(?P<num>[\d,]+\.?\d*)\s*(?P<unit>{_UNIT_ALT})?\s*港元"
 #
 # 口径始终是同一个（你那句判别口诀）：这笔钱付给谁？
 # 付给接纳要约的公众股东的才算，付给特定卖方的不算。
+# ⚠️⚠️ 这一段是这个文件里最反复踩的坑，值得写清楚。
+#
+# 「每股 X 港元」和「總代價 X 港元」在正则眼里长得几乎一样，而**总额和
+# 单价差着上亿倍**。抽错了不会报错，只会在表里留一个荒谬但看着正常的数。
+# 实跑里已经栽过三次，每次都是同一个病，只是换了个措辞：
+#
+#   02362  「要約的總價值根據要約價每股要約股份0.01港元計算」  → 抽成 0.01
+#   08439  「計及…最高金額後每股要約股份應收總額0.918港元」    → 抽成 0.918
+#   02362  「倘要約獲悉數接納，按每股要約股份0.01港元計算」      → 抽成 0.01
+#
+# 前两次我只在**出事的那一条**正则上加了 (?!每股)，于是下一条措辞又中招。
+# 这次改成：所有正则共用同一个「不许跨过每股」的间隔件 _GAP。
+# 一条总代价的措辞里出现「每股」，那个数就一定是单价，不是总额 ——
+# 这是口径决定的，不是个案。
+_GAP = r"(?:(?!每股|每份)[^0-9。；])"
+
 _DEAL_SIZE = [
     # 「須支付的最高現金代價約為5,440萬港元」
     # 「應付之最高現金金額為1,905,849,908.60港元」
     re.compile(rf"最高(?:現金)?(?:總)?(?:代價|金額|價值|款項|總額)"
-               rf"[^0-9]{{0,24}}?{_AMOUNT}"),
-    # 「須支付的最高總代價」这种把「最高」和名词拆开的写法
-    re.compile(rf"(?:應付|須支付|需支付|須付|所需)[^0-9]{{0,12}}?最高"
-               rf"[^0-9]{{0,24}}?{_AMOUNT}"),
+               rf"{_GAP}{{0,24}}?{_AMOUNT}"),
+    # 「須支付的最高總代價」这种把「最高」和名词拆开的写法。
+    # 「需要支付最高達52,007,328港元」（01633）—— 認「需要／須要」，
+    # 只写「需支付」会漏掉多一个「要」字的那种。
+    re.compile(rf"(?:應付|須支付|需支付|須要支付|需要支付|支付|須付|所需)"
+               rf"{_GAP}{{0,12}}?最高{_GAP}{{0,24}}?{_AMOUNT}"),
     # 「須支付的現金代價總額為92,000,000港元」
-    re.compile(rf"(?:現金)?(?:代價|款項)總額[^0-9]{{0,24}}?{_AMOUNT}"),
+    # 「應付的總現金代價將為7,000,000港元」（02362）
+    re.compile(rf"(?:總)?(?:現金)?(?:代價|款項)(?:總額|總代價)?"
+               rf"(?:將)?為{_GAP}{{0,12}}?{_AMOUNT}"),
     # 「倘要約獲悉數接納，應付總額約為…」
-    #
-    # ⚠️ 这条最松，必须挡住「每股」——「倘要約獲悉數接納，按每股要約股份
-    # 0.01港元計算」会被它抓成交易规模 0.01。实跑里 02362 金川國際那单
-    # 的交易规模就是这么变成 0.01 的（答案是 7,000,000）。
-    # 每股价永远不是交易规模：一个是单价，一个是总额。
-    re.compile(rf"(?:悉數接納|全數接納|全部接納)"
-               rf"((?:(?!每股)[^。；]){{0,60}}?){_AMOUNT}"),
+    re.compile(rf"(?:悉數接納|全數接納|全部接納){_GAP}{{0,60}}?{_AMOUNT}"),
     # 「要約項下之總代價約為…」
     re.compile(rf"要約(?:項下)?(?:之|的)?(?:總代價|總價值)"
-               rf"[^0-9]{{0,24}}?{_AMOUNT}"),
+               rf"{_GAP}{{0,24}}?{_AMOUNT}"),
 ]
 
 
