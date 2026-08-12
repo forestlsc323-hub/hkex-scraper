@@ -58,7 +58,12 @@ def test_the_pool_still_works_after_a_timeout(monkeypatch):
         with pytest.raises(parsepool.ParseTimeout):
             pool.parse("stuck.pdf", b"%PDF-1.4")
 
-        # 换回真的解析器，后面这份必须正常出结果
+        # 换回真的解析器，后面这份必须正常出结果。
+        # ⚠️ 超时之后那个槽是**新起的**进程，它的第一份活要先把解析库
+        # import 一遍（spawn 的代价），这段时间算在超时里。生产上超时是
+        # 90 秒，这点开销无所谓；测试里为了让第一份快点超时用了 1 秒，
+        # 所以这里得把表调回正常值，否则测的是 spawn 快不快，不是池子还能不能用。
+        pool.timeout = 60
         monkeypatch.setattr(parsepool, "_worker", _real_worker())
         doc = pool.parse("ok.pdf", make_pdf(["hello world"]), min_text_chars=1)
         assert doc.pages

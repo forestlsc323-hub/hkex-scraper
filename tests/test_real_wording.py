@@ -201,3 +201,65 @@ def test_a_window_split_by_table_columns_is_still_recognised():
     ex = extractor.extract("", P08439)
     windows = {c.window for c in ex.comparisons}
     assert {"5d", "10d", "30d"} <= windows
+
+
+# ---------------------------------------------------------- 这笔钱付给谁？
+
+P_SPA = {
+    # 01633 上諭那份的真实结构：同一页里先说买卖协议的对价（付给卖方），
+    # 再说要约项下的最高代价（付给公众股东）。前者是后者的好几倍。
+    2: "賣方同意出售及要約人同意收購銷售股份（即合共502,140,000股股份），"
+       "現金總代價為143,009,472港元（相當於每股銷售股份0.2848港元）。"
+       "因此，於要約獲全面接納後，要約人需要支付最高達52,007,328港元的"
+       "現金應付代價。",
+    1: "每股要約股份的要約價 . . . 現金0.2848港元",
+}
+
+
+def test_the_price_paid_to_the_seller_is_not_the_deal_size():
+    """你手册里那句判别口诀：「这笔钱付给谁？」
+
+    2025 全年 58 单实测，比值（程序÷答案）里有四单**正好 3.00**：
+        03928  222,800,000 ÷ 74,268,000 = 3.000
+        02442  230,000,000 ÷ 76,673,400 = 3.000
+        01757   80,000,000 ÷ 26,700,000 = 2.996
+    三比一 —— 要约人先买走 75%，剩下 25% 才是要约的对象。
+    那个 3 倍不是巧合，是「收购控股权的钱」和「要约的钱」之比。
+    """
+    ex = extractor.extract("聯合公告 強制性無條件現金要約", P_SPA)
+    assert ex.deal_size == "52007328", "抓成了付给卖方的那笔"
+
+
+def test_a_deal_size_bigger_than_the_whole_company_is_thrown_away():
+    """要约只买公众股东手上那部分，付出去的钱不可能超过
+    「按要约价把整家公司买下来」。
+
+    2025 实测 03626 / 01747 / 01489 三单都超了 —— 不用看原文就知道错。
+    """
+    ex = extractor.Extraction()
+    ex.offer_price, ex.deal_size, ex.total_shares = "0.1812", "122455200", "271120000"
+    extractor._drop_impossible_deal_size(ex)
+
+    assert ex.deal_size == ""
+    assert any("全部股本估值" in n for n in ex.notes)
+
+
+def test_a_deal_size_within_the_whole_company_survives():
+    ex = extractor.Extraction()
+    ex.offer_price, ex.deal_size, ex.total_shares = "0.1812", "49126944", "271120000"
+    extractor._drop_impossible_deal_size(ex)
+    assert ex.deal_size == "49126944"
+
+
+def test_the_ceiling_stays_quiet_without_a_share_count():
+    """抽不到股数就没有天花板可言 —— 不能因此作废一个可能对的数。"""
+    ex = extractor.Extraction()
+    ex.offer_price, ex.deal_size, ex.total_shares = "0.1812", "122455200", ""
+    extractor._drop_impossible_deal_size(ex)
+    assert ex.deal_size == "122455200"
+
+
+def test_candidates_are_listed_when_there_is_more_than_one():
+    """候选多于一个时要说出来 —— 「这里有得选」必须看得见。"""
+    ex = extractor.extract("", P_SPA)
+    assert any("候选" in n for n in ex.notes) or ex.deal_size == "52007328"

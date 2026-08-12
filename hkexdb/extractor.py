@@ -309,6 +309,13 @@ def looks_like_offer(pages: dict[int, str]) -> bool:
 _MIN_SHARES_IN_A_DEAL = 1000
 
 
+def _num_or_none(value):
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _drop_impossible_deal_size(result) -> None:
     """总代价不可能等于每股价。对不上就把规模清掉，绝不留一个假数。
 
@@ -326,6 +333,19 @@ def _drop_impossible_deal_size(result) -> None:
         result.notes.append(
             f"抽到的交易规模 {result.deal_size} 与每股 {result.offer_price} "
             f"港元不相称（总代价不可能这么接近每股价），已作废，需人工读原文")
+        result.deal_size = ""
+        result.deal_size_evidence = Evidence()
+        return
+
+    # 天花板：要约只买公众股东手上那部分，付出去的钱不可能超过
+    # 「按要约价把整家公司买下来」。超了就是抓到了别的东西 ——
+    # 2025 实测 03626 / 01747 / 01489 三单都超了，不用看原文就知道错。
+    shares = _num_or_none(result.total_shares)
+    if shares and size > price * shares * 1.01:
+        whole = price * shares
+        result.notes.append(
+            f"抽到的交易规模 {result.deal_size} 超过按要约价计的全部股本估值 "
+            f"{whole:,.0f}（要约买不到比整家公司还多），已作废，需人工读原文")
         result.deal_size = ""
         result.deal_size_evidence = Evidence()
 
@@ -990,6 +1010,33 @@ def _amount_of(m) -> str:
     return raw if not unit_char else f"{float(raw) * _UNIT[unit_char]:.0f}"
 
 
+# 「这笔钱付给谁？」—— 你手册里的判别口诀，这里是它的机器实现。
+#
+# 一份要约公告里最大的那个数字，往往是**买卖协议项下收购控股权**的对价，
+# 那笔钱付给特定卖方，不是付给接纳要约的公众股东，所以不是交易规模。
+#
+# 2025 全年 58 单实测，比值（程序÷答案）里有四单**正好 3.00**：
+#     03928 中國新零售  222,800,000 ÷ 74,268,000 = 3.000
+#     02442 怡俊集團    230,000,000 ÷ 76,673,400 = 3.000
+#     01757 俊裕地基     80,000,000 ÷ 26,700,000 = 2.996
+#     03626 HSSP       195,000,000 ÷ 65,044,000 = 2.998
+# 三比一 —— 要约人先买走 75%，剩下 25% 才是要约的对象。
+# 那个 3 倍不是巧合，是「收购控股权的钱」和「要约的钱」之比。
+_SELLER_SIDE = re.compile(
+    r"銷售股份|待售股份|買賣協議|賣方|出售股份|轉讓股份|收購事項項下")
+_OFFER_SIDE = re.compile(r"要約項下|根據要約|接納要約|要約獲|要約的最高|要約應付")
+
+
+def _paid_to_the_seller(flat: str, at: int) -> bool:
+    """这处金额讲的是不是「付给卖方」那一笔。
+
+    看它前面那段话：提到销售股份／买卖协议／卖方，而又没有说这是要约
+    项下的，那就是控股权转让的对价 —— 口径完全不同，不能当交易规模。
+    """
+    before = flat[max(0, at - 90):at]
+    return bool(_SELLER_SIDE.search(before)) and not _OFFER_SIDE.search(before)
+
+
 def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
     """一份公告里所有像「交易规模」的数。返回 [(金额, 页码, 引文)]。
 
@@ -1016,6 +1063,8 @@ def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
                 if amount in seen:
                     continue
                 seen.add(amount)
+                if _paid_to_the_seller(flat, m.start()):
+                    continue          # 付给卖方的，不是要约规模
                 start = max(0, m.start() - 40)
                 out.append((amount, page, flat[start:m.end() + 10].strip()))
     return out
