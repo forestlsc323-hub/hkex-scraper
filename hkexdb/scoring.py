@@ -180,16 +180,23 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
     同一家公司可能有两单不同的要约（02362 就是 MGO + PO），所以按代码
     分组之后仍要一对一配，每个程序行只能被用掉一次。
     """
+    # 两边的代码都过一遍规范化 —— deals.csv 里也有「01117<br/>01432」
+    # 这种双代码的行（镜像归档），不统一就配不上。
     pool: dict[str, list] = {}
     for row in got_rows:
-        pool.setdefault(str(row.get("股票代码", "")).strip(), []).append(row)
+        # 双代码的行挂在两个代码下面，配上哪个都算
+        for code in codes_in(row.get("股票代码", "")) or [""]:
+            pool.setdefault(code, []).append(row)
+    used: set[int] = set()
 
     pairs, misses = [], []
     for want in sorted(answer_rows, key=lambda r: str(r.get("公告日期", ""))):
-        code = str(want.get("股票代码", "")).strip()
+        code = normalise_code(want.get("股票代码", ""))
         want_date = _date(want)
         best, best_gap = None, None
         for cand in pool.get(code, []):
+            if id(cand) in used:
+                continue
             gap = 0
             cand_date = _date(cand)
             if want_date and cand_date:
@@ -201,10 +208,17 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
         if best is None:
             misses.append(want)
         else:
-            pool[code].remove(best)
+            used.add(id(best))
             pairs.append((want, best, best_gap or 0))
 
-    leftovers = [r for rows in pool.values() for r in rows]
+    seen_left: set[int] = set()
+    leftovers = []
+    for rows in pool.values():
+        for row in rows:
+            if id(row) in used or id(row) in seen_left:
+                continue
+            seen_left.add(id(row))
+            leftovers.append(row)
     return pairs, misses, leftovers
 
 
@@ -245,9 +259,72 @@ def write_template(columns: list[str], path: Path) -> Path:
     return path
 
 
+# 答案表的列名别名。你自己那张表用的是投行习惯的叫法，
+# deals.csv 用的是这个程序的叫法 —— 两边对不上就一条都配不上，
+# 而报告只会显示「一单都没对上」，看不出是列名的问题。
+#
+# 与其让你每次导出都手工改一遍表头，不如程序认得这些叫法。
+_ALIASES = {
+    "股份代码": "股票代码", "股份代號": "股票代码", "代码": "股票代码",
+    "股份代码（规范）": "股票代码", "股份代码(规范)": "股票代码",
+    "首次公告日期": "公告日期", "T0": "公告日期", "日期": "公告日期",
+    "溢价率": "主值溢价率(%)", "溢價率": "主值溢价率(%)",
+    "主值溢价率": "主值溢价率(%)",
+    "交易规模": "交易规模(HKD)", "交易規模": "交易规模(HKD)",
+    "要约价": "要约价(HKD)", "要約價": "要约价(HKD)",
+    "要约类": "要约类型", "类型": "要约类型",
+    "公司简称": "受要约方", "公司名称": "受要约方",
+}
+
+
+def normalise_code(value: str) -> str:
+    """股票代码统一成 5 位。
+
+    同一家公司在你表里可能写 195 / 0195.HK / 00195，在 deals.csv 里是
+    00195 —— 不统一的话它们是三个不同的键，一单都配不上。
+    """
+    text = str(value or "").strip().upper()
+    text = text.split(".HK")[0].split("<")[0].strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits.zfill(5)[-5:] if digits else ""
+
+
+def codes_in(value: str) -> list[str]:
+    """一行里所有的股票代码。
+
+    deals.csv 里镜像归档那些行是「01117<br/>01432」这种双代码 ——
+    一行同时讲两家公司，所以它应该能配上其中**任何一个**。
+    """
+    import re as _re
+    seen, out = set(), []
+    for chunk in _re.split(r"[^0-9A-Za-z.]+", str(value or "")):
+        code = normalise_code(chunk)
+        if code and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def normalise_row(row: dict) -> dict:
+    """把一行答案表整理成程序认得的样子：列名、代码、百分号。"""
+    out: dict = {}
+    for key, value in row.items():
+        name = _ALIASES.get(str(key).strip(), str(key).strip())
+        # 别名撞车时不覆盖已有的正式列（表里同时有「股票代码」和「股份代码」）
+        if name in out and str(out[name]).strip():
+            continue
+        out[name] = value
+    if out.get("股票代码"):
+        out["股票代码"] = normalise_code(out["股票代码"])
+    for col in ("主值溢价率(%)", "交易规模(HKD)", "要约价(HKD)"):
+        if col in out:
+            out[col] = str(out[col] or "").replace("%", "").replace(",", "").strip()
+    return out
+
+
 def load(path: Path) -> list[dict]:
     from .dealsview import load_rows
-    return load_rows(path)
+    return [normalise_row(r) for r in load_rows(path)]
 
 
 # ---------------------------------------------------------------- 答案表自检

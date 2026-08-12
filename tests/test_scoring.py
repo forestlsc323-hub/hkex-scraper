@@ -236,3 +236,46 @@ def test_an_ordinary_difference_gets_no_made_up_explanation():
     assert scoring._hint("266329230", "66833690") == ""
     assert scoring._hint("", "123") == ""
     assert scoring._hint("MGO", "PO") == ""
+
+
+# ------------------------------------------------- 答案表：认得你自己的叫法
+
+def test_your_own_column_names_are_accepted(tmp_path):
+    """你那张 2025 年的表用的是投行习惯的列名，deals.csv 用的是程序的叫法。
+
+    两边对不上就一条都配不上，而报告只会显示「一单都没对上」——
+    看不出是列名的问题。与其让你每次导出都手工改表头，不如程序认得。
+    """
+    path = tmp_path / "answer_key.csv"
+    path.write_text(
+        "股份代码,公司简称,首次公告日期,要约类,溢价率,交易规模\n"
+        "6808,高鑫零售,2025-01-01,MGO,2.86%,3236298104\n",
+        encoding="utf-8-sig")
+
+    rows = scoring.load(path)
+
+    assert rows[0]["股票代码"] == "06808"        # 补到 5 位
+    assert rows[0]["公告日期"] == "2025-01-01"
+    assert rows[0]["要约类型"] == "MGO"
+    assert rows[0]["主值溢价率(%)"] == "2.86"    # 百分号去掉
+    assert rows[0]["交易规模(HKD)"] == "3236298104"
+
+
+def test_a_code_written_three_ways_is_one_company():
+    """同一家公司在你表里可能写 195 / 0195.HK / 00195。"""
+    assert {scoring.normalise_code(x) for x in
+            ("195", "0195.HK", "00195", " 195 ")} == {"00195"}
+
+
+def test_the_program_side_codes_are_normalised_too():
+    """deals.csv 里有「01117<br/>01432」这种双代码行（镜像归档）。"""
+    got = [_row("01117<br/>01432", "2025-10-30", **{"要约类型": "MGO"})]
+    answer = [_row("1432", "2025-10-30", **{"要约类型": "MGO"})]
+    report = scoring.score(got, [scoring.normalise_row(r) for r in answer])
+    assert not report.missing_deals
+
+
+def test_an_official_column_is_not_clobbered_by_an_alias(tmp_path):
+    """表里同时有「股票代码」和「股份代码」时，正式那列说了算。"""
+    row = scoring.normalise_row({"股票代码": "00195", "股份代码": "999"})
+    assert row["股票代码"] == "00195"
