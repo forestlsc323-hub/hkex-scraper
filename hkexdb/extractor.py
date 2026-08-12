@@ -422,9 +422,61 @@ _SECTION_END = re.compile(r"最高(?:與|及)最低股價|財務資源|可動用
 #     平均收市價約每股股份3.18港元        （3336）
 # 只认后一种会把 3336 的 8 个基准全判成精确值，V4 的区间检验退化成等式检验，
 # 于是 11 项里 8 项报假警报 —— 这正是当初设计区间检验要避免的事。
+# 「每股」不是唯一写法。实跑里这三种都出现过，只认第一种就整单落空：
+#     …收市價每股0.115港元            （08413，最常见）
+#     …每一股份收市價12.00港元        （03389 亨得利）
+#     …的股份平均收市價0.119港元      （03389 亨得利，第 3 条）
+# 03389 那单五条比较一条都没抽出来，就是因为它通篇不写「每股」。
+_PER_SHARE = r"(?:每股|每一股份|股份)"
 _BENCHMARK = re.compile(
-    r"(約)?\s*每股[^0-9%]{0,24}?(約)?\s*([\d,]+\.?\d*)\s*(?:的)?港元")
-_PCT = re.compile(r"(溢價|折讓|折價)\s*(?:約)?(?:為)?\s*([\d.]+)\s*%")
+    rf"(約)?\s*{_PER_SHARE}[^0-9%]{{0,24}}?(約)?\s*([\d,]+\.?\d*)\s*(?:的)?港元")
+
+# 「溢價／折讓」和百分比的**前后顺序两种都有**：
+#     折讓約14.13%          （词在前，最常见）
+#     有大約0.125%之溢價    （数在前 —— 03389 全篇都是这种）
+# 只认词在前的话，03389 那五条比较全部匹配不上，整单溢价率留空。
+_PCT_WORD_FIRST = re.compile(r"(溢價|折讓|折價)\s*(?:約)?(?:為)?\s*([\d.]+)\s*%")
+_PCT_NUM_FIRST = re.compile(r"([\d.]+)\s*%\s*(?:之|的)?\s*(溢價|折讓|折價)")
+
+
+class _Pct:
+    """一处百分比：词、数、以及它在句子里的位置。"""
+
+    __slots__ = ("word", "number", "start", "end")
+
+    def __init__(self, word: str, number: str, start: int, end: int):
+        self.word, self.number = word, number
+        self.start, self.end = start, end
+
+    @property
+    def direction(self) -> str:
+        return PREMIUM if self.word == "溢價" else DISCOUNT
+
+
+def _pcts(text: str) -> list:
+    """句子里所有的「溢價/折讓 X%」，两种词序都认，按出现先后排。"""
+    found = []
+    for m in _PCT_WORD_FIRST.finditer(text):
+        found.append(_Pct(m.group(1), m.group(2), m.start(), m.end()))
+    for m in _PCT_NUM_FIRST.finditer(text):
+        # 「折讓約 14.13%」在两个正则下都会命中一次，位置重叠的算一处
+        if any(f.start < m.end() and m.start < f.end for f in found):
+            continue
+        found.append(_Pct(m.group(2), m.group(1), m.start(), m.end()))
+    found.sort(key=lambda f: f.start)
+    return found
+
+
+# 「分別」是并列句的标记：三个基准价列完再列三个百分比，一一对应关系
+# 靠语序而不是靠位置（01310 香港寬頻）。这种句子拆不安全 ——
+#     「…分別約每股3.228港元、每股2.892港元及每股2.701港元分別溢價約
+#       57.20%、75.48%及87.87%」
+# 按「最近的那个基准价」去配，第二、三条会配到错的基准上。
+# 所以只取并列开始前的那一条，其余标出来让人补（铁律二：不静默瞎配）。
+_PARALLEL = re.compile(r"分別|分别")
+
+_PARALLEL_NOTE = ("价值比较里有「分別…」并列句，只取了并列开始前的那一条，"
+                  "其余口径请人工补（拆不准就不硬拆）")
 
 _ANCHORS = [
     # ⚠️「未受干擾日」和「不受干擾日期」两种写法都有 —— 一字之差。
@@ -462,7 +514,11 @@ _WINDOWS = [
 #
 # 罗马数字和字母序号在 (i) 上撞车：i 既是罗马数字 1，也是字母表第 9 个。
 # 靠「必须连号」化解 —— 见 _split_items。
-_MARK = re.compile(r"\(\s*(?:[ivx]+|[a-z]|\d{1,2})\s*\)|(?<![\d.])\d{1,2}\s*\.\s")
+_MARK = re.compile(r"\(\s*(?:[ivx]+|[a-z]|\d{1,2})\s*\)|(?<![\d.])\d{1,2}\s*\.\s"
+                   # 00372 保德用的是不带括号的「i. ii. iii. … viii.」。
+                   # 不认它的话整节切不开，一整节当成一条 —— 于是
+                   # 第一个数字（要约价自己）成了基准价。
+                   r"|(?<![A-Za-z])[ivx]{1,4}\s*\.\s")
 
 _ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
           "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12}
@@ -593,7 +649,8 @@ def _scan_whole_document(joined: str) -> list[tuple[int, str]]:
     return out
 
 
-def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
+def extract_comparisons(pages: dict[int, str],
+                        notes: list | None = None) -> list[Comparison]:
     """抽「价值比较」。
 
     两条路：
@@ -608,7 +665,7 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
 
     start = _SECTION_START.search(joined)
     if not start:
-        return _comparisons_from_scan(joined, page_of)
+        return _comparisons_from_scan(joined, page_of, notes)
     rest = joined[start.end():]
     end = _SECTION_END.search(rest)
     section = rest[:end.start()] if end else rest[:2500]
@@ -623,48 +680,105 @@ def extract_comparisons(pages: dict[int, str]) -> list[Comparison]:
 
     out: list[Comparison] = []
     cursor = 0
+    parallel = False
     for item in _split_items(section):
         pos = section.find(item, cursor)
         cursor = pos + len(item)
+        found, skipped = _comparisons_in(item, page_at(pos))
+        out.extend(found)
+        parallel = parallel or skipped
 
-        pct = _PCT.search(item)
-        bench = _BENCHMARK.search(item)
-        if not pct or not bench:
+    # 小标题在、但一条都没切出来 → 多半是表格排版（08439 就是），
+    # 换一套读法再试一次。绝不放着一个「有小标题却零条比较」的结果不管。
+    if not out:
+        out = _comparisons_from_table(section, page_at(0))
+    if parallel and notes is not None:
+        notes.append(_PARALLEL_NOTE)
+    return out
+
+
+def _note_alternative_prices(result) -> None:
+    """一份公告给了**两套要约价**时，说出来。
+
+    06808 高鑫零售同时列了两个价：1.58 港元（部分遞延結算替代方案下的
+    最高代价）和 1.38 港元（全額預付替代方案），于是同一套锚点／窗口
+    各出现两遍，百分比一套一个样。程序按先出现的那套取值（1.58），
+    而你的答案取的是 1.38 那套。
+
+    只有一份样本，定不出「该取哪一套」的规则，所以不猜 —— 但也不能
+    装作没看见：把重复的那一套摆到备注里，看表的人一眼知道这单有分叉。
+
+    ⚠️ 判据必须是「**整条梯子**重复了一遍」，不是「有两个数字撞了」。
+    按后者写的第一版在 12 单里报了 8 单，全是误报：
+      · 每股净资产天然有两条（经审核 + 未经审核，两个结算日）；
+      · 窗口认不出来的那几条（120日均价、最後實際可行日期）都落进
+        「收市价」，于是和真正的收市价撞车。
+    一条 12 单里响 8 次的提醒，只会教会人忽略「备注」这一列。
+    """
+    seen: dict[tuple[str, str], str] = {}
+    clash: list[str] = []
+    for c in result.comparisons:
+        if c.anchor == "nav":
+            continue          # 经审核/未经审核两条净资产是常态，不算分叉
+        key = (c.anchor, c.window)
+        if key in seen and seen[key] != c.stated_pct:
+            if not any(x.startswith(c.label) for x in clash):
+                clash.append(f"{c.label} {seen[key]}% / {c.stated_pct}%")
+        else:
+            seen.setdefault(key, c.stated_pct)
+    if len(clash) >= 3:
+        result.notes.append(
+            "本单像是列了两套要约价（替代方案）：整条梯子出现了两遍 —— "
+            + "、".join(clash[:3]) + "。主值取的是先出现的那套，请核原文")
+
+
+def _comparisons_in(item: str, page: int) -> tuple[list[Comparison], bool]:
+    """一条（可能含多项）比较文字 → 若干 Comparison。
+
+    ⚠️ 基准价取的是**百分比左边最近的那一个**，不是这段话里的第一个。
+    01310 香港寬頻那句话以「經調整要約價每股5.075港元較…」开头 ——
+    按「第一个」取，要约价自己成了基准价，溢价率算在自己头上，
+    而结果看起来完全正常。
+
+    返回 (抽到的, 有没有因为并列句而放弃的)。
+    """
+    out: list[Comparison] = []
+    benches = list(_BENCHMARK.finditer(item))
+    if not benches:
+        return out, False
+
+    pcts = _pcts(item)
+    skipped = False
+    prev_end = 0
+    for p in pcts:
+        left = [b for b in benches if b.end() <= p.start]
+        if not left:
             continue
-        anchor, window = _classify(item)
+        bench = left[-1]
+        # 「分別」＝并列句，基准价和百分比按语序一一对应，位置配不准
+        if _PARALLEL.search(item[bench.end():p.start]):
+            skipped = True
+            continue
+        # 一条里只有一处百分比时按整条判锚点（沿用原来的行为）；
+        # 有多处时各判各的，否则后面那条的「30個交易日」会污染前面那条。
+        scope = item if len(pcts) == 1 else item[prev_end:p.end]
+        prev_end = p.end
+        anchor, window = _classify(scope)
         number = bench.group(3).replace(",", "")
         approx = bench.group(1) is not None or bench.group(2) is not None
         out.append(Comparison(
             anchor=anchor, window=window,
             benchmark=number, benchmark_decimals=_decimals(number),
             benchmark_is_exact=not approx,   # 「約」在哪一侧都算约整值
-            stated_pct=pct.group(2),
-            stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
-            page=page_at(pos), quote=item.strip()[:220]))
-
-    # 小标题在、但一条都没切出来 → 多半是表格排版（08439 就是），
-    # 换一套读法再试一次。绝不放着一个「有小标题却零条比较」的结果不管。
-    if not out:
-        out = _comparisons_from_table(section, page_at(0))
-    return out
+            stated_pct=p.number, stated_direction=p.direction,
+            page=page, quote=item.strip()[:220]))
+    return out, skipped
 
 
 def _build(clause: str, page: int) -> Comparison | None:
     """一句 → 一条比较项。抽不齐就返回 None，绝不半拉子入表。"""
-    pct = _PCT.search(clause)
-    bench = _BENCHMARK.search(clause)
-    if not pct or not bench:
-        return None
-    number = bench.group(3).replace(",", "")
-    approx = bench.group(1) is not None or bench.group(2) is not None
-    anchor, window = _classify(clause)
-    return Comparison(
-        anchor=anchor, window=window,
-        benchmark=number, benchmark_decimals=_decimals(number),
-        benchmark_is_exact=not approx,
-        stated_pct=pct.group(2),
-        stated_direction=PREMIUM if pct.group(1) == "溢價" else DISCOUNT,
-        page=page, quote=clause.strip()[:220])
+    found, _ = _comparisons_in(clause, page)
+    return found[0] if found else None
 
 
 # 表格形式的价值比较。08439 新百利就是这么排的 —— 一张表，不是一句句话。
@@ -678,7 +792,10 @@ def _build(clause: str, page: int) -> Comparison | None:
 #   · 没有「溢價／折讓」两个字，靠**括号**表示负数：(4.9)% 是折让 4.9%；
 #   · 后面还跟着第二个百分比（计入特别股息后的口径），要的是**第一个**。
 _TABLE_ROW = re.compile(
-    r"(?P<bench>\d+\.\d{2,4})\s*(?P<neg>[（(])?\s*(?P<pct>\d+\.?\d*)\s*[)）]?\s*%")
+    # ⚠️ 基准价后面必须紧跟空白或左括号。少了这个前瞻，「0.125%」会被
+    # 拆成基准 0.12 ＋ 百分比 5 —— 一条凭空捏出来的比较，且看着很正常。
+    r"(?P<bench>\d+\.\d{2,4})(?=[\s（(])"
+    r"\s*(?P<neg>[（(])?\s*(?P<pct>\d+\.?\d*)\s*[)）]?\s*%")
 
 
 def _comparisons_from_table(section: str, page: int) -> list[Comparison]:
@@ -702,8 +819,14 @@ def _comparisons_from_table(section: str, page: int) -> list[Comparison]:
     return out
 
 
-def _comparisons_from_scan(joined: str, page_of: dict[int, int]) -> list[Comparison]:
-    """兜底：没有小标题时按形状全文捞。"""
+def _comparisons_from_scan(joined: str, page_of: dict[int, int],
+                           notes: list | None = None) -> list[Comparison]:
+    """兜底：没有小标题时按形状全文捞。
+
+    ⚠️ 并列句的提醒在这条路上也要发出来。01310 香港寬頻恰恰是
+    「没有小标题」**且**「一句话里塞了四条比较」—— 两个毛病同时犯，
+    而只在有小标题那条路上写备注的话，正好漏掉它。
+    """
     def page_at(pos: int) -> int:
         best = 0
         for at, page in sorted(page_of.items()):
@@ -713,16 +836,19 @@ def _comparisons_from_scan(joined: str, page_of: dict[int, int]) -> list[Compari
 
     out: list[Comparison] = []
     seen: set[tuple[str, str, str]] = set()
+    parallel = False
     for pos, clause in _scan_whole_document(joined):
-        cmp_ = _build(clause, page_at(pos))
-        if cmp_ is None:
-            continue
-        # 同一条比较可能在摘要和正文各出现一次，去重
-        key = (cmp_.anchor, cmp_.window, cmp_.stated_pct)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(cmp_)
+        found, skipped = _comparisons_in(clause, page_at(pos))
+        parallel = parallel or skipped
+        for cmp_ in found:
+            # 同一条比较可能在摘要和正文各出现一次，去重
+            key = (cmp_.anchor, cmp_.window, cmp_.stated_pct)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cmp_)
+    if parallel and notes is not None:
+        notes.append(_PARALLEL_NOTE)
     return out
 
 
@@ -1144,7 +1270,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
 
     result.offer_type, result.offer_type_evidence = extract_offer_type(title, pages)
     result.offer_price, result.offer_price_evidence = extract_offer_price(pages)
-    result.comparisons = extract_comparisons(pages)
+    result.comparisons = extract_comparisons(pages, result.notes)
     result.six_month_low, result.six_month_high, result.six_month_evidence = \
         extract_six_month(pages)
     result.deal_size, result.deal_size_evidence = extract_deal_size(pages)
@@ -1171,6 +1297,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         result.notes.append("要约类型未识别，需人工判定")
     if not result.comparisons:
         result.notes.append("未找到「價值比較」一节，溢价率无法抽取")
+    _note_alternative_prices(result)
     if not result.deal_size:
         result.notes.append("交易规模未识别")
     if not result.offeror:

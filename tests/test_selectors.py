@@ -80,16 +80,80 @@ def test_single_anchor_deals_fall_back_to_last_trading_day():
         assert pick.signed_pct == expected
 
 
-def test_selector_returns_none_rather_than_guessing():
-    """没有 30 日均价这一项时宁可不给答案，不许退而求其次。
+def test_no_thirty_day_falls_back_but_says_which_window_it_used():
+    """没有 30 日均价时退到更短的窗口 —— 但**口径必须跟着变**。
 
-    静默降级会把一个「对最後交易日收市价」的数悄悄写进
-    「30 日均价溢价率」字段 —— 正是铁律二说的静默污染。
+    ⚠️ 这条规则改过一次。原来是「宁可不给答案」，理由是怕把一个
+    「对收市价」的数悄悄写进「30 日均价」字段。那个顾虑是对的，但
+    解法用错了：只要口径和数字同列显示，退档就不是静默降级。
+    改的依据是你答案表里两单（都是公告本身没印 30 日）：
+        01833 平安好醫生 -4.23% ← 前10日均价
+        01980 天鴿互動   +2.10% ← 前5日均价
+    留空的做法把这两单算成「抽不出」，而它们其实抽得出。
     """
     only_spot = [{"label": "收市价", "anchor": "last_trading_day", "window": "spot",
                   "stated_pct": "10.00", "stated_direction": "premium",
                   "page": 1, "quote": "x"}]
-    assert selectors.select_primary_premium(only_spot) is None
+    pick = selectors.select_primary_premium(only_spot)
+    assert pick.signed_pct == Decimal("10.00")
+    assert pick.window == "spot" and pick.label == "收市价"
+    assert pick.fell_back
+
+
+def test_the_fallback_ladder_prefers_the_longest_window_available():
+    def item(window, pct):
+        return {"label": window, "anchor": "last_trading_day", "window": window,
+                "stated_pct": pct, "stated_direction": "premium",
+                "page": 1, "quote": "x"}
+
+    both = [item("spot", "1"), item("5d", "2"), item("10d", "3")]
+    assert selectors.select_primary_premium(both).window == "10d"
+    assert selectors.select_primary_premium(both[:2]).window == "5d"
+
+
+def test_the_fallback_can_be_switched_off():
+    """关掉退档就回到老行为：只认 30 日，别的一律留空。"""
+    only_spot = [{"label": "收市价", "anchor": "last_trading_day", "window": "spot",
+                  "stated_pct": "10.00", "stated_direction": "premium",
+                  "page": 1, "quote": "x"}]
+    assert selectors.select_primary_premium(only_spot, fallback=()) is None
+
+
+def test_a_thirty_day_item_is_never_displaced_by_the_fallback():
+    """有 30 日就必须用 30 日 —— 退档只在缺口时生效。"""
+    rows = [{"label": "收市价", "anchor": "last_trading_day", "window": "spot",
+             "stated_pct": "1", "stated_direction": "premium", "page": 1, "quote": "x"},
+            {"label": "前30日均价", "anchor": "last_trading_day", "window": "30d",
+             "stated_pct": "2", "stated_direction": "premium", "page": 1, "quote": "x"}]
+    pick = selectors.select_primary_premium(rows)
+    assert pick.window == "30d" and not pick.fell_back
+
+
+def test_the_other_anchor_in_the_same_window_is_carried_along():
+    """08439 / 3336 那个争议：选了一个，另一个也要能看见。"""
+    rows = [{"label": "未受干扰日前30日均价", "anchor": "undisturbed", "window": "30d",
+             "stated_pct": "129.8", "stated_direction": "premium",
+             "page": 1, "quote": "x"},
+            {"label": "最后交易日前30日均价", "anchor": "last_trading_day",
+             "window": "30d", "stated_pct": "40.8", "stated_direction": "premium",
+             "page": 1, "quote": "x"}]
+    pick = selectors.select_primary_premium(rows)
+    assert pick.anchor == "undisturbed"
+    assert pick.other_anchor == "最后交易日前30日均价" and pick.other_pct == "40.8"
+
+
+def test_flipping_the_anchor_priority_flips_the_pick():
+    """口径之争是配置项，不是常量 —— 改 config.yaml 就能翻过来。"""
+    rows = [{"label": "未受干扰日前30日均价", "anchor": "undisturbed", "window": "30d",
+             "stated_pct": "129.8", "stated_direction": "premium",
+             "page": 1, "quote": "x"},
+            {"label": "最后交易日前30日均价", "anchor": "last_trading_day",
+             "window": "30d", "stated_pct": "40.8", "stated_direction": "premium",
+             "page": 1, "quote": "x"}]
+    pick = selectors.select_primary_premium(
+        rows, anchor_priority=("last_trading_day", "undisturbed", "pre_rule37"))
+    assert pick.signed_pct == Decimal("40.8")
+    assert pick.other_anchor == "未受干扰日前30日均价"
 
 
 def test_unknown_anchor_is_not_silently_accepted():

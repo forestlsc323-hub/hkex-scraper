@@ -106,6 +106,7 @@ CASES = [
 # 所以这批文本必须一字不改地留在测试里：它们是这一层现在唯一的地面。
 # ================================================================
 
+from decimal import Decimal                  # noqa: E402
 from hkexdb import extractor, selectors      # noqa: E402
 
 
@@ -311,3 +312,166 @@ def test_the_price_gate_also_uses_the_comparison_benchmarks():
 
     extractor._drop_impossible_offer_price(ex)
     assert ex.offer_price == ""
+
+
+# ========================================================== 第二批：又四种措辞
+#
+# 这四单来自 2025 全年那份原文摘录。每一单都卡在一个**不同的**地方，
+# 而卡住的方式一模一样：抽不出比较项 → 溢价率整单留空。
+
+# 03389 亨得利 —— 两处和别家都不一样：
+#   · 百分比在前、「溢價」在后：「有大約0.125%之溢價」
+#   · 通篇不写「每股」，写「每一股份」和「股份平均收市價」
+# 两条叠在一起，五条比较一条都抽不出来。
+P03389 = {
+    5: "價值比較每股要約股份之0.14港元的要約價代表著："
+       "(a) 較最後交易日聯交所報出的每一股份收市價12.00港元有大約0.125%之溢價；"
+       "(b) 較截至最後交易日為止（包括該日）的最後連續五個交易日，聯交所報出的"
+       "股份平均收市價0.122港元有大約14.75%之溢價；"
+       "(c) 較截至最後交易日為止（包括該日）的最後連續三十個交易日，聯交所報出的"
+       "股份平均收市價0.119港元有大約17.61%之溢價；"
+       "(d) 較2024年12月31日的經審計股東應佔綜合資產淨值約每一股份人民幣0.73元"
+       "（約合0.79元港元）有大約82.21%之折讓。財務資源",
+}
+
+# 00372 保德國際發展 —— 条目编号是不带括号的「i. ii. iii. … ix.」。
+# 认不出编号 → 整节当成一条 → 第一个数字（要约价自己）成了基准价。
+P00372 = {
+    4: "價值比較每股要約股份的要約價0.175港元較："
+       "i. 於最後實際可行日期聯交所所報的每股股份收市價0.180港元折讓約2.78%；"
+       "ii. 於最後交易日聯交所所報的每股股份收市價0.155港元溢價約12.90%；"
+       "iii. 於截至最後交易日（包括當日）止5個連續交易日聯交所所報的每股股份"
+       "平均收市價約0.160港元溢價約9.38%；"
+       "iv. 於截至最後交易日（包括當日）止最近10個連續交易日聯交所所報的每股股份"
+       "平均收市價約0.157港元溢價約11.46%；"
+       "v. 於截至最後交易日（包括當日）止最近30個連續交易日聯交所所報的每股股份"
+       "平均收市價約0.179港元折讓約2.23%。財務資源",
+}
+
+# 01310 香港寬頻 —— 没有小标题，且是一句「分別…分別…」的并列句：
+# 三个基准价列完再列三个百分比。按「最近的基准价」去配，后两条必错。
+P01310 = {
+    3: "尤其是：(i) 經調整要約價每股5.075港元較股份於不受干擾日期於聯交所所報之"
+       "收市價（按除息基準）每股3.555港元溢價約42.76%，以及較截至不受干擾日期"
+       "（包括該日）止30個、60個及90個交易日的平均收市價（按除息基準）分別約"
+       "每股3.228港元、每股2.892港元及每股2.701港元分別溢價約57.20%、75.48%"
+       "及87.87%。",
+}
+
+# 01980 天鴿互動 —— 公告本身没有 30 日均价，最长只到 5 日。
+P01980 = {
+    6: "價值比較要約價每股要約股份0.68港元："
+       "(i) 相等於股份於最後交易日在聯交所所報之收市價每股0.68港元；"
+       "(ii) 較股份於截至最後交易日（包括該日）止連續五個交易日在聯交所所報"
+       "平均收市價每股約0.67港元溢價約2.10%；"
+       "(iii) 較2024年12月31日本公司擁有人應佔每股經審核綜合資產淨值約2.20港元"
+       "折讓約69.03%。最高及最低股價",
+}
+
+
+def _ladder(pages):
+    ex = extractor.extract("", pages)
+    return ex, {(c.anchor, c.window): c.stated_pct for c in ex.comparisons}
+
+
+def test_a_percentage_printed_before_the_word_is_still_read():
+    """「有大約17.61%之溢價」—— 数在前、词在后。
+
+    只认「溢價約 X%」的话，03389 五条比较一条都对不上，整单溢价率留空。
+    """
+    _ex, ladder = _ladder(P03389)
+    assert ladder[("last_trading_day", "30d")] == "17.61"
+    assert ladder[("last_trading_day", "5d")] == "14.75"
+
+
+def test_a_benchmark_that_never_says_per_share_is_still_found():
+    """03389 通篇写「每一股份」「股份平均收市價」，一次「每股」都没有。"""
+    _ex, ladder = _ladder(P03389)
+    assert ladder[("last_trading_day", "spot")] == "0.125"
+
+
+def test_bare_roman_numbering_is_recognised():
+    """00372 用的是「i. ii. iii.」，不带括号。
+
+    切不开的后果不是漏抽，是抽错：整节当成一条，第一个「每股…港元」
+    正好是要约价自己，于是要约价成了自己的基准价。
+    """
+    ex, ladder = _ladder(P00372)
+    assert len(ex.comparisons) == 5
+    assert ladder[("last_trading_day", "30d")] == "2.23"
+    assert all(c.benchmark != "0.175" for c in ex.comparisons), "要约价当成了基准价"
+
+
+def test_the_benchmark_is_the_one_nearest_to_the_percentage():
+    """01310 那句以「經調整要約價每股5.075港元較…」开头。
+
+    按「这段话里第一个每股…港元」取，要约价自己成了基准价，
+    溢价率算在自己头上 —— 而结果看起来完全正常。
+    """
+    ex, _ = _ladder(P01310)
+    assert ex.comparisons[0].benchmark == "3.555"
+    assert ex.comparisons[0].window == "spot", "后面那句的「30個」污染了前面这条"
+
+
+def test_a_parallel_list_is_flagged_not_guessed():
+    """「分別約每股A、每股B及每股C分別溢價約x%、y%及z%」拆不准就不拆。"""
+    ex, _ = _ladder(P01310)
+    assert len(ex.comparisons) == 1
+    assert any("並列" in n or "并列" in n for n in ex.notes)
+
+
+def test_an_announcement_without_a_thirty_day_average_still_gets_a_premium():
+    """01980 最长只到 5 日。留空等于把「公告没印 30 日」当成「抽不出」。"""
+    from hkexdb import selectors
+
+    ex = extractor.extract("", P01980)
+    comps = [{"anchor": c.anchor, "window": c.window, "label": c.label,
+              "stated_pct": c.stated_pct, "stated_direction": c.stated_direction,
+              "benchmark": c.benchmark, "page": c.page, "quote": c.quote}
+             for c in ex.comparisons]
+    pick = selectors.select_primary_premium(comps)
+    assert pick.signed_pct == Decimal("2.10")
+    assert pick.window == "5d" and pick.fell_back
+
+
+# 06808 高鑫零售 —— 一份公告给了**两个**要约价：
+#   1.58 港元（部分遞延結算替代方案下的最高代价）
+#   1.38 港元（全額預付替代方案）
+# 于是同一条梯子印了两遍，百分比一套一个样。你的答案取的是 1.38 那套。
+P06808 = {
+    9: "價值比較每股要約股份1.58港元，即根據部分遞延結算替代方案應付之最高代價，較："
+       "(a) 股份於不受干擾日期在聯交所所報收市價每股1.84港元折讓約14.13%；"
+       "(b) 股份於緊接不受干擾日期（包括當日）前30個交易日在聯交所所報平均收市價"
+       "每股約1.34港元溢價約17.76%；"
+       "(c) 股份於最後交易日在聯交所所報收市價每股2.48港元折讓約36.29%；"
+       "(d) 於二零二四年三月三十一日應佔經審核綜合資產淨值約每股股份約2.42港元"
+       "折讓約34.81%。"
+       "每股要約股份1.38港元，即全額預付替代方案價格，較："
+       "(e) 股份於不受干擾日期在聯交所所報收市價每股1.84港元折讓約25.00%；"
+       "(f) 股份於緊接不受干擾日期（包括當日）前30個交易日在聯交所所報平均收市價"
+       "每股約1.34港元溢價約2.86%；"
+       "(g) 股份於最後交易日在聯交所所報收市價每股2.48港元折讓約44.35%；"
+       "(h) 於二零二四年三月三十一日應佔經審核綜合資產淨值約每股股份約2.42港元"
+       "折讓約43.06%。最高及最低股價",
+}
+
+
+def test_two_alternative_offer_prices_are_flagged():
+    """整条梯子印了两遍 —— 说明这单有两个要约价，主值只能取一套。
+
+    定不出「该取哪一套」的规则（只有这一份样本），所以不猜；
+    但也不能装作没看见。
+    """
+    ex = extractor.extract("", P06808)
+    assert any("两套要约价" in n for n in ex.notes)
+
+
+def test_the_alternative_price_warning_does_not_cry_wolf():
+    """⚠️ 判据是「整条梯子重复」，不是「有两个数字撞了」。
+
+    按后者写的第一版在 12 单里报了 8 单，全是误报 —— 每股净资产天然
+    有经审核/未经审核两条。一条老是响的提醒会把「备注」这一列废掉。
+    """
+    for pages in (P03389, P00372, P01980, P01310, P01633, P01875):
+        ex = extractor.extract("", pages)
+        assert not any("两套要约价" in n for n in ex.notes), pages

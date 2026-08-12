@@ -384,6 +384,37 @@ def _parse_timeout() -> float:
         return float(MAX_SECONDS_PER_PDF)
 
 
+def _premium_rules() -> dict:
+    """溢价率主值的口径，从 config.yaml 读。
+
+    这一节的配置以前只是写在那儿给人看的，代码根本没读 —— 也就是说
+    「改配置就能改行为」那句话对它不成立。锚点优先级恰恰是有争议的
+    一项（08439 你要最后交易日，3336 你要未受干扰日），所以它必须是
+    一个你改得动的旋钮，而不是埋在 .py 里的常量。
+    """
+    from . import selectors
+    from .config import section
+
+    out = {"window": selectors.DEFAULT_WINDOW,
+           "anchor_priority": selectors.DEFAULT_ANCHOR_PRIORITY,
+           "fallback": selectors.WINDOW_FALLBACK}
+    try:
+        cfg = section("config.yaml", key="primary_value_rules",
+                      root=ROOT).get("premium") or {}
+    except (TypeError, AttributeError):
+        return out
+    if isinstance(cfg.get("window"), str):
+        out["window"] = cfg["window"]
+    order = cfg.get("anchor_priority")
+    if isinstance(order, list) and all(isinstance(x, str) for x in order) and order:
+        out["anchor_priority"] = tuple(order)
+    ladder = cfg.get("window_fallback")
+    if isinstance(ladder, list) and all(isinstance(x, str) for x in ladder):
+        # 空列表＝关掉退档：只认 30 日，别的一律留空
+        out["fallback"] = tuple(ladder)
+    return out
+
+
 def _month_chunks(d1: dt.date, d2: dt.date) -> list[tuple[dt.date, dt.date]]:
     """按月切段。照抄你 asso 那份文件 search_by_category 的做法，
     连理由都一样：「类别筛选后记录数远小于上限，无需按天」。
@@ -1459,11 +1490,16 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
                       "stated_direction": c.stated_direction,
                       "benchmark": c.benchmark,
                       "page": c.page, "quote": c.quote} for c in ex.comparisons]
-            pick = selectors.select_primary_premium(comps)
+            rules = _premium_rules()
+            pick = selectors.select_primary_premium(
+                comps, window=rules["window"],
+                anchor_priority=rules["anchor_priority"],
+                fallback=rules["fallback"])
             if pick:
                 deal.premium_pct = str(pick.signed_pct)
                 deal.premium_basis = pick.label
                 _reconcile_premium_direction(deal, pick, ex)
+                _note_other_anchor(deal, pick)
 
             # 整条溢价梯子都留着：投行看可比不会只看一个口径，
             # 而且下一个人可能要按「最后交易日收市价」重排
@@ -1534,6 +1570,24 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
                 deal.confidence = "low"
                 deal.verdict, deal.verdict_reason = "unclear", f"抽取失败：{exc}"
     return deal
+
+
+def _note_other_anchor(deal, pick) -> None:
+    """同一个窗口下还有另一个锚点时，把它也写进备注。
+
+    这个选择是有争议的，而且争议来自你自己的两单答案：
+        3336 巨騰   你取 -15.45%（未受干扰日前30日），不是 -17.50%（最后交易日）
+        08439 新百利 你取 +40.80%（最后交易日前30日），不是 +129.8%（未受干扰日）
+    两单都是「两个锚点都有」，选法相反 —— 一条规则解释不了两单。
+    所以程序按 config.yaml 里的优先级选一个，**同时把另一个摆出来**：
+    要改哪一单，看一眼备注就能改，不用回去翻原文。
+    """
+    if not pick.other_anchor or not pick.other_pct:
+        return
+    deal.notes = "；".join(x for x in (
+        deal.notes,
+        f"同窗口另一口径：较{pick.other_anchor} {pick.other_pct}%"
+        f"（本表按 {pick.label} 取值）") if x)
 
 
 def _reconcile_premium_direction(deal, pick, ex) -> None:

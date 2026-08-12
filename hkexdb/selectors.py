@@ -34,6 +34,15 @@ DEFAULT_ANCHOR_PRIORITY = ("undisturbed", "last_trading_day", "pre_rule37")
 
 DEFAULT_WINDOW = "30d"
 
+# 没有 30 日均价时按这个顺序退。**退到哪一档会写进「主值口径」那一列**，
+# 所以这不是静默降级 —— 数字和口径永远同列显示。
+#
+# 依据（两单都是你答案表里核过的）：
+#   01833 平安好醫生  答案 -4.23%  ← 前10日均价（该单最长只到 10 日）
+#   01980 天鴿互動    答案 +2.10%  ← 前5日均价（该单最长只到 5 日）
+# 原来这两单一律留空，等于把「公告没给 30 日」当成「公告没给溢价率」。
+WINDOW_FALLBACK = ("30d", "10d", "5d", "spot")
+
 
 @dataclass(frozen=True)
 class PremiumPick:
@@ -50,28 +59,17 @@ class PremiumPick:
     benchmark: str = ""          # 这一项的基准价原文，方向复核要用
     stated_pct: str = ""         # 公告印的百分比原文（不带符号）
     stated_direction: str = ""   # 公告写的是溢价还是折让
+    fell_back: bool = False      # 公告没有 30 日均价，退到了更短的窗口
+    other_anchor: str = ""       # 同窗口下另一个锚点的口径（例：最后交易日前30日均价）
+    other_pct: str = ""          # 那一项的带符号百分比
 
 
-def select_primary_premium(comparisons: list[dict], *,
-                           window: str = DEFAULT_WINDOW,
-                           anchor_priority: tuple[str, ...] = DEFAULT_ANCHOR_PRIORITY
-                           ) -> PremiumPick | None:
-    """从「价值比较」各项里选出主值溢价率。
-
-    comparisons 的每一项须带结构化的 anchor / window 字段 ——
-    **不要用中文标签做字符串匹配**：三单里同一个概念就有
-    「前30个交易日平均收市价」「最後交易日前30日均价」等多种写法。
-
-    选不出来时返回 None，绝不退而求其次挑一个近似的。
-    静默降级正是铁律二说的那种污染。
-    """
-    candidates = [c for c in comparisons if c.get("window") == window]
-    if not candidates:
-        return None
-
+def _pick_one(candidates: list[dict], anchor_priority: tuple[str, ...],
+              total: int, fell_back: bool) -> PremiumPick | None:
     def rank(item: dict) -> int:
         anchor = item.get("anchor", "")
-        return anchor_priority.index(anchor) if anchor in anchor_priority else len(anchor_priority)
+        return (anchor_priority.index(anchor) if anchor in anchor_priority
+                else len(anchor_priority))
 
     best = min(candidates, key=rank)
     if rank(best) >= len(anchor_priority):
@@ -80,6 +78,17 @@ def select_primary_premium(comparisons: list[dict], *,
     pct = Decimal(str(best["stated_pct"]))
     signed = pct if best["stated_direction"] == "premium" else -pct
 
+    # 同一个窗口下另一个锚点的那一项。08439 和 3336 两单说明这个选择
+    # 有争议（一单你要最后交易日，一单你要未受干扰日），所以不管选了
+    # 哪个，都把另一个摆到备注里 —— 想改哪一单，看一眼就能改。
+    others = [c for c in candidates if c is not best
+              and rank(c) < len(anchor_priority)]
+    other = min(others, key=rank) if others else None
+    other_pct = ""
+    if other is not None:
+        value = Decimal(str(other["stated_pct"]))
+        other_pct = str(value if other["stated_direction"] == "premium" else -value)
+
     return PremiumPick(
         signed_pct=signed,
         anchor=best["anchor"],
@@ -87,12 +96,45 @@ def select_primary_premium(comparisons: list[dict], *,
         label=best["label"],
         page=best["page"],
         source_quote=best["quote"],
-        considered=len(comparisons),
+        considered=total,
         rejected=[c["label"] for c in candidates if c is not best],
         benchmark=str(best.get("benchmark", "")),
         stated_pct=str(best["stated_pct"]),
         stated_direction=best["stated_direction"],
+        fell_back=fell_back,
+        other_anchor=other["label"] if other is not None else "",
+        other_pct=other_pct,
     )
+
+
+def select_primary_premium(comparisons: list[dict], *,
+                           window: str = DEFAULT_WINDOW,
+                           anchor_priority: tuple[str, ...] = DEFAULT_ANCHOR_PRIORITY,
+                           fallback: tuple[str, ...] = WINDOW_FALLBACK
+                           ) -> PremiumPick | None:
+    """从「价值比较」各项里选出主值溢价率。
+
+    comparisons 的每一项须带结构化的 anchor / window 字段 ——
+    **不要用中文标签做字符串匹配**：三单里同一个概念就有
+    「前30个交易日平均收市价」「最後交易日前30日均价」等多种写法。
+
+    先要 30 日均价；公告压根没印 30 日的，按 `fallback` 一档档退到
+    10 日 / 5 日 / 收市价。退到哪一档会原样写进「主值口径」，和数字同列，
+    所以它不是静默降级 —— 看表的人一眼知道这个 -4.23% 是 10 日口径。
+
+    该窗口下一个已知锚点都没有时仍然返回 None：
+    宁可留空，也不挑一个说不出出处的近似值。
+    """
+    windows = [window] + [w for w in fallback if w != window]
+    for index, name in enumerate(windows):
+        candidates = [c for c in comparisons if c.get("window") == name]
+        if not candidates:
+            continue
+        pick = _pick_one(candidates, anchor_priority, len(comparisons),
+                         fell_back=index > 0)
+        if pick is not None:
+            return pick
+    return None
 
 
 # ------------------------------------------------------- 主值方向的算术复核
