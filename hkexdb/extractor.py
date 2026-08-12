@@ -339,13 +339,19 @@ def _drop_impossible_offer_price(result) -> None:
     要约价 220 是它的一千九百倍。留一个这样的数比留空坏得多。
     """
     price = _num_or_none(result.offer_price)
-    high = _num_or_none(result.six_month_high)
-    if not price or not high or high <= 0:
+    # 参照物有两个来源，谁在就用谁：六个月最高价，或价值比较里最高的
+    # 那个基准价。09929 那份排版错乱到连六个月最高价都没抽到，
+    # 只靠一个来源这道闸就形同虚设。
+    refs = [_num_or_none(result.six_month_high)]
+    refs += [_num_or_none(c.benchmark) for c in result.comparisons]
+    refs = [r for r in refs if r and r > 0]
+    if not price or not refs:
         return
+    high = max(refs)
     if price > high * _PRICE_SANITY_MULTIPLE:
         result.notes.append(
-            f"抽到的要约价 {result.offer_price} 是六个月最高价 {result.six_month_high} "
-            f"的 {price / high:.0f} 倍（数量级不对，多半是 PDF 里数字与文字错位），"
+            f"抽到的要约价 {result.offer_price} 是参照价 {high} 的 "
+            f"{price / high:.0f} 倍（数量级不对，多半是 PDF 里数字与文字错位），"
             f"已作废，需人工读原文")
         result.offer_price = ""
         result.offer_price_evidence = Evidence()

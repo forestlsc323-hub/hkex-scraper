@@ -297,3 +297,17 @@ def test_the_price_gate_stays_quiet_without_a_six_month_high():
     ex.offer_price, ex.six_month_high = "220.00", ""
     extractor._drop_impossible_offer_price(ex)
     assert ex.offer_price == "220.00"
+
+
+def test_the_price_gate_also_uses_the_comparison_benchmarks():
+    """09929 那份排版错乱到连六个月最高价都没抽到 ——
+    只靠一个参照物，这道闸形同虚设。价值比较里的基准价同样能当尺子。"""
+    ex = extractor.Extraction()
+    ex.offer_price, ex.six_month_high = "220.0", ""
+    ex.comparisons = [extractor.Comparison(
+        anchor="last_trading_day", window="spot", benchmark="0.103",
+        benchmark_decimals=3, benchmark_is_exact=True, stated_pct="6.36",
+        stated_direction="premium", page=1, quote="")]
+
+    extractor._drop_impossible_offer_price(ex)
+    assert ex.offer_price == ""
