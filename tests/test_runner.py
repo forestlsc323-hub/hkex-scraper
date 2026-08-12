@@ -1480,3 +1480,74 @@ def test_rows_without_an_offer_price_are_never_merged():
     b = runner.Deal(code="00195", date="2025-06-20", offer_price="",
                     deal_size="", verdict="offer")
     assert runner.mark_duplicate_filings([a, b]) == 0
+
+
+# ------------------------------------------- 主值溢价率的符号：算术说了算还是标出来
+
+class _Pick:
+    """⚠️ 字段要和 selectors.PremiumPick 一致 —— 少一个就测不出真问题。"""
+
+    def __init__(self, label, benchmark, stated_pct, direction):
+        self.label, self.benchmark = label, benchmark
+        self.stated_pct, self.stated_direction = stated_pct, direction
+
+
+class _Ex:
+    def __init__(self, offer_price):
+        self.offer_price = offer_price
+
+
+def _deal_with(premium: str):
+    d = runner.Deal(date="2025-01-02", code="00001", name="某某")
+    d.premium_pct, d.premium_basis = premium, "最后交易日前30日均价"
+    d.confidence, d.notes = "high", ""
+    return d
+
+
+def test_a_typo_in_the_wording_is_corrected_by_the_announcements_own_numbers():
+    """要约价 1.20 高于基准 1.00，公告却写「折让 20%」——
+    百分比复算得上，说明错的只是那两个字，符号按算术改。"""
+    deal = _deal_with("-20.00")
+    runner._reconcile_premium_direction(
+        deal, _Pick("最后交易日前30日均价", "1.00", "20.00", "discount"),
+        _Ex("1.20"))
+    assert deal.premium_pct == "20.00"
+    assert "纠正" in deal.notes
+    assert deal.confidence == "high"       # 数字自洽，没有降级的理由
+
+
+def test_a_mismatched_benchmark_is_flagged_instead_of_flipped():
+    """基准价配错行时不许改数 —— 改了就是把一个错的数改成另一个错的数。"""
+    deal = _deal_with("-20.00")
+    runner._reconcile_premium_direction(
+        deal, _Pick("最后交易日前30日均价", "1.00", "20.00", "premium"),
+        _Ex("0.11"))
+    assert deal.premium_pct == "-20.00"    # 一个字符都没动
+    assert "方向存疑" in deal.premium_basis
+    assert deal.confidence == "low"
+    assert "人工核" in deal.notes
+
+
+def test_an_agreeing_pick_is_left_completely_alone():
+    deal = _deal_with("-20.00")
+    runner._reconcile_premium_direction(
+        deal, _Pick("最后交易日前30日均价", "1.00", "20.00", "discount"),
+        _Ex("0.80"))
+    assert (deal.premium_pct, deal.premium_basis, deal.notes,
+            deal.confidence) == ("-20.00", "最后交易日前30日均价", "", "high")
+
+
+def test_nothing_to_recheck_leaves_the_row_untouched():
+    deal = _deal_with("-20.00")
+    runner._reconcile_premium_direction(
+        deal, _Pick("最后交易日前30日均价", "", "20.00", "discount"), _Ex(""))
+    assert deal.premium_pct == "-20.00" and deal.notes == ""
+
+
+def test_the_correction_note_carries_both_numbers():
+    """铁律三：结论要能追溯。只说「改了符号」没法复核。"""
+    deal = _deal_with("-20.00")
+    runner._reconcile_premium_direction(
+        deal, _Pick("最后交易日前30日均价", "1.00", "20.00", "discount"),
+        _Ex("1.20"))
+    assert "1.20" in deal.notes and "1.00" in deal.notes

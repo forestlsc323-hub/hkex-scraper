@@ -192,3 +192,63 @@ def test_field_accuracy_report_is_three_for_three(capsys):
 
     for f in fields:
         assert tally[f][0] == tally[f][1], f"{f} 未全对：{tally[f]}"
+
+
+# ------------------------------------------------- 主值方向的算术复核（V5 上桌）
+
+def _pick(benchmark: str, stated_pct: str, direction: str):
+    """构造一个主值选取结果。⚠️ 必须走 select_primary_premium，
+    不能手搓 PremiumPick —— 手搓的话字段少一个也测不出来。"""
+    return selectors.select_primary_premium([{
+        "anchor": "last_trading_day", "window": "30d",
+        "label": "最后交易日前30日均价", "stated_pct": stated_pct,
+        "stated_direction": direction, "benchmark": benchmark,
+        "page": 3, "quote": "较…折让约…%"}])
+
+
+def test_the_pick_carries_the_numbers_needed_to_recheck_it():
+    pick = _pick("1.00", "20.00", "discount")
+    assert pick.benchmark == "1.00" and pick.stated_pct == "20.00"
+
+
+def test_wording_and_arithmetic_agreeing_is_a_pass():
+    check = selectors.check_direction(_pick("1.00", "20.00", "discount"), "0.80")
+    assert check.agrees and check.pct_agrees
+
+
+def test_a_premium_written_as_a_discount_is_caught():
+    """要约价高于基准却写「折让」—— 光看百分比看不出来，必须比大小。"""
+    check = selectors.check_direction(_pick("1.00", "20.00", "discount"), "1.20")
+    assert not check.agrees
+    assert check.arithmetic == "premium"
+    assert check.pct_agrees          # 数字自洽，错的只是那两个字
+
+
+def test_a_mismatched_benchmark_shows_up_as_the_percentage_not_reconciling():
+    """基准价配错行时（09929 那种 PDF 文字层错位），方向可能碰巧还对，
+    但百分比一定复算不出来 —— 所以 pct_agrees 才是那一层的探针。"""
+    check = selectors.check_direction(_pick("220.00", "20.00", "discount"), "0.11")
+    assert check.agrees          # 0.11 < 220，算术上确实是折让
+    assert not check.pct_agrees  # 但折让 99.95%，不是公告印的 20%
+
+
+def test_rounding_does_not_count_as_a_disagreement():
+    # 0.80 / 1.005 = 20.398% 折让，公告印 20.40%
+    check = selectors.check_direction(_pick("1.005", "20.40", "discount"), "0.80")
+    assert check.agrees and check.pct_agrees
+
+
+def test_no_offer_price_means_no_opinion():
+    assert selectors.check_direction(_pick("1.00", "20.00", "discount"), "") is None
+
+
+def test_no_benchmark_means_no_opinion():
+    assert selectors.check_direction(_pick("", "20.00", "discount"), "0.80") is None
+
+
+def test_a_zero_benchmark_never_divides():
+    assert selectors.check_direction(_pick("0", "20.00", "discount"), "0.80") is None
+
+
+def test_nothing_picked_means_nothing_to_check():
+    assert selectors.check_direction(None, "0.80") is None

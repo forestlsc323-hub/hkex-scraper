@@ -829,6 +829,10 @@ def score_against_answer_key(on_log=None) -> str:
         report = scoring.score(got, answers)
         for line in report.text().splitlines():
             log(line)
+        # 「漏了 4 单」不指挥任何动作，「这 4 单漏在索引层」才指挥得动。
+        from . import trace as trace_mod
+        for line in trace_mod.missing_report(got, answers):
+            log(line)
 
     out = ROOT / "准确率报告.txt"
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -1453,11 +1457,13 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             comps = [{"anchor": c.anchor, "window": c.window, "label": c.label,
                       "stated_pct": c.stated_pct,
                       "stated_direction": c.stated_direction,
+                      "benchmark": c.benchmark,
                       "page": c.page, "quote": c.quote} for c in ex.comparisons]
             pick = selectors.select_primary_premium(comps)
             if pick:
                 deal.premium_pct = str(pick.signed_pct)
                 deal.premium_basis = pick.label
+                _reconcile_premium_direction(deal, pick, ex)
 
             # 整条溢价梯子都留着：投行看可比不会只看一个口径，
             # 而且下一个人可能要按「最后交易日收市价」重排
@@ -1528,6 +1534,36 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
                 deal.confidence = "low"
                 deal.verdict, deal.verdict_reason = "unclear", f"抽取失败：{exc}"
     return deal
+
+
+def _reconcile_premium_direction(deal, pick, ex) -> None:
+    """主值溢价率的符号，跟公告自己的两个数字对一遍（铁律一）。
+
+    符号错比数值错严重：折让被写成溢价，那一行放进可比表会得出
+    完全相反的结论，而光看百分比看不出来 —— 必须比大小。
+
+    两种处理，分得很清楚：
+      · 百分比复算得上 → 数字自洽，错的只是「溢价／折让」那两个字，
+        按算术改符号。这不是判断，是公告自己的两个数除出来的。
+      · 百分比复算不上 → 我多半把基准价配错了行（PDF 表格错位那类），
+        两边都不可信。**不改数**，只把口径标上问号、置信度降到低，
+        让人一眼看得见（铁律二：宁可标出来，不要静默改）。
+    """
+    from . import selectors
+
+    check = selectors.check_direction(pick, ex.offer_price)
+    if check is None or check.agrees:
+        return
+
+    if check.pct_agrees:
+        from decimal import Decimal
+        deal.premium_pct = str(-Decimal(deal.premium_pct))
+        note = f"溢价方向按公告自己的数字纠正：{check.detail}"
+    else:
+        deal.premium_basis = f"{pick.label}（方向存疑）"
+        deal.confidence = "low"
+        note = f"溢价方向与基准价对不上，数值未改，请人工核：{check.detail}"
+    deal.notes = "；".join(x for x in (deal.notes, note) if x)
 
 
 def _run_checks(ex, validators) -> str:

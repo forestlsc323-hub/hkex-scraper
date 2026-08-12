@@ -47,6 +47,9 @@ class PremiumPick:
     source_quote: str
     considered: int              # 一共有多少项候选
     rejected: list[str]          # 同窗口下被更高优先级锚点挤掉的项
+    benchmark: str = ""          # 这一项的基准价原文，方向复核要用
+    stated_pct: str = ""         # 公告印的百分比原文（不带符号）
+    stated_direction: str = ""   # 公告写的是溢价还是折让
 
 
 def select_primary_premium(comparisons: list[dict], *,
@@ -86,7 +89,70 @@ def select_primary_premium(comparisons: list[dict], *,
         source_quote=best["quote"],
         considered=len(comparisons),
         rejected=[c["label"] for c in candidates if c is not best],
+        benchmark=str(best.get("benchmark", "")),
+        stated_pct=str(best["stated_pct"]),
+        stated_direction=best["stated_direction"],
     )
+
+
+# ------------------------------------------------------- 主值方向的算术复核
+
+@dataclass(frozen=True)
+class DirectionCheck:
+    """主值那一项的「溢价/折让」两个字，和它自己的两个数字对不对得上。"""
+
+    agrees: bool                 # 措辞与算术一致
+    arithmetic: str              # 按两个数字算出来的方向
+    stated: str                  # 公告写的方向
+    pct_agrees: bool             # 公告印的百分比能不能用这两个数复算出来
+    detail: str                  # 写给人看的一句话，带上两个数
+
+
+_PCT_TOLERANCE = Decimal("0.6")   # 百分点。印刷四舍五入 + 基准价取「約」值
+
+
+def check_direction(pick: PremiumPick | None, offer_price: str) -> DirectionCheck | None:
+    """用公告自己的两个数字，复核公告自己的那两个字（铁律一）。
+
+    准确率报告里有三单的溢价率**符号相反**。符号错和数值错不是同一
+    类错：数值差一点还能用，符号反了会把折让当成溢价放进可比表，
+    而做 precedent 时那一行会直接得出相反的结论。
+
+    这里只做比大小和一次除法，不做任何判断：
+
+        要约价 > 基准价 → 算术上就是溢价，公告写「折让」两个字就对不上。
+
+    对不上时还要再问一句：公告印的**百分比数值**能不能用这两个数
+    复算出来？
+        能   → 数字自洽，错的只是那两个字（公告的印刷错误，你手册里
+               「公告会错」那一节说的就是这个）。这时算术说了算。
+        不能 → 多半是我把基准价配错了行（PDF 表格错位那类），
+               两边都不可信，只能标出来给人看。
+
+    返回 None 表示无从复核（缺要约价或缺基准价）—— 不复核就不表态。
+    """
+    if pick is None:
+        return None
+    try:
+        offer = Decimal(str(offer_price).replace(",", "").strip())
+        benchmark = Decimal(str(pick.benchmark).replace(",", "").strip())
+        stated_pct = Decimal(str(pick.stated_pct).replace(",", "").strip())
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if benchmark <= 0 or offer <= 0:
+        return None
+
+    arithmetic = "premium" if offer > benchmark else "discount"
+    computed = abs(offer - benchmark) / benchmark * 100
+    pct_agrees = abs(computed - stated_pct) <= _PCT_TOLERANCE
+    word = {"premium": "溢价", "discount": "折让"}
+    detail = (f"要约价 {offer} 对基准 {benchmark}（{pick.label}）"
+              f"→ 算术上是{word[arithmetic]} {computed:.2f}%；"
+              f"公告写{word.get(pick.stated_direction, pick.stated_direction)}"
+              f" {stated_pct}%")
+    return DirectionCheck(agrees=arithmetic == pick.stated_direction,
+                          arithmetic=arithmetic, stated=pick.stated_direction,
+                          pct_agrees=pct_agrees, detail=detail)
 
 
 @dataclass(frozen=True)
