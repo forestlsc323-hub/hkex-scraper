@@ -121,14 +121,18 @@ def test_a_normal_discount_is_not_flagged():
 
 
 def test_the_shipped_answer_key_loads_and_is_checked():
-    """仓库里那份 25 单的答案表要能直接读，并且自检能跑。"""
+    """仓库里那份答案表要能直接读，并且自检能跑。
+
+    现在是 83 单：2026 上半年 25 单（用户手工核的）+ 2025 全年 58 单
+    （从用户的表格截图转录的）。数量会随他继续录入而涨，所以不写死。
+    """
     from hkexdb import runner, scoring as S
     path = runner.Path(__file__).parent.parent / "data" / "answer_key.csv"
     if not path.exists():
         import pytest
         pytest.skip("答案表不在（本地 data/ 被清过）")
     rows = S.load(path)
-    assert len(rows) == 25
+    assert len(rows) >= 25
     assert rows[0]["股票代码"].startswith("0"), "代码列前导零被吞了"
     assert any("01875" in p for p in S.sanity_check(rows))
 

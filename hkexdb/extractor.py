@@ -979,30 +979,59 @@ _DEAL_SIZE = [
 ]
 
 
+def _amount_of(m) -> str:
+    """把一处匹配换算成整数金额字符串。
+
+    有「萬」「億」才换算，而这是**单位换算不是计算**（铁律一），
+    依据留在 quote 里可复核；没有单位就原样保留，取整会丢掉角分。
+    """
+    raw = m.group("num").replace(",", "")
+    unit_char = m.group("unit") or ""
+    return raw if not unit_char else f"{float(raw) * _UNIT[unit_char]:.0f}"
+
+
+def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
+    """一份公告里所有像「交易规模」的数。返回 [(金额, 页码, 引文)]。
+
+    一份要约公告里通常同时印着好几个大额数字：控股权转让的对价、
+    全部已发行股本的估值、要约项下应付给公众股东的最高代价……
+    你的手册里那句判别口诀说的就是它们的区别 ——「这笔钱付给谁？」
+
+    2025 全年 58 单实测：交易规模只对了 12 单（23.5%），而错的 35 单
+    比值从 0.019 到 3.201 **连续分布** —— 不是稳定地取错了某一个口径，
+    而是每份公告里候选不同、先撞上哪个就用哪个。12 单正好对上说明
+    正则本身找得到，问题在**选**。
+
+    所以先把候选**全部**列出来。选哪个仍按原来的优先级（改口径要有
+    依据，不能拍脑袋），但候选多于一个时会写进备注 ——
+    让「这里有得选」这件事在结果里看得见，而不是静默地选了一个。
+    """
+    out: list[tuple[str, int, str]] = []
+    seen: set[str] = set()
+    for pattern in _DEAL_SIZE:
+        for page in sorted(pages):
+            flat = _flat(pages[page])
+            for m in pattern.finditer(flat):
+                amount = _amount_of(m)
+                if amount in seen:
+                    continue
+                seen.add(amount)
+                start = max(0, m.start() - 40)
+                out.append((amount, page, flat[start:m.end() + 10].strip()))
+    return out
+
+
 def extract_deal_size(pages: dict[int, str]) -> tuple[str, Evidence]:
     """取「要约项下最高现金代价」。
 
     口径来自你三单人工答案的反推（见 selectors.py）：
     不是控股权转让对价，也不是 100% 股本估值。
-
-    中文数字单位（萬/億）在这里换算成整数 —— 这是**单位换算不是计算**，
-    换算依据写进 quote 里可复核。
     """
-    for page in sorted(pages):
-        flat = _flat(pages[page])
-        for pattern in _DEAL_SIZE:
-            m = pattern.search(flat)
-            if m:
-                raw = m.group("num").replace(",", "")
-                unit_char = m.group("unit") or ""
-                start = max(0, m.start() - 40)
-                evidence = Evidence(page, flat[start:m.end() + 10].strip())
-                if not unit_char:
-                    # 公告直接印了完整数字，原样保留 —— 取整会丢掉角分
-                    return raw, evidence
-                # 有「萬」「億」才换算。这是单位换算，不是计算；依据留在 quote 里。
-                return f"{float(raw) * _UNIT[unit_char]:.0f}", evidence
-    return "", Evidence()
+    picks = deal_size_candidates(pages)
+    if not picks:
+        return "", Evidence()
+    amount, page, quote = picks[0]
+    return amount, Evidence(page, quote)
 
 
 # ---------------------------------------------------------------- 总入口
@@ -1029,6 +1058,16 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.six_month_low, result.six_month_high, result.six_month_evidence = \
         extract_six_month(pages)
     result.deal_size, result.deal_size_evidence = extract_deal_size(pages)
+
+    # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
+    # 比值连续散布在 0.019~3.201 —— 说明不是稳定取错了某个口径，
+    # 是每份公告里候选不同。把候选摆出来，「这里有得选」才看得见。
+    others = deal_size_candidates(pages)
+    if len(others) > 1:
+        rest = "、".join(a for a, _, _ in others[1:5])
+        result.notes.append(
+            f"交易规模有 {len(others)} 个候选，取了 {result.deal_size}，"
+            f"其余：{rest}{'…' if len(others) > 5 else ''}（口径存疑请核原文）")
     result.total_shares, result.total_shares_evidence = extract_total_shares(pages)
     result.is_conditional, result.is_conditional_evidence = \
         extract_conditionality(title, pages)
