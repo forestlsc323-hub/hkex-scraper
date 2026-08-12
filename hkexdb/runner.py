@@ -258,6 +258,9 @@ def _keep_raw_files() -> bool:
 # 先翻几页再决定要不要翻完。0 = 关掉这个机制，老老实实整份解析。
 PROBE_PAGES = 12
 
+# 开几个解析子进程。见 _parse_workers 的实测数据。
+PARSE_WORKERS = 2
+
 
 def _probe_pages() -> int:
     """侦察页数。要约公告的封面必然印着价钱或名目，12 页留足了余量。"""
@@ -267,6 +270,22 @@ def _probe_pages() -> int:
                           .get("probe_pages", PROBE_PAGES)))
     except (TypeError, ValueError, AttributeError):
         return PROBE_PAGES
+
+
+def _parse_workers() -> int:
+    """开几个解析子进程。
+
+    实测（8 份 60 页）：1 个 17.3 秒 / 2 个 8.8 秒 / 3 个 6.6 秒 /
+    4 个 4.7 秒 —— 接近线性。默认取 2：再多就开始跟你机器上别的程序
+    抢 CPU 和内存（一份 295 页的综合文件解析时能吃掉几百兆），
+    而收益已经在递减。
+    """
+    from .config import section
+    try:
+        return max(1, min(8, int(section("config.yaml", key="pdf", root=ROOT)
+                                 .get("parse_workers", PARSE_WORKERS))))
+    except (TypeError, ValueError, AttributeError):
+        return PARSE_WORKERS
 
 
 def _parse_timeout() -> float:
@@ -1081,19 +1100,19 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         on_activity(f"{done[0]}/{len(targets)} 份　还剩 {left} 份："
                     + "、".join(parts) + tail)
 
-    # 解析全程持有这把锁 —— 也就是说**同一时刻只有一份公告在解析**。
+    # 解析不再串行了 —— 因为它已经不在这个进程里跑。
     #
-    # 这不是保守，是实测出来的：12 份真实公告只算解析，
-    #   1 路 12.13 秒 / 2 路 13.59 秒 / 4 路 20.56 秒
-    # 解析是 CPU 型工作，GIL 让它没法真并行，多开线程只是把同样的活
-    # 切碎轮流做 —— 总时间反而涨 70%，还把 Tk 主线程一起拖住
-    # （界面卡顿从 74 毫秒涨到 328 毫秒，这就是「未响应」的来源）。
+    # 早先测出「4 路并发解析比 1 路慢 70%」（12.13 秒 → 20.56 秒），
+    # 据此加了一把全程持有的解析锁。那个结论**只在线程里成立**：
+    # CPU 型工作在一个解释器里受 GIL 限制没法真并行，多开线程只是把
+    # 同样的活切碎轮流做。
     #
-    # 下载是 I/O 型工作，等网络时会释放 GIL，那才是并发真正能赚到的地方。
-    # 所以：下载并发、解析串行。
-    parse_lock = threading.Lock()
+    # 解析搬进子进程之后没有 GIL 了，重测（8 份 60 页）：
+    #   1 个进程 17.3 秒 / 2 个 8.8 秒 / 3 个 6.6 秒 / 4 个 4.7 秒
+    # 3.7 倍。同一个结论，换了执行模型就正好反过来 ——
+    # 所以那把锁撤掉，改由 ParsePool 的槽位数控制并行度。
 
-    # 而且解析要在**另一个进程**里跑。
+    # 解析要在**另一个进程**里跑。
     #
     # 一次实跑「一个小时没动」：日志停在 27/68，界面标题「未响应」，
     # 界面上「已运行」的秒数冻在 8 分 38 秒 —— 秒数冻住本身就是证据，
@@ -1108,7 +1127,7 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     # 没有要新抽的就别起 —— 存档全命中时一份 PDF 都不用开，
     # 为了零份公告 spawn 一个进程纯属浪费。
     from .parsepool import ParsePool
-    pool = ParsePool(timeout=_parse_timeout(),
+    pool = ParsePool(timeout=_parse_timeout(), workers=_parse_workers(),
                      on_note=lambda t: log(f"  【注意】{t}")) if targets else None
 
     def one(row) -> Deal:
@@ -1122,7 +1141,7 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         _announce()
         try:
             deal = _extract_one(row, opener, cancel_event, extractor, pdf_source,
-                                selectors, validators, parse_lock, pool)
+                                selectors, validators, None, pool)
         finally:
             with lock:
                 busy.pop(who, None)

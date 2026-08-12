@@ -72,6 +72,17 @@ def fake_open_pdf(url):
                        "要約人於要約項下須支付的最高現金代價約為5,440萬港元。"})
 
 
+def _fake_worker(*_args):
+    """假解析。**必须是模块级函数** —— 局部 lambda 没法 pickle 给子进程。"""
+    page = ("「要約價」 指 每股要約股份0.519港元 "
+            "價值比較每股要約價為每股0.519港元，較："
+            "(i) 股份於最後交易日在聯交所所報收市價每股1.870港元折讓約72.25%。"
+            "要約人於要約項下須支付的最高現金代價約為5,440萬港元。")
+    return {"pages": {1: page}, "page_count": 1, "has_text_layer": True,
+            "extractor": "fake", "extractor_note": "", "pages_parsed": 1,
+            "stopped_early": False}
+
+
 def make_fetch(records, *, calls=None):
     def fetch(d1, d2, log, on_step, cancel_event):
         if calls is not None:
@@ -803,16 +814,17 @@ def test_an_unidentifiable_mirror_pair_is_left_for_a_human():
     assert a.verdict == b.verdict == "offer"
 
 
-# ---------------------------------------------------------------- 解析串行
+def test_parsing_runs_in_parallel_but_never_more_than_configured(
+        _isolate, monkeypatch):
+    """解析并行度由槽位数说了算 —— 多一个都不行。
 
-def test_parsing_never_runs_two_at_a_time(_isolate, monkeypatch):
-    """解析必须串行。实测 12 份真实公告只算解析：
+    早先这条测试断言的是**相反**的事（「解析必须串行」），依据是实测
+    「4 路并发解析比 1 路慢 70%」。那个结论只在线程里成立：CPU 型工作
+    受 GIL 限制没法真并行。解析搬进子进程之后没有 GIL 了，重测 8 份
+    60 页：1 个进程 17.3 秒 / 2 个 8.8 秒 / 3 个 6.6 秒 / 4 个 4.7 秒。
 
-        1 路 12.13 秒 / 2 路 13.59 秒 / 4 路 20.56 秒
-
-    GIL 让 CPU 型工作没法真并行，多开线程总时间反而涨 70%，
-    还把 Tk 主线程一起拖住 —— 那就是「未响应」的来源。
-    下载并发（I/O，等网络时放开 GIL），解析串行。
+    同一个结论，换了执行模型就正好反过来 —— 所以断言也跟着反过来，
+    但**上界**必须守住：开多少槽就最多几份在解析，不能失控。
     """
     import time as _t
 
@@ -820,26 +832,24 @@ def test_parsing_never_runs_two_at_a_time(_isolate, monkeypatch):
 
     monkeypatch.setattr(runner, "_speed_settings",
                         lambda: (4000, 4, "keyword", ["要約"]))
+    monkeypatch.setattr(runner, "_parse_workers", lambda: 2)
 
-    # 数并发的地方是 ParsePool.parse —— 真正的解析已经搬进子进程了，
-    # 在本进程给 pdf_source.parse_doc 打桩根本拦不到（打了也不会触发，
-    # 那样这条测试会「通过」但什么都没测）。
     overlap = {"max": 0, "now": 0}
     guard = threading.Lock()
-    real_parse = parsepool.ParsePool.parse
+    real_run = parsepool._Slot.run
 
-    def watched_parse(self, url, data, **kw):
+    def watched_parse(self, args):
         with guard:
             overlap["now"] += 1
             overlap["max"] = max(overlap["max"], overlap["now"])
         _t.sleep(0.05)
         try:
-            return real_parse(self, url, data, **kw)
+            return real_run(self, args)
         finally:
             with guard:
                 overlap["now"] -= 1
 
-    monkeypatch.setattr(parsepool.ParsePool, "parse", watched_parse)
+    monkeypatch.setattr(parsepool._Slot, "run", watched_parse)
 
     page = ("「要約價」 指 每股要約股份0.519港元 "
             "價值比較每股要約價為每股0.519港元，較："
@@ -851,21 +861,19 @@ def test_parsing_never_runs_two_at_a_time(_isolate, monkeypatch):
         _t.sleep(0.02)                       # 假装在下载
         return runner._Fetched(url, pdf, False)
 
-    monkeypatch.setattr(parsepool, "_worker",
-                        lambda *a: {"pages": {1: page}, "page_count": 1,
-                                    "has_text_layer": True, "extractor": "fake",
-                                    "extractor_note": "", "pages_parsed": 1,
-                                    "stopped_early": False})
+    monkeypatch.setattr(parsepool, "_worker", _fake_worker)
 
     rows = [{"row_id": f"r{i}", "date": "2026-06-15", "code": f"{i:05d}",
              "name": f"公司{i}", "title": "作出強制性無條件現金要約",
              "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
             for i in range(8)]
 
-    runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
-                          open_pdf=fetch_only)
-    assert overlap["max"] == 1, \
-        f"同时有 {overlap['max']} 份在解析 —— 解析必须串行"
+    deals = runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
+                                  open_pdf=fetch_only)
+
+    assert len(deals) == 8
+    assert overlap["max"] <= 2, \
+        f"同时有 {overlap['max']} 份在解析，配的是 2 个槽 —— 并行度失控了"
 
 
 def test_the_activity_line_says_how_long_each_one_has_waited(_isolate, monkeypatch):

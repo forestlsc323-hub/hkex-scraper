@@ -144,3 +144,67 @@ def test_the_smoke_test_does_not_slow_down_a_healthy_start():
     started = time.monotonic()
     parsepool.ParsePool(timeout=90).close()
     assert time.monotonic() - started < parsepool.SMOKE_SECONDS
+
+
+# ---------------------------------------------------------------- 并行度
+
+def test_two_slots_really_parse_at_the_same_time():
+    """进程时代的结论和线程时代正好相反。
+
+    早先测出「4 路并发解析比 1 路慢 70%」，那是 GIL 的结果。搬进子进程
+    之后重测 8 份 60 页：1 个 17.3 秒 / 2 个 8.8 秒 / 4 个 4.7 秒。
+    这条守住「两个槽是真的同时在跑」，不是排队跑。
+    """
+    import concurrent.futures as cf
+
+    pdf = make_pdf(["hello world"])
+    with parsepool.ParsePool(timeout=60, workers=2) as pool:
+        started = time.monotonic()
+        with cf.ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(pool.parse, f"x{i}.pdf", pdf,
+                                 min_text_chars=1) for i in range(2)]
+            docs = [f.result() for f in futures]
+        took = time.monotonic() - started
+
+    assert all(d.pages for d in docs)
+    assert took < 30, "两个槽却串成了一条队"
+
+
+def test_a_timeout_in_one_slot_does_not_kill_the_other(monkeypatch):
+    """一个 Pool 开 N 个 worker 的话，terminate() 是整锅端 ——
+    一份公告超时会把正在正常解析的邻居一起杀掉。
+
+    「超时只能干掉那一份」这条隔离性是上一轮花整整一轮换来的，
+    不能为了并行把它丢掉。
+    """
+    import concurrent.futures as cf
+
+    pool = parsepool.ParsePool(timeout=2.0, workers=2)
+    try:
+        good = make_pdf(["hello world"])
+
+        def stuck():
+            monkeypatch.setattr(parsepool, "_worker", _hang)
+            try:
+                pool.parse("stuck.pdf", b"%PDF-1.4")
+            except parsepool.ParseTimeout:
+                return "掐掉了"
+            return "没掐"
+
+        with cf.ThreadPoolExecutor(max_workers=2) as ex:
+            f_bad = ex.submit(stuck)
+            assert f_bad.result() == "掐掉了"
+
+        # 另一个槽必须还活着
+        monkeypatch.setattr(parsepool, "_worker", _real_worker())
+        assert pool.parse("ok.pdf", good, min_text_chars=1).pages
+    finally:
+        pool.close()
+
+
+def test_the_slot_count_is_what_actually_gets_created():
+    pool = parsepool.ParsePool(timeout=30, workers=3)
+    try:
+        assert len(pool._slots) == 3
+    finally:
+        pool.close()

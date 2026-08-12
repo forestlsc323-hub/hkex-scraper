@@ -24,14 +24,27 @@
   · 超时是**真的**超时：到点 terminate，那一行标成「解析超时」，
     剩下的接着跑。这才对得起那句「最多再等 90 秒」。
 
-只开一个工作进程，并且外层仍然串行调用。解析本来就是串行的（实测
-多路并发解析更慢），这里不趁机改并发 —— 一次只解决一个问题。
+并行度：**进程时代和线程时代的结论正好相反。**
+
+早先测出「4 路并发解析比 1 路慢 70%」，那是线程 + GIL 的结论 ——
+CPU 型工作在一个解释器里没法真并行，多开线程只是把同样的活切碎
+轮流做。解析搬进子进程之后没有 GIL 了，重测（8 份 60 页）：
+
+    1 个进程  17.3 秒      2 个进程   8.8 秒
+    3 个进程   6.6 秒      4 个进程   4.7 秒   ← 3.7 倍
+
+所以现在开多个进程。但**每个进程各自独立**（一个进程一个 Pool），
+不是一个 Pool 开多个 worker —— 后者在超时时只能整锅端掉，
+会把正在正常解析的邻居一起杀了。这条隔离性是上一轮花了整整一轮
+才换来的，不能为了并行把它丢掉。
 """
 
 from __future__ import annotations
 
 import logging
 import multiprocessing
+import queue
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +60,10 @@ def _smoke() -> str:
 
 class ParseTimeout(Exception):
     """这份公告解析超时，已经被掐掉。"""
+
+
+class _WorkerDied(Exception):
+    """子进程自己炸了（不是超时）。上层会退回本进程再试一次。"""
 
 
 def _worker(url: str, data: bytes, probe_pages: int, max_pages: int,
@@ -73,25 +90,26 @@ def _worker(url: str, data: bytes, probe_pages: int, max_pages: int,
     }
 
 
-class ParsePool:
-    """一个常驻的解析子进程，带一把真的秒表。
+class _Slot:
+    """一个独立的解析子进程。**一个槽一个进程**，互不牵连。
 
-    起不来就退回本进程解析（打包成 exe、受限环境里 spawn 可能不可用）。
-    退回意味着重新暴露在「卡死无法掐断」的风险里，所以这件事要说出来，
-    不能悄悄降级。
+    为什么不用「一个 Pool 开 N 个 worker」：Pool.terminate() 是整锅端，
+    一份公告解析超时就会把正在正常干活的邻居一起杀掉。而「超时只能
+    干掉那一份」这条隔离性，是上一轮花了整整一轮才换来的。
     """
 
-    def __init__(self, timeout: float = TIMEOUT_SECONDS, on_note=None):
+    def __init__(self, timeout: float, note):
         self.timeout = timeout
-        self._on_note = on_note
-        self._pool = None
+        self._note = note
+        self.lock = threading.Lock()
+        self.pool = None
         self._start(smoke=True)
 
     def _start(self, smoke: bool = False) -> None:
         try:
-            self._pool = multiprocessing.get_context("spawn").Pool(processes=1)
+            self.pool = multiprocessing.get_context("spawn").Pool(processes=1)
         except Exception as exc:                        # noqa: BLE001
-            self._pool = None
+            self.pool = None
             self._note(f"解析子进程起不来（{type(exc).__name__}），"
                        f"改在本进程解析：卡死的公告将无法掐断")
             return
@@ -111,30 +129,70 @@ class ParsePool:
         宁可开工前花一秒钟问清楚。
         """
         try:
-            got = self._pool.apply_async(_smoke, ()).get(SMOKE_SECONDS)
-            return got == "ok"
+            return self.pool.apply_async(_smoke, ()).get(SMOKE_SECONDS) == "ok"
         except Exception:                               # noqa: BLE001
             return False
 
-    def _note(self, text: str) -> None:
-        log.warning(text)
-        if self._on_note:
-            self._on_note(text)
+    def run(self, args) -> dict:
+        """在这个槽里解析一份。**并行度的真实上界就在这一层。**
 
-    def _restart(self) -> None:
+        排队等槽不算「正在解析」—— 早先的测试在 ParsePool.parse 外面数
+        并发，数到的是排队的线程，于是 2 个槽量出 4 路并行。
+        把执行放进槽里，数的地方和真相就对上了。
+        """
+        if self.pool is None:
+            return _worker(*args)
+        try:
+            return self.pool.apply_async(_worker, args).get(self.timeout)
+        except multiprocessing.TimeoutError:
+            # 只掐这一个槽 —— 别的槽正在正常解析，不能连坐
+            self.restart()
+            raise ParseTimeout(
+                f"解析超过 {self.timeout:.0f} 秒，已掐断") from None
+        except Exception as exc:                        # noqa: BLE001
+            self.restart()
+            raise _WorkerDied(f"{type(exc).__name__}: {exc}") from exc
+
+    def restart(self) -> None:
         """掐掉卡住的那个，换一个新的。
 
         terminate() 是真的发信号杀进程 —— 这正是线程做不到、
         而我们绕这一大圈想要的东西。
         """
-        pool, self._pool = self._pool, None
+        self.close()
+        self._start()
+
+    def close(self) -> None:
+        pool, self.pool = self.pool, None
         if pool is not None:
             try:
                 pool.terminate()
                 pool.join()
             except Exception:                           # noqa: BLE001
                 pass
-        self._start()
+
+
+class ParsePool:
+    """若干个独立的解析子进程，每个都带一把真的秒表。
+
+    起不来就退回本进程解析（打包成 exe、受限环境里 spawn 可能不可用）。
+    退回意味着重新暴露在「卡死无法掐断」的风险里，所以这件事要说出来，
+    不能悄悄降级。
+    """
+
+    def __init__(self, timeout: float = TIMEOUT_SECONDS, on_note=None,
+                 workers: int = 1):
+        self.timeout = timeout
+        self._on_note = on_note
+        self._slots = [_Slot(timeout, self._note) for _ in range(max(1, workers))]
+        self._free: queue.Queue = queue.Queue()
+        for slot in self._slots:
+            self._free.put(slot)
+
+    def _note(self, text: str) -> None:
+        log.warning(text)
+        if self._on_note:
+            self._on_note(text)
 
     def parse(self, url: str, data: bytes, *, probe_pages: int = 0,
               max_pages: int = 0, min_text_chars: int = 500):
@@ -142,40 +200,24 @@ class ParsePool:
         from .pdf_source import PdfDoc
 
         args = (url, data, probe_pages, max_pages, min_text_chars)
-        if self._pool is None:
-            return self._inline(args)
-
+        slot = self._free.get()          # 没有空槽就在这儿排队
         try:
-            payload = self._pool.apply_async(_worker, args).get(self.timeout)
-        except multiprocessing.TimeoutError:
-            self._restart()
-            raise ParseTimeout(
-                f"解析超过 {self.timeout:.0f} 秒，已掐断") from None
-        except Exception as exc:                        # noqa: BLE001
-            # 子进程自己炸了（内存不够、解析库崩了）。池子未必还能用，
-            # 重开一个，这一份退回本进程再试一次 —— 一份烂文件不该
-            # 让后面几十份全部走无池子路径。
-            self._note(f"解析子进程出错（{type(exc).__name__}: {exc}），"
-                       f"这一份改在本进程解析")
-            self._restart()
-            return self._inline(args)
+            payload = slot.run(args)
+        except ParseTimeout:
+            raise
+        except _WorkerDied as died:
+            # 子进程自己炸了（内存不够、解析库崩了）。这一份退回本进程
+            # 再试一次 —— 一份烂文件不该让后面几十份全部走无池子路径。
+            self._note(f"解析子进程出错（{died.args[0]}），这一份改在本进程解析")
+            payload = _worker(*args)
+        finally:
+            self._free.put(slot)         # 出了什么事都要把槽还回去
 
         return PdfDoc(url=url, from_cache=False, **payload)
 
-    def _inline(self, args):
-        """没有子进程时的退路：就在本进程解析，和以前一样。"""
-        from .pdf_source import PdfDoc
-        payload = _worker(*args)
-        return PdfDoc(url=args[0], from_cache=False, **payload)
-
     def close(self) -> None:
-        pool, self._pool = self._pool, None
-        if pool is not None:
-            try:
-                pool.terminate()
-                pool.join()
-            except Exception:                           # noqa: BLE001
-                pass
+        for slot in self._slots:
+            slot.close()
 
     def __enter__(self):
         return self
