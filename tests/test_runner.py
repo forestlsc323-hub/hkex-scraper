@@ -1300,3 +1300,66 @@ def test_a_single_day_over_the_server_hard_cap_is_reported_not_swallowed(
 
     assert any("单日就超过服务端硬顶" in s for s in said), \
         "取不全却不吭声 —— 这正是最该避免的那种失败"
+
+
+# ---------------------------------------------------------------- 原文摘录
+
+def test_the_excerpt_keeps_the_sentences_that_matter_and_drops_the_rest():
+    """一份公告两三万字，贴过来没人看得完。真正有用的就是
+    「較最後交易日收市價每股 X 港元折讓約 Y%」那几句。
+
+    这个功能存在的理由：我手上真实公告正文只有 1,805 字，而一次实跑
+    要读一百多万字 —— 54 条正则全是从那点样本反推的，覆盖不到的
+    措辞就抽不出来。溢价率那 9 个空白全是这么来的。
+    """
+    pages = {
+        1: "封面。本公司董事會欣然宣佈。" + "无关内容。" * 200,
+        2: "無關的一頁。" * 300,
+        3: "價值比較每股要約價0.519港元，較最後交易日收市價每股1.870港元"
+           "折讓約72.25%。",
+    }
+    text = runner.wording_excerpt(pages)
+
+    assert "折讓約72.25%" in text and "第 3 页" in text
+    assert "無關的一頁" not in text, "把没用的整页也抄进来了"
+    assert len(text) < 2000, "摘录应该短到能直接贴，不是搬运全文"
+
+
+def test_overlapping_windows_are_merged_not_repeated():
+    """同一段里挤着好几个锚点，不能把这段抄好几遍。"""
+    pages = {1: "價值比較 要約價 溢價 折讓 最後交易日 都挤在这一句里。"}
+    text = runner.wording_excerpt(pages)
+    assert text.count("都挤在这一句里") == 1
+
+
+def test_a_document_with_no_anchor_says_so_instead_of_dumping_everything():
+    text = runner.wording_excerpt({1: "董事會會議召開日期。" * 50})
+    assert "一个锚点都没出现" in text
+
+
+def test_the_excerpt_is_capped_so_one_document_cannot_flood_the_file():
+    pages = {i: f"第{i}段 價值比較 溢價 折讓" for i in range(1, 40)}
+    text = runner.wording_excerpt(pages, limit=5)
+    assert text.count("—— 第") <= 5
+    assert "已截断" in text
+
+
+def test_export_writes_a_file_even_when_a_download_fails(_isolate, monkeypatch):
+    """取不回来的那一行要如实写进文件，不能让整个导出失败。"""
+    from hkexdb import pdf_source
+
+    def boom(url, cache, **kw):
+        raise ConnectionError("连不上")
+
+    monkeypatch.setattr(pdf_source, "fetch_bytes", boom)
+    path = runner.export_wording(
+        [{"股票代码": "00195", "受要约方": "綠科", "公告日期": "2026-05-29",
+          "PDF链接": "https://x/1.pdf"}])
+
+    text = path.read_text(encoding="utf-8")
+    assert "00195" in text and "取不回来" in text
+
+
+def test_a_row_without_a_link_is_skipped_not_crashed(_isolate):
+    path = runner.export_wording([{"股票代码": "00001", "PDF链接": ""}])
+    assert "没有 PDF 链接" in path.read_text(encoding="utf-8")

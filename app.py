@@ -115,6 +115,8 @@ def main() -> int:
     btn_csv.pack(side="left", padx=4)
     btn_score = ttk.Button(dtop, text="对答案（准确率）")
     btn_score.pack(side="left", padx=4)
+    btn_wording = ttk.Button(dtop, text="导出原文措辞（发给 Claude）")
+    btn_wording.pack(side="left", padx=4)
 
     dsum = ttk.Label(page_deals, text="", foreground="#666", padding=(12, 0))
     dsum.pack(fill="x")
@@ -258,6 +260,62 @@ def main() -> int:
 
     btn_score.configure(command=run_scoring)
 
+    def export_wording() -> None:
+        """把「抽不出来」那几单的原文措辞摘出来，好让 Claude 照着改正则。
+
+        为什么需要这个按钮：抽取层那 54 条正则，全是从三份真实公告
+        （合计 1,805 字）加上每次实跑暴露的失败反推出来的。而你一次
+        实跑要读一百多万字 —— 正则覆盖不到的措辞就抽不出来，
+        溢价率那 9 个空白全是这么来的。
+
+        靠人工从 PDF 里复制原文太慢，所以让程序自己摘：默认挑选中那行，
+        没选就自动挑「溢价率或交易规模是空的」那些单。
+        """
+        from tkinter import messagebox
+
+        picked = [_selected()] if _selected() else [
+            r for r in dstate["view"]
+            if r.get("判定") == "要约"
+            and not (str(r.get("主值溢价率(%)", "")).strip()
+                     and str(r.get("交易规模(HKD)", "")).strip())]
+        if not picked:
+            messagebox.showinfo("导出原文措辞",
+                                "没有需要导出的行。\n\n"
+                                "选中某一行再点，就只导出那一单；\n"
+                                "不选的话会自动挑「溢价率或规模是空的」那些单。")
+            return
+        if not messagebox.askyesno(
+                "导出原文措辞",
+                f"要把 {len(picked)} 单公告的关键段落摘出来吗？\n\n"
+                f"会重新下载这几份 PDF（每份几秒），只摘带\n"
+                f"「價值比較 / 要約價 / 溢價 / 折讓 / 代價」的段落，\n"
+                f"不是全文。\n\n"
+                f"结果写到 原文摘录.txt，发给 Claude 就能照着改正则。"):
+            return
+
+        btn_wording.configure(state="disabled", text="导出中…")
+
+        def work():
+            try:
+                path = runner.export_wording(picked,
+                                             on_log=lambda t: msgs.put(("log", t)))
+                msgs.put(("wording", path))
+            except Exception as exc:                      # noqa: BLE001
+                msgs.put(("wording", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_wording(result) -> None:
+        from tkinter import messagebox
+        btn_wording.configure(state="normal", text="导出原文措辞（发给 Claude）")
+        if isinstance(result, Exception):
+            messagebox.showerror("导出原文措辞",
+                                 f"{type(result).__name__}: {result}")
+            return
+        _open_file(Path(result))
+
+    btn_wording.configure(command=export_wording)
+
     # ================================================================
     # 抓取页
     # ================================================================
@@ -395,6 +453,8 @@ def main() -> int:
                 finish(payload)
             elif kind == "update":
                 show_update(payload)
+            elif kind == "wording":
+                show_wording(payload)
             elif kind == "checked":
                 state["running"] = False
                 btn_run.configure(state="normal")

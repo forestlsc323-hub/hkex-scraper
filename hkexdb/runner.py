@@ -1562,3 +1562,108 @@ def _write_diagnostic(lines: list[str], result: Result) -> Path:
     ]
     out.write_text("\n".join(str(p) for p in parts), encoding="utf-8")
     return out
+
+
+# ---------------------------------------------------------------- 原文摘录
+
+# 摘录时围绕这些词各取前后一段。它们是抽取层真正要找的锚点 ——
+# 摘出来的就是「正则本该命中却没命中」的那几句。
+_WORDING_ANCHORS = [
+    "價值比較", "价值比较", "要約價", "註銷價", "收購價",
+    "溢價", "折讓", "最高現金", "代價總額", "總代價", "現金代價",
+    "最後交易日", "未受干擾",
+]
+_WORDING_WINDOW = 450       # 每个锚点前后各取多少字
+
+
+def wording_excerpt(pages: dict, anchors=None, window: int = _WORDING_WINDOW,
+                    limit: int = 12) -> str:
+    """从解析出来的正文里，摘出锚点附近那几段。
+
+    为什么不是整篇导出：一份公告两三万字，贴过来没人看得完，而真正
+    有用的就是「較最後交易日收市價每股 X 港元折讓約 Y%」那几句。
+    摘录只取锚点附近，既够我改正则，也不会把整份文件搬来搬去。
+    """
+    from .extractor import _flat
+
+    anchors = anchors or _WORDING_ANCHORS
+    out, taken = [], 0
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        spans: list[tuple[int, int]] = []
+        for word in anchors:
+            start = 0
+            while True:
+                i = flat.find(word, start)
+                if i < 0:
+                    break
+                spans.append((max(0, i - window), min(len(flat), i + window)))
+                start = i + len(word)
+        if not spans:
+            continue
+        # 相邻的窗口合并，免得同一段被抄好几遍
+        spans.sort()
+        merged = [list(spans[0])]
+        for a, b in spans[1:]:
+            if a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        for a, b in merged:
+            if taken >= limit:
+                out.append("…（后面还有，已截断）")
+                return "\n\n".join(out)
+            out.append(f"—— 第 {page} 页 ——\n{flat[a:b].strip()}")
+            taken += 1
+    return "\n\n".join(out) if out else "（这份公告里一个锚点都没出现）"
+
+
+def export_wording(rows: list[dict], on_log=None) -> Path:
+    """把几单公告的关键段落摘出来写成一个文件，好发给我改正则。
+
+    这个功能存在的理由，是我手上真实公告正文只有 1,805 字（1417 /
+    3336 / 00195 三份的价值比较节），而你一次实跑要读一百多万字。
+    54 条正则全是从那 1,805 字 + 每次实跑暴露的失败反推出来的 ——
+    覆盖不到的措辞就抽不出来，溢价率那 9 个空白全是这么来的。
+
+    靠人工从 PDF 里复制原文太慢，所以让程序自己摘：给它几行结果，
+    它把对应公告重新取回来、解析、摘出锚点附近那几段。
+    """
+    def log(text: str = "") -> None:
+        if on_log:
+            on_log(str(text))
+
+    from . import extractor, pdf_source
+    from .parsepool import ParsePool
+
+    cache = ROOT / "data" / "cache" / "pdf"
+    out = ROOT / "原文摘录.txt"
+    parts = [
+        "这个文件是给 Claude 改正则用的：只摘了公告里带「價值比較 / 要約價 /",
+        "溢價 / 折讓 / 代價」这些词的段落，不是全文。",
+        "", "=" * 64, ""]
+
+    pool = ParsePool(timeout=_parse_timeout(), on_note=log)
+    try:
+        for row in rows:
+            code = row.get("股票代码", "") or "（无代码）"
+            name = row.get("受要约方", "")
+            url = row.get("PDF链接", "")
+            head = f"{code} {name}　{row.get('公告日期', '')}"
+            log(f"  正在取 {head} …")
+            if not url:
+                parts += [head, "（这一行没有 PDF 链接，跳过）", "", "-" * 64, ""]
+                continue
+            try:
+                data, _ = pdf_source.fetch_bytes(url, cache)
+                doc = pool.parse(url, data, probe_pages=0)
+                body = wording_excerpt(doc.pages)
+            except Exception as exc:                      # noqa: BLE001
+                body = f"（取不回来：{type(exc).__name__}: {exc}）"
+            parts += [head, url, "", body, "", "-" * 64, ""]
+    finally:
+        pool.close()
+
+    out.write_text("\n".join(parts), encoding="utf-8")
+    log(f"已写出 {out}")
+    return out
