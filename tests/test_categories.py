@@ -114,7 +114,10 @@ def test_cache_info_and_clear_report_real_numbers(tmp_path, monkeypatch):
         (cache / f"{i}.pdf").write_bytes(b"x" * 1000)
 
     assert runner.cache_info() == (3, 3000)
-    assert runner.clear_cache() == (3, 3000)
+    # 删除走的是「清理临时文件」那一套（界面上的按钮就是它），
+    # 原来还有个 clear_cache 做同一件事，没有任何调用方，已删。
+    gone, freed = runner.clear_disposable(["data/cache"])
+    assert (gone, freed) == (3, 3000)
     assert runner.cache_info() == (0, 0)
 
 

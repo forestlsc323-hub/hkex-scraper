@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 MGO, VGO, PO = "MGO", "VGO", "PO"
 PREMIUM, DISCOUNT = "premium", "discount"
@@ -84,7 +85,8 @@ class Comparison:
         names = {"undisturbed": "未受干扰日", "last_trading_day": "最后交易日",
                  "pre_rule37": "3.7公告前", "nav": "每股净资产"}
         windows = {"spot": "收市价", "5d": "前5日均价", "10d": "前10日均价",
-                   "30d": "前30日均价", "180d": "前180日均价", "nav": ""}
+                   "30d": "前30日均价", "60d": "前60日均价",
+                   "180d": "前180日均价", "nav": ""}
         return f"{names.get(self.anchor, self.anchor)}{windows.get(self.window, '')}"
 
 
@@ -169,9 +171,19 @@ class Extraction:
 _FOOTER = re.compile(r"[-–—]\s*\d{1,4}\s*[-–—]")
 
 
+_SPACES = re.compile(r"[ \t　]+")
+
+
+@lru_cache(maxsize=512)
 def _flat(text: str) -> str:
-    """PDF 的换行会把一个句子劈开，先拼回去；顺手去掉页脚。"""
-    flat = re.sub(r"[ \t　]+", " ", text.replace("\n", ""))
+    """PDF 的换行会把一个句子劈开，先拼回去；顺手去掉页脚。
+
+    ⚠️ 这是全篇最热的一个函数：十几个 extract_* 各自遍历一遍 pages，
+    一份 60 页的公告要调它 800 多次，占整个抽取层七成时间。
+    它是纯函数（同一页永远得同一个结果），所以加记忆就够，
+    不必去改十几个调用方的结构。
+    """
+    flat = _SPACES.sub(" ", text.replace("\n", ""))
     return _FOOTER.sub("", flat)
 
 
@@ -775,12 +787,6 @@ def _comparisons_in(item: str, page: int) -> tuple[list[Comparison], bool]:
     return out, skipped
 
 
-def _build(clause: str, page: int) -> Comparison | None:
-    """一句 → 一条比较项。抽不齐就返回 None，绝不半拉子入表。"""
-    found, _ = _comparisons_in(clause, page)
-    return found[0] if found else None
-
-
 # 表格形式的价值比较。08439 新百利就是这么排的 —— 一张表，不是一句句话。
 # 扁平化之后长这样（列头和折行的字都混在里面）：
 #
@@ -1273,12 +1279,17 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.comparisons = extract_comparisons(pages, result.notes)
     result.six_month_low, result.six_month_high, result.six_month_evidence = \
         extract_six_month(pages)
-    result.deal_size, result.deal_size_evidence = extract_deal_size(pages)
+    # 候选算一遍就够 —— 主值和备注都从这一份里取。
+    # （原来 extract_deal_size 里算一遍、写备注时又算一遍，
+    #   而这个函数是整个抽取层第二贵的一项。）
+    others = deal_size_candidates(pages)
+    if others:
+        amount, page, quote = others[0]
+        result.deal_size, result.deal_size_evidence = amount, Evidence(page, quote)
 
     # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
     # 比值连续散布在 0.019~3.201 —— 说明不是稳定取错了某个口径，
     # 是每份公告里候选不同。把候选摆出来，「这里有得选」才看得见。
-    others = deal_size_candidates(pages)
     if len(others) > 1:
         rest = "、".join(a for a, _, _ in others[1:5])
         result.notes.append(

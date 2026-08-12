@@ -38,6 +38,9 @@ from .scoring import codes_in, normalise_code
 # 用的是同一个窗口，否则「追踪说找到了、评分说漏了」会自相矛盾。
 NEAR_DAYS = 45
 
+# 详列多少单。再多就只报分层合计 —— 报告是给人看的，不是给人翻的。
+DETAIL_LIMIT = 25
+
 INDEX = "index"
 SCREEN = "screen"
 EXTRACT = "extract"
@@ -96,12 +99,11 @@ class Trace:
     layer: str = ""
 
     def text(self) -> str:
+        """一单的追踪结果。**只印有东西的那几层** ——
+        三行「无」重复 80 遍会把报告淹掉，而结论那一行已经说清楚了。"""
         out = [f"{self.code}　{self.date or '（不限日期）'}　→　{self.verdict}"]
         for label, hits in (("索引", self.index), ("筛查", self.screened),
                             ("成品", self.deals)):
-            if not hits:
-                out.append(f"    {label}：无")
-                continue
             for hit in hits:
                 out.append(f"    {label}：{hit.line()}")
         return "\n".join(out)
@@ -234,11 +236,18 @@ def missing_report(got_rows: list[dict], answer_rows: list[dict], *,
     snap = Snapshot(root or ROOT)
     lines = ["", "── 漏检追踪：这些单卡在哪一层 ──"]
     tally: dict[str, int] = {}
+    shown = 0
     for want in misses:
         result = trace(want.get("股票代码", ""), want.get("公告日期", ""),
                        snapshot=snap, near_days=near_days)
         tally[result.layer or "other"] = tally.get(result.layer or "other", 0) + 1
-        lines.append(result.text())
+        # 只详列前 DETAIL_LIMIT 单。存档是空的时候会有几十上百单同时落在
+        # 索引层，全印出来只是把报告刷长，合计那一行已经说明问题。
+        if shown < DETAIL_LIMIT:
+            lines.append(result.text())
+            shown += 1
+    if len(misses) > shown:
+        lines.append(f"…还有 {len(misses) - shown} 单，分层见下面的合计")
     lines.append("")
     label = {INDEX: "索引层（没搜到）", SCREEN: "筛查层（规则灰掉）",
              EXTRACT: "抽取层（没抽出字段）", "other": "其他"}

@@ -37,11 +37,14 @@ DEFAULT_WINDOW = "30d"
 # 没有 30 日均价时按这个顺序退。**退到哪一档会写进「主值口径」那一列**，
 # 所以这不是静默降级 —— 数字和口径永远同列显示。
 #
+# 顺序＝**离 30 天最近的先上**，你说的「取 30 天以内或者 30 天之后的数」
+# 就是这个意思，按天数距离排出来正好是下面这一串：
+#     30d(0) → 10d(20) → 5d(25) → spot(29) → 60d(30) → 180d(150)
 # 依据（两单都是你答案表里核过的）：
 #   01833 平安好醫生  答案 -4.23%  ← 前10日均价（该单最长只到 10 日）
 #   01980 天鴿互動    答案 +2.10%  ← 前5日均价（该单最长只到 5 日）
 # 原来这两单一律留空，等于把「公告没给 30 日」当成「公告没给溢价率」。
-WINDOW_FALLBACK = ("30d", "10d", "5d", "spot")
+WINDOW_FALLBACK = ("30d", "10d", "5d", "spot", "60d", "180d")
 
 
 @dataclass(frozen=True)
@@ -197,31 +200,8 @@ def check_direction(pick: PremiumPick | None, offer_price: str) -> DirectionChec
                           pct_agrees=pct_agrees, detail=detail)
 
 
-@dataclass(frozen=True)
-class DealSizePick:
-    value: Decimal
-    key: str
-    role: str
-    page: int | None
-    source_quote: str | None
-    rejected: list[str]
-
-
-def select_primary_deal_size(candidates: list[dict], *,
-                             key: str = "offer_max_cash") -> DealSizePick | None:
-    """从交易规模的多个候选值里选主值。
-
-    1417 那单有 5 个候选，其中 2 个是分项干扰值。
-    按反推规则取 `offer_max_cash`（要约项下最高现金代价）。
-    """
-    match = next((c for c in candidates if c.get("key") == key), None)
-    if match is None:
-        return None
-    return DealSizePick(
-        value=Decimal(str(match["value"])),
-        key=match["key"],
-        role=match.get("role", ""),
-        page=match.get("page"),
-        source_quote=match.get("quote"),
-        rejected=[c["key"] for c in candidates if c is not match],
-    )
+# ⚠️ 交易规模的选取**不在这一层**。它在 extractor.deal_size_candidates ——
+# 那里能看见原文上下文（「这笔钱付给谁」得看句子，看不了候选清单）。
+# 这里曾经有第二套实现 select_primary_deal_size，流水线从来没调用过，
+# 只有它自己的测试在用。两套规则各说各话是审计级数据库最不该有的东西，
+# 所以删掉了。交易规模的规则和回归测试都在抽取层。

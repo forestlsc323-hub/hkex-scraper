@@ -344,7 +344,7 @@ def _keep_raw_files() -> bool:
 PROBE_PAGES = 12
 
 # 开几个解析子进程。见 _parse_workers 的实测数据。
-PARSE_WORKERS = 2
+PARSE_WORKERS = "auto"
 
 
 def _probe_pages() -> int:
@@ -357,20 +357,34 @@ def _probe_pages() -> int:
         return PROBE_PAGES
 
 
-def _parse_workers() -> int:
-    """开几个解析子进程。
+def _auto_workers() -> int:
+    """按这台机器的核数定解析子进程数。
 
     实测（8 份 60 页）：1 个 17.3 秒 / 2 个 8.8 秒 / 3 个 6.6 秒 /
-    4 个 4.7 秒 —— 接近线性。默认取 2：再多就开始跟你机器上别的程序
-    抢 CPU 和内存（一份 295 页的综合文件解析时能吃掉几百兆），
-    而收益已经在递减。
+    4 个 4.7 秒 —— 接近线性。原来默认写死 2，在四核以上的机器上等于
+    白扔一半速度；写死 4 又会在双核机上把界面拖卡。
+
+    取核数的一半、封顶 4：一份 295 页的综合文件解析时能吃掉几百兆，
+    四个并发就是一两个 G，再多不值当。
     """
+    import os
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
+def _parse_workers() -> int:
+    """开几个解析子进程。config.yaml 写 auto 或留空就按核数自动定。"""
     from .config import section
     try:
-        return max(1, min(8, int(section("config.yaml", key="pdf", root=ROOT)
-                                 .get("parse_workers", PARSE_WORKERS))))
-    except (TypeError, ValueError, AttributeError):
-        return PARSE_WORKERS
+        want = section("config.yaml", key="pdf", root=ROOT).get("parse_workers",
+                                                                PARSE_WORKERS)
+    except (TypeError, AttributeError):
+        want = PARSE_WORKERS
+    if isinstance(want, str) and want.strip().lower() in ("auto", ""):
+        return _auto_workers()
+    try:
+        return max(1, min(8, int(want)))
+    except (TypeError, ValueError):
+        return _auto_workers()
 
 
 def _parse_timeout() -> float:
@@ -804,21 +818,6 @@ def human_size(n: int) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} GB"
-
-
-def clear_cache() -> tuple[int, int]:
-    """删掉公告原件副本，腾地方。返回 (删了几份, 腾出多少字节)。
-
-    删了不影响已经抽出来的 deals.csv —— 但重跑时要重新下载，
-    而且如果哪份公告已经被披露易换掉，那一单就再也复现不了原样。
-    """
-    count, size = cache_info()
-    path = ROOT / CACHE_DIR
-    if path.exists():
-        for f in path.iterdir():
-            if f.is_file():
-                f.unlink()
-    return count, size
 
 
 def score_against_answer_key(on_log=None) -> str:
@@ -1647,9 +1646,9 @@ def _run_checks(ex, validators) -> str:
 # 所以列是固定的：某一单没有这个口径就留空，绝不用别的口径顶上。
 LADDER_COLUMNS = [
     "最后交易日收市价", "最后交易日前5日均价", "最后交易日前10日均价",
-    "最后交易日前30日均价", "最后交易日前180日均价",
+    "最后交易日前30日均价", "最后交易日前60日均价", "最后交易日前180日均价",
     "未受干扰日收市价", "未受干扰日前5日均价", "未受干扰日前10日均价",
-    "未受干扰日前30日均价", "未受干扰日前180日均价",
+    "未受干扰日前30日均价", "未受干扰日前60日均价", "未受干扰日前180日均价",
     "3.7公告前收市价",
     "每股净资产",
 ]

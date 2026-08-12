@@ -165,27 +165,9 @@ def test_unknown_anchor_is_not_silently_accepted():
 
 # ---------------------------------------------------------------- 交易规模
 
-def test_deal_size_rule_reproduces_human_answer(fx):
-    pick = selectors.select_primary_deal_size(fx["deal_size_candidates"])
-    assert pick is not None
-    assert pick.value == Decimal(str(fx["human_answer"]["deal_size"])), (
-        f"规则选出 {pick.value}，人工答案 {fx['human_answer']['deal_size']}")
-
-
-def test_deal_size_rejects_the_distractors_on_1417():
-    """1417 有 5 个候选，其中 2 个是分项干扰值，1 个是 SPA 对价。"""
-    fx = load(FIXTURE_DIR / "1417_mgo_20260615.yaml")
-    pick = selectors.select_primary_deal_size(fx["deal_size_candidates"])
-
-    assert pick.value == Decimal("54400000")
-    assert set(pick.rejected) == {
-        "spa1_consideration", "spa2_consideration",
-        "spa_total_consideration", "implied_equity_value"}
-    # 最容易误选的是 SPA 对价 —— 它更大，且是「这笔交易实际付掉的钱」
-    spa = next(c for c in fx["deal_size_candidates"]
-               if c["key"] == "spa_total_consideration")
-    assert spa["value"] == 155643703
-    assert spa["value"] > pick.value
+# 交易规模的选取规则和它的回归测试都在抽取层（tests/test_real_wording.py
+# 里「这笔钱付给谁」那几条）—— 这里原来那两个测试用的是 selectors 里的
+# 第二套实现，而流水线从来没调用过它，测了个寂寞。
 
 
 def test_1417_printed_vs_recomputed_gap_is_recorded():
@@ -240,8 +222,12 @@ def test_field_accuracy_report_is_three_for_three(capsys):
             "offer_type": fx["deal"]["offer_type"],
             "premium_pct": str(selectors.select_primary_premium(
                 fx["price_comparisons"]).signed_pct),
-            "deal_size": str(selectors.select_primary_deal_size(
-                fx["deal_size_candidates"]).value),
+            # 交易规模按 fixture 里标好的口径取（offer_max_cash）——
+            # 这一栏的**规则**由抽取层的真实措辞测试守着，这里只是
+            # 三单固定样本的对答案报告。
+            "deal_size": str(next(
+                c["value"] for c in fx["deal_size_candidates"]
+                if c["key"] == "offer_max_cash")),
         }
         for f in fields:
             tally[f][1] += 1
