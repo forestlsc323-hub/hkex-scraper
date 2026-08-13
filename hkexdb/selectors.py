@@ -37,14 +37,17 @@ DEFAULT_WINDOW = "30d"
 # 没有 30 日均价时按这个顺序退。**退到哪一档会写进「主值口径」那一列**，
 # 所以这不是静默降级 —— 数字和口径永远同列显示。
 #
-# 顺序＝**离 30 天最近的先上**，你说的「取 30 天以内或者 30 天之后的数」
-# 就是这个意思，按天数距离排出来正好是下面这一串：
-#     30d(0) → 10d(20) → 5d(25) → spot(29) → 60d(30) → 180d(150)
+# 顺序＝**离 30 个交易日最近的先上**（月按 21 个交易日折算），
+# 你说的「取 30 天以内或者 30 天之后的数」就是这个意思：
+#   30d(0) 1m(9) 10d(20) 5d(25) 收市价(29) 60d(30) 3m(33) 90d(60)
+#   120d(90) 6m(96) 180d(150) 12m(222)
 # 依据（两单都是你答案表里核过的）：
 #   01833 平安好醫生  答案 -4.23%  ← 前10日均价（该单最长只到 10 日）
 #   01980 天鴿互動    答案 +2.10%  ← 前5日均价（该单最长只到 5 日）
-# 原来这两单一律留空，等于把「公告没给 30 日」当成「公告没给溢价率」。
-WINDOW_FALLBACK = ("30d", "10d", "5d", "spot", "60d", "180d")
+#   09638 法拉帝      答案 +27.20% ← 前1个月均价（整套梯子按月，没有交易日口径）
+# 原来这几单一律留空，等于把「公告没给 30 日」当成「公告没给溢价率」。
+WINDOW_FALLBACK = ("30d", "1m", "10d", "5d", "spot", "60d", "3m",
+                   "90d", "120d", "6m", "180d", "12m")
 
 
 @dataclass(frozen=True)
@@ -69,13 +72,17 @@ class PremiumPick:
 
 def _pick_one(candidates: list[dict], anchor_priority: tuple[str, ...],
               total: int, fell_back: bool) -> PremiumPick | None:
-    def rank(item: dict) -> int:
+    def rank(item: dict) -> tuple:
+        # 交易所排在锚点**前面**：双重上市的公司两套梯子数字完全不同
+        # （09638 法拉帝对米兰 25.9%、对港交所 27.2%），这是港股可比库，
+        # 口径取港交所那一套。认不出交易所的按港股处理（绝大多数单）。
+        venue = 0 if item.get("venue", "") != "foreign" else 1
         anchor = item.get("anchor", "")
-        return (anchor_priority.index(anchor) if anchor in anchor_priority
-                else len(anchor_priority))
+        return (venue, anchor_priority.index(anchor)
+                if anchor in anchor_priority else len(anchor_priority))
 
     best = min(candidates, key=rank)
-    if rank(best) >= len(anchor_priority):
+    if rank(best)[1] >= len(anchor_priority):
         return None      # 该窗口下没有任何已知锚点，宁可不给答案
 
     pct = Decimal(str(best["stated_pct"]))
@@ -85,7 +92,7 @@ def _pick_one(candidates: list[dict], anchor_priority: tuple[str, ...],
     # 有争议（一单你要最后交易日，一单你要未受干扰日），所以不管选了
     # 哪个，都把另一个摆到备注里 —— 想改哪一单，看一眼就能改。
     others = [c for c in candidates if c is not best
-              and rank(c) < len(anchor_priority)]
+              and rank(c)[1] < len(anchor_priority)]
     other = min(others, key=rank) if others else None
     other_pct = ""
     if other is not None:

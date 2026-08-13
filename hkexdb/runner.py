@@ -1500,7 +1500,7 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             comps = [{"anchor": c.anchor, "window": c.window, "label": c.label,
                       "stated_pct": c.stated_pct,
                       "stated_direction": c.stated_direction,
-                      "benchmark": c.benchmark,
+                      "benchmark": c.benchmark, "venue": c.venue,
                       "page": c.page, "quote": c.quote} for c in ex.comparisons]
             rules = _premium_rules()
             pick = selectors.select_primary_premium(
@@ -1654,16 +1654,19 @@ def _run_checks(ex, validators, premium_pct: str = "") -> str:
         bad = [f"{f.code}:{f.subject}" for f in floor if not f.passed]
         return "未通过 " + "；".join(bad) if bad else ""
     offer = Decimal(ex.offer_price)
+    # 并列句拆出来的那些条可能没有基准价（公告把价放在下面的表里），
+    # 没有基准价就跑不了 V4/V5 —— 跳过，而不是拿空串去构造 Decimal。
+    usable = [c for c in ex.comparisons if c.benchmark]
     comparisons = [validators.PriceComparison(
         label=c.label, benchmark=Decimal(c.benchmark),
         benchmark_decimals=c.benchmark_decimals,
         benchmark_is_exact=c.benchmark_is_exact,
         stated_pct=Decimal(c.stated_pct), stated_direction=c.stated_direction,
-        page=c.page, source_quote=c.quote) for c in ex.comparisons]
+        page=c.page, source_quote=c.quote) for c in usable]
 
     low = Decimal(ex.six_month_low) if ex.six_month_low else Decimal(0)
     high = Decimal(ex.six_month_high) if ex.six_month_high else Decimal("9" * 12)
-    nonmarket = frozenset(c.label for c in ex.comparisons if c.anchor == "nav")
+    nonmarket = frozenset(c.label for c in usable if c.anchor == "nav")
     # V16 只看市价类基准 —— 每股净资产和市价差几倍是常态，不算异常。
     spread = [(c.label, Decimal(c.benchmark)) for c in ex.comparisons
               if c.anchor != "nav" and c.benchmark]

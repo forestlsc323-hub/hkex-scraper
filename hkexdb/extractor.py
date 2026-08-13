@@ -51,7 +51,9 @@ PREMIUM, DISCOUNT = "premium", "discount"
 
 # 「部份」和「部分」在港交所公告里混用，前者才是港式繁体的常见写法。
 # 只认「部分」会把一单部分要约判成别的类型（09638 法拉帝就是）。
-_SCOPE_PARTIAL = re.compile(r"部[分份](?:收購)?要約|partial\s+offer", re.I)
+# 09638 法拉帝（意大利公司，双重上市）写的是「部分**公開**收購要約」。
+_SCOPE_PARTIAL = re.compile(
+    r"部[分份](?:公開)?(?:收購)?要約|partial\s+(?:public\s+)?(?:tender\s+)?offer", re.I)
 _SCOPE_FULL = re.compile(
     r"全面(?:性)?[^，。；]{0,8}要約|全部已發行股份[^，。；]{0,16}要約|"
     r"general\s+offer", re.I)
@@ -100,6 +102,7 @@ class Comparison:
     page: int
     quote: str
     at: int = -1               # 在「價值比較」一节里的偏移，按替代方案切块要用
+    venue: str = ""            # hk / foreign —— 双重上市的公司会印两套梯子
 
     @property
     def label(self) -> str:
@@ -107,7 +110,10 @@ class Comparison:
                  "pre_rule37": "3.7公告前", "nav": "每股净资产"}
         windows = {"spot": "收市价", "5d": "前5日均价", "10d": "前10日均价",
                    "30d": "前30日均价", "60d": "前60日均价",
-                   "180d": "前180日均价", "nav": ""}
+                   "180d": "前180日均价", "nav": "",
+                   "90d": "前90日均价", "120d": "前120日均价",
+                   "1m": "前1个月均价", "3m": "前3个月均价",
+                   "6m": "前6个月均价", "12m": "前12个月均价"}
         return f"{names.get(self.anchor, self.anchor)}{windows.get(self.window, '')}"
 
 
@@ -555,6 +561,24 @@ def _choose_deal_size(result, candidates: list[tuple[str, int, str]],
             + ("…" if len(rejected) > 3 else ""))
 
 
+# 外币计价的要约（09638 法拉帝按 3.50 歐元），公告会在脚注里给港元等值：
+#     「僅供說明用途，代價3.50歐元相當於每股31.71港元，乃根據參考匯率計算」
+# 这是**摘录**公告自己算好的数，不是我们做汇率换算（铁律一）。
+_HKD_EQUIVALENT = re.compile(
+    r"(?:代價|要約價|價格)[^。；]{0,20}?(?:歐元|美元|人民幣|英鎊|新加坡元)"
+    r"[^。；]{0,12}?(?:相當於|相等於|約為|折合)[^。；]{0,8}?每股\s*([\d,]+\.?\d*)\s*港元")
+
+
+def _hkd_equivalent(pages: dict[int, str]) -> tuple[str, Evidence]:
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        m = _HKD_EQUIVALENT.search(flat)
+        if m:
+            return m.group(1).replace(",", ""), Evidence(
+                page, flat[max(0, m.start() - 20):m.end() + 10].strip())
+    return "", Evidence()
+
+
 def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
     """按模式优先级扫，而不是按页码。
 
@@ -568,7 +592,8 @@ def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
             if m:
                 start = max(0, m.start() - 20)
                 return m.group(1), Evidence(page, flat[start:m.end() + 20].strip())
-    return "", Evidence()
+    # 一个港元价都找不到时，看看是不是外币计价的单 —— 公告自己给了港元等值。
+    return _hkd_equivalent(pages)
 
 
 # ---------------------------------------------------------------- 价值比较
@@ -639,8 +664,30 @@ def _pcts(text: str) -> list:
 # 所以只取并列开始前的那一条，其余标出来让人补（铁律二：不静默瞎配）。
 _PARALLEL = re.compile(r"分別|分别")
 
+# 并列句里逐个列出来的窗口：「1個月、3個月、6個月及12個月」
+# 「30個、60個及90個交易日」。数得清个数，才敢按位置一一对应。
+_WINDOW_TOKEN = re.compile(
+    r"(?:[一二三四五六七八九十百]+|\d+)\s*個\s*(?:交易日|月)?(?=[、及和，]|交易日|個|期間|的|平均)")
+
 _PARALLEL_NOTE = ("价值比较里有「分別…」并列句，只取了并列开始前的那一条，"
                   "其余口径请人工补（拆不准就不硬拆）")
+
+# 双重上市的公司会把同一套比较印两遍：一遍对本地交易所，一遍对港交所。
+# 09638 法拉帝（米蘭泛歐 + 港交所）就是 —— 四条对米兰、四条对港交所，
+# 数字完全不同（25.9% vs 27.2%）。这是**港股**可比库，口径当然取港交所。
+_VENUE_FOREIGN = re.compile(
+    r"米蘭|米兰|泛歐|泛欧|倫敦|伦敦|紐約|纽约|新加坡交易所|東京|东京|"
+    r"EXM|Euronext|NASDAQ|NYSE|LSE|SGX", re.I)
+_VENUE_HK = re.compile(r"聯交所|联交所|香港交易所|HKEX", re.I)
+
+
+def _venue(text: str) -> str:
+    """这条比较是对哪个交易所的报价。认不出就留空（当港股处理）。"""
+    hk, foreign = _VENUE_HK.search(text), _VENUE_FOREIGN.search(text)
+    if hk and (not foreign or hk.start() < foreign.start()):
+        return "hk"
+    return "foreign" if foreign else ""
+
 
 _ANCHORS = [
     # ⚠️「未受干擾日」和「不受干擾日期」两种写法都有 —— 一字之差。
@@ -657,8 +704,16 @@ _ANCHORS = [
 # 插进了三列数据。所以括号里那个数字必须能**单独**认出来，
 # 不能只认「三十(30)個」这种连在一起的完整写法。
 # 08439 新百利那张表里 5 条比较的窗口全判成了「收市价」，就是这么来的。
+# ⚠️ 窗口不只有「個交易日」，还有「個月」——09638 法拉帝整套梯子用的是
+# 1/3/6/12 個月。认不出就全落进「收市价」，四条比较挤成一条。
 _WINDOWS = [
+    ("12m", re.compile(r"十二\s*個\s*月|\b12\s*個\s*月")),
+    ("6m", re.compile(r"六\s*個\s*月|\b6\s*個\s*月")),
+    ("3m", re.compile(r"三\s*個\s*月|\b3\s*個\s*月")),
+    ("1m", re.compile(r"一\s*個\s*月|\b1\s*個\s*月")),
     ("180d", re.compile(r"一百八十|\(?\s*180\s*\)?\s*個")),
+    ("120d", re.compile(r"一百二十|\(?\s*120\s*\)?\s*個")),
+    ("90d", re.compile(r"九十|\(?\s*90\s*\)?\s*個")),
     ("60d", re.compile(r"六十|\(?\s*60\s*\)?\s*個")),
     ("30d", re.compile(r"三十|\(?\s*30\s*\)?\s*個")),
     ("10d", re.compile(r"十\s*\(?10\)?\s*個|\(?\s*10\s*\)?\s*個|十個")),
@@ -776,7 +831,9 @@ def _classify(item: str) -> tuple[str, str]:
 # 规则 3.5 要求披露的内容，不会变。
 _LOOKS_LIKE_COMPARISON = re.compile(
     r"(?=[^；;。]*(?:溢價|折讓|折價)\s*(?:約)?(?:為)?\s*[\d.]+\s*%)"
-    r"(?=[^；;。]*每股)")
+    # ⚠️ 不能只认「每股」：09638 法拉帝那句「…平均收市價分別溢價約27.2%…」
+    # 通篇没有「每股」两个字，整条就被滤掉了。价格类词一样算数。
+    r"(?=[^；;。]*(?:每股|收市價|平均價|官方價))")
 
 # 假的价值比较表：认购价/配售价/供股价也有一模一样的表（你陷阱清单里那条）。
 # 兜底扫描时必须把它们排掉，否则会把募资价当成要约价的比较。
@@ -976,7 +1033,9 @@ def _note_alternative_prices(result) -> None:
     for c in result.comparisons:
         if c.anchor == "nav":
             continue          # 经审核/未经审核两条净资产是常态，不算分叉
-        key = (c.anchor, c.window)
+        # ⚠️ 交易所要进 key：双重上市的公司对本地所印一套、对港交所印一套
+        # （09638 法拉帝），那是同一个要约价的两种报价，不是两套要约价。
+        key = (c.anchor, c.window, c.venue)
         if key in seen and seen[key] != c.stated_pct:
             if not any(x.startswith(c.label) for x in clash):
                 clash.append(f"{c.label} {seen[key]}% / {c.stated_pct}%")
@@ -986,6 +1045,74 @@ def _note_alternative_prices(result) -> None:
         result.notes.append(
             "本单像是列了两套要约价（替代方案）：整条梯子出现了两遍 —— "
             + "、".join(clash[:3]) + "。主值取的是先出现的那套，请核原文")
+
+
+# 并列句里那一串跟在后面的光秃秃百分比：「…溢價約27.2%、27.0%、27.4%及33.5%」
+# ⚠️ 数字本身会被 PDF 拆开：09638 那句印的是「…、2 1.0%、2 4.4%及30.7%」，
+# 「21.0」中间硬生生插了个空格。所以数字里允许有空白，捕获后再去掉。
+# 只在并列串这一条路上放宽 —— 表格读法靠空格分隔数字，全局放宽会毁掉它。
+_TRAILING_PCT = re.compile(r"[、及和,]\s*([\d.][\d.\s]*?)\s*%")
+
+
+def _parallel_comparisons(item: str, page: int, offset: int) -> tuple | None:
+    """「A、B及C…分別溢價約 a%、b% 及 c%」——**数得清就敢拆**。
+
+    原来一律不拆，因为按「最近的基准价」去配后面几条必错。但那是配错了
+    对象：并列句里真正一一对应的是**窗口**和**百分比**，而不是位置。
+    只要窗口个数和百分比个数相等，对应关系就是确定的，不是猜的 ——
+    个数对不上就还是不拆（宁可少一条，不要错一条）。
+
+        09638 法拉帝：1個月、3個月、6個月及12個月 ↔ 27.2%、27.0%、27.4%、33.5%
+        01310 香港寬頻：30個、60個及90個交易日 ↔ 57.20%、75.48%、87.87%
+
+    基准价只有在个数也相等时才配上；否则留空（这一条比较照样能用，
+    溢价率和口径都是齐的，只是没法跑 V4/V5 复算）。
+
+    返回 (拆出来的比较项, 并列部分从哪个字符开始)。后者给调用方用来
+    圈定「句子前半截」—— 前半截那些普通比较项判窗口时不能看见后半截的
+    「…90個交易日」，否则收市价会被判成 90 日均价。
+    """
+    if not _PARALLEL.search(item):
+        return None
+    tokens = list(_WINDOW_TOKEN.finditer(item))
+    heads = _pcts(item)
+    if not tokens or not heads:
+        return None
+
+    # ⚠️ 领头的那个百分比必须排在**窗口枚举之后**。
+    # 01310 香港寬頻那句先讲收市价（溢價約42.76%），再讲「30個、60個及
+    # 90個交易日…分別溢價約57.20%、75.48%及87.87%」——
+    # 拿第一个百分比当领头，会把收市价那条安到 30 日头上，
+    # 而且个数照样凑得齐（42.76 + 75.48 + 87.87 = 3 个），看不出错。
+    after = tokens[-1].end()
+    lead = next((h for h in heads if h.start >= after), None)
+    if lead is None:
+        return None
+    numbers = [(lead.start, lead.number)]
+    numbers += [(lead.end + m.start(), m.group(1).replace(" ", ""))
+                for m in _TRAILING_PCT.finditer(item[lead.end:])]
+    if len(numbers) != len(tokens) or len(numbers) < 2:
+        return None
+
+    benches = list(_BENCHMARK.finditer(item))
+    paired = benches if len(benches) == len(tokens) else []
+    anchor = _classify(item[:tokens[0].start()])[0]
+
+    out = []
+    for i, (tok, (pos, num)) in enumerate(zip(tokens, numbers)):
+        window = next((name for name, pat in _WINDOWS
+                       if pat.search(tok.group(0))), "spot")
+        b = paired[i] if paired else None
+        number = b.group(3).replace(",", "") if b else ""
+        out.append(Comparison(
+            anchor=anchor, window=window,
+            benchmark=number,
+            benchmark_decimals=_decimals(number) if number else 0,
+            benchmark_is_exact=bool(b) and not (b.group(1) or b.group(2)),
+            stated_pct=num, stated_direction=lead.direction,
+            page=page, quote=item.strip()[:220], at=offset + pos,
+            venue=_venue(item)))
+    return out, tokens[0].start()
 
 
 def _comparisons_in(item: str, page: int,
@@ -999,12 +1126,16 @@ def _comparisons_in(item: str, page: int,
 
     返回 (抽到的, 有没有因为并列句而放弃的)。
     """
+    # 并列句拆出来的那几条，和句子前半截那些普通比较项要**都留着** ——
+    # 01310 那句前半截讲收市价，后半截才是并列的三个均价。
+    zipped, cut = _parallel_comparisons(item, page, offset) or ([], len(item))
+
     out: list[Comparison] = []
     benches = list(_BENCHMARK.finditer(item))
     if not benches:
-        return out, False
+        return out + zipped, False
 
-    pcts = _pcts(item)
+    pcts = [p for p in _pcts(item) if p.start < cut]
     skipped = False
     prev_end = 0
     for p in pcts:
@@ -1018,7 +1149,10 @@ def _comparisons_in(item: str, page: int,
             continue
         # 一条里只有一处百分比时按整条判锚点（沿用原来的行为）；
         # 有多处时各判各的，否则后面那条的「30個交易日」会污染前面那条。
-        scope = item if len(pcts) == 1 else item[prev_end:p.end]
+        # ⚠️ 判锚点/窗口只能看**并列部分之前**那一截：整条句子里还带着
+        # 「…90個交易日」，拿它去判前半截的收市价，窗口会变成 90 日。
+        head = item[:cut]
+        scope = head if len(pcts) == 1 else head[prev_end:p.end]
         prev_end = p.end
         anchor, window = _classify(scope)
         number = bench.group(3).replace(",", "")
@@ -1028,8 +1162,9 @@ def _comparisons_in(item: str, page: int,
             benchmark=number, benchmark_decimals=_decimals(number),
             benchmark_is_exact=not approx,   # 「約」在哪一侧都算约整值
             stated_pct=p.number, stated_direction=p.direction,
-            page=page, quote=item.strip()[:220], at=offset + p.start))
-    return out, skipped
+            page=page, quote=item.strip()[:220], at=offset + p.start,
+            venue=_venue(scope)))
+    return out + zipped, skipped
 
 
 # 表格形式的价值比较。08439 新百利就是这么排的 —— 一张表，不是一句句话。
@@ -1066,7 +1201,7 @@ def _comparisons_from_table(section: str, page: int) -> list[Comparison]:
             benchmark_is_exact=True,          # 表格里印的就是精确值
             stated_pct=m.group("pct"),
             stated_direction=DISCOUNT if m.group("neg") else PREMIUM,
-            page=page, quote=item.strip()[:220]))
+            page=page, quote=item.strip()[:220], venue=_venue(item)))
     return out
 
 
@@ -1452,14 +1587,19 @@ _GAP = r"(?:(?!每股|每份)[^0-9。；])"
 # 名词那一坨的写法在实跑里至少有四种排列，硬按顺序写死会一直漏：
 #     現金代價總額 / 現金總代價 / 總現金代價 / 代價總額
 # 所以把「現金」「總」当可选前缀各允许一次，名词本体单列。
-_MONEY_NOUN = r"(?:現金)?(?:總)?(?:現金)?(?:代價|金額|價值|款項)(?:總額|總代價)?"
+_MONEY_NOUN = (r"(?:現金)?(?:總)?(?:現金)?(?:代價|金額|價值|款項|支付額)"
+               r"(?:總額|總代價)?")
 
 # 「為」前面可能还垫着「約」「將」「將約」。
 #     現金總代價**約為**320,581,945港元          （03389 亨得利）
 #     現金代價總額**將約為**194,867,400港元      （08413 亞洲富思）
 # 少这一个「約」字，这两单的交易规模就是空的 —— 而溢价率都抽对了，
 # 说明 PDF 读到了，纯粹是措辞没认。
-_ABOUT_IS = r"(?:上限|下限|最高|最低|封頂)?\s*(?:將)?\s*(?:約|大約)?\s*(?:將)?為"
+# 「相當於」也是一种「为」：09638 法拉帝的港元金额就写在
+# 「最高支付額相當於1,653,370,226.83港元」这个脚注里 —— 公告自己换算好的，
+# 我们只是摘录（铁律一：不做换算）。
+_ABOUT_IS = (r"(?:上限|下限|最高|最低|封頂)?\s*(?:將)?\s*(?:約|大約)?\s*"
+             r"(?:將)?(?:為|相當於|相等於)")
 
 _DEAL_SIZE = [
     # 「須支付的最高現金代價約為5,440萬港元」

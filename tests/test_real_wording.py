@@ -413,11 +413,23 @@ def test_the_benchmark_is_the_one_nearest_to_the_percentage():
     assert ex.comparisons[0].window == "spot", "后面那句的「30個」污染了前面这条"
 
 
-def test_a_parallel_list_is_flagged_not_guessed():
-    """「分別約每股A、每股B及每股C分別溢價約x%、y%及z%」拆不准就不拆。"""
+def test_a_parallel_list_is_unzipped_when_the_counts_line_up():
+    """「30個、60個及90個交易日…分別溢價約57.20%、75.48%及87.87%」。
+
+    ⚠️ 这条规则改过一次。原来一律不拆，理由是「按最近的基准价去配后面
+    几条必错」—— 那个顾虑是对的，但配错了对象：并列句里真正一一对应的是
+    **窗口**和**百分比**。只要两边个数相等，对应关系是确定的，不是猜的。
+    个数对不上就还是不拆。
+
+    另外，领头的百分比必须排在窗口枚举**之后** —— 这句前半截还有一个
+    「溢價約42.76%」（对收市价的），拿它当领头个数照样凑得齐（3 个），
+    却会把收市价那条安到 30 日头上，而且完全看不出错。
+    """
     ex, _ = _ladder(P01310)
-    assert len(ex.comparisons) == 1
-    assert any("並列" in n or "并列" in n for n in ex.notes)
+    got = {(c.window, c.stated_pct) for c in ex.comparisons}
+    assert got == {("spot", "42.76"), ("30d", "57.20"),
+                   ("60d", "75.48"), ("90d", "87.87")}
+    assert ex.comparisons[0].benchmark == "3.555", "前半截那条的基准价还在"
 
 
 def test_an_announcement_without_a_thirty_day_average_still_gets_a_premium():
@@ -726,3 +738,77 @@ def test_the_spa_price_per_share_is_extracted():
     ex = extractor.extract("", P01451)
     assert ex.spa_price == "0.80"
     assert ex.spa_price_evidence.page == 7
+
+
+# ---------------------------- 09638 法拉帝：外币计价、双重上市、月度窗口（真原文）
+
+P09638 = {
+    7: "3. 要約的統一代價及總值KKCG Maritime將就根據要約交回的每股股份"
+       "支付相等於3.50歐元（僅作說明用途，相當於約31.71港元）（附息）的現金代價。",
+    9: "每股股份代價較：• 股份於不受干擾日在米蘭泛歐交易所錄得的官方價格"
+       "每股2.89歐元溢價約21.3%；• 股份於截至不受干擾日（包括該日）止1個月、"
+       "3個月、6個月及12個月期間在米蘭泛歐交易所錄得的成交量加權平均官方價格"
+       "分別溢價約25.9%、25.5%、26.3%及26.6%。"
+       "每股股份代價6較：• 股份於不受干擾日在香港聯交所錄得的收市價"
+       "每股32.10港元折讓約1.2%；• 股份於截至不受干擾日（包括該日）止1個月、"
+       "3個月、6個月及12個月期間在香港聯交所錄得的平均收市價"
+       "分別溢價約27.2%、2 7.0%、2 7.4%及33.5%。"
+       "6 僅供說明用途，代價3.50歐元相當於每股31.71港元，乃根據參考匯率計算。",
+    10: "5 最高支付額相當於1,653,370,226.83港元，乃根據參考匯率計算。",
+}
+
+
+def test_a_partial_public_tender_offer_is_a_po():
+    """「自願附帶條件的部分**公開**收購要約」—— 多两个字就认不出来了。"""
+    title = "由KKCG MARITIME發起的自願附帶條件的部分公開收購要約"
+    assert extractor.classify_offer(title, {}).label == "PO"
+
+
+def test_month_windows_are_recognised():
+    """整套梯子用的是 1/3/6/12 個月，不是「個交易日」。
+
+    认不出就全落进「收市价」，四条比较挤成一条。
+    """
+    ex = extractor.extract("", P09638)
+    assert {"1m", "3m", "6m", "12m"} <= {c.window for c in ex.comparisons}
+
+
+def test_the_hong_kong_ladder_wins_over_the_foreign_one():
+    """双重上市的公司印两套梯子：对米兰 25.9%、对港交所 27.2%。
+
+    这是**港股**可比库，口径取港交所那一套。
+    """
+    from hkexdb import selectors
+
+    ex = extractor.extract("", P09638)
+    comps = [{"anchor": c.anchor, "window": c.window, "label": c.label,
+              "stated_pct": c.stated_pct, "stated_direction": c.stated_direction,
+              "benchmark": c.benchmark, "venue": c.venue,
+              "page": c.page, "quote": c.quote} for c in ex.comparisons]
+    pick = selectors.select_primary_premium(comps)
+    assert pick.signed_pct == Decimal("27.2")
+    assert pick.window == "1m"
+
+
+def test_a_number_split_by_a_space_inside_a_parallel_run_is_repaired():
+    """PDF 把「27.0」印成了「2 7.0」—— 数字中间硬插一个空格。
+
+    ⚠️ 只在并列串这一条路上放宽（数字里允许空白）。表格读法靠空格分隔
+    基准价和百分比，全局放宽会毁掉它。
+    """
+    ex = extractor.extract("", P09638)
+    assert {"27.2", "27.0", "27.4", "33.5"} <= {c.stated_pct
+                                                for c in ex.comparisons}
+
+
+def test_a_price_in_euros_falls_back_to_the_printed_hkd_equivalent():
+    """公告自己换算好的港元等值是**摘录**，不是我们做汇率换算（铁律一）。"""
+    ex = extractor.extract("", P09638)
+    assert ex.offer_price == "31.71"
+    assert ex.deal_size == "1653370226.83"
+
+
+def test_two_ladders_for_two_exchanges_are_not_two_offer_prices():
+    """同一个要约价的两种报价，不是替代方案 —— 别报那个警。"""
+    ex = extractor.extract("", P09638)
+    assert not any("两套要约价" in n for n in ex.notes)
