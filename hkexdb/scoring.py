@@ -81,7 +81,7 @@ class FieldScore:
     field: str
     graded: int = 0        # 答案表里填了值的条数
     right: int = 0
-    wrong: list = field(default_factory=list)   # (key, 抽到的, 应该是)
+    wrong: list = field(default_factory=list)   # (key, 抽到的, 应该是, 抽取器版本)
 
     @property
     def rate(self) -> float:
@@ -96,6 +96,8 @@ class Report:
     # 按「同代码、日期最近」配上的（不是同一天）。放宽了配对就必须
     # 逐条报出来 —— 一个会自己放宽的比对器，如果不说，比严格的更危险。
     loose_pairs: list = field(default_factory=list)
+    stale: int = 0          # 参与评分的行里，有几行是旧版本抽取器留下的
+    version: str = ""       # 当前抽取器版本
 
     def text(self) -> str:
         lines = ["字段级准确率", "=" * 56, ""]
@@ -114,7 +116,7 @@ class Report:
             lines += ["", "错在哪里", "-" * 56]
             any_wrong = False
             for s in self.scores:
-                for key, got, want in s.wrong:
+                for key, got, want, ver in s.wrong:
                     any_wrong = True
                     lines.append(f"[{s.field}] {'/'.join(key)}")
                     lines.append(f"    抽到：{got or '（空）'}")
@@ -122,8 +124,21 @@ class Report:
                     hint = _hint(got, want)
                     if hint:
                         lines.append(f"    ↳ {hint}")
+                    if ver and self.version and ver != self.version:
+                        lines.append(
+                            f"    ⚠ 这一行是旧版本 {ver} 抽的（当前 {self.version}）"
+                            f"—— 它没跑过新规则，先重跑再看这条")
             if not any_wrong:
                 lines.append("（没有错项）")
+
+        if self.stale:
+            lines += ["",
+                      f"⚠️ 参与评分的行里有 {self.stale} 行是**旧版本**抽取器留下的",
+                      "-" * 56,
+                      "   存档是跨次累积的，只有落在本次日期范围里的那些行会被重抽。",
+                      "   范围外的行还是老规则抽出来的结果 —— 拿它们算准确率，",
+                      "   量的是历史，不是现在的规则。想全部刷新，把日期范围放到",
+                      "   覆盖它们（存档命中不发请求，只是重抽 PDF）。"]
 
         if self.loose_pairs:
             lines += ["", f"按「同代码、日期最近」配上的 {len(self.loose_pairs)} 单",
@@ -253,10 +268,17 @@ def score(got_rows: list[dict], answer_rows: list[dict]) -> Report:
             if matches(field_name, got, want):
                 s.right += 1
             else:
-                s.wrong.append((key, str(got), str(want)))
+                s.wrong.append((key, str(got), str(want),
+                                str(got_row.get("抽取器版本", "")).strip()))
 
     extra = [_key(r) for r in leftovers]
-    return Report(list(scores.values()), missing, extra, loose)
+    # 旧版本抽的行拿来算准确率，量的是历史不是现在的规则 —— 必须说出来。
+    from .store import EXTRACTOR_VERSION
+    stale = sum(1 for _w, g, _gap in pairs
+                if str(g.get("抽取器版本", "")).strip()
+                and str(g.get("抽取器版本", "")).strip() != EXTRACTOR_VERSION)
+    return Report(list(scores.values()), missing, extra, loose,
+                  stale=stale, version=EXTRACTOR_VERSION)
 
 
 def write_template(columns: list[str], path: Path) -> Path:

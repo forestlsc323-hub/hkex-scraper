@@ -1255,20 +1255,50 @@ def extract_terms(title: str, pages: dict[int, str]) -> dict:
 # 「全部已發行股本估值」不是垃圾，只是**不能当 deal size** ——
 # 它是估值指标，投行做倍数时正要用它。所以它归估值组，不归规模组。
 # 抽的是股数，乘法交给 Python（铁律一）。
+# ⚠️ 顺序即优先级，而且**绝不能有一条光认「合共」的**。
+# 01780 榮尊那单原来抽出 84,000,000 股 —— 那是买卖协议里从售股股东手上
+# 买的股数（「向售股股東收購合共84,000,000股股份」），真正的已发行股本是
+# 620,000,000 股，同一页上白纸黑字写着。
+# 股数抽错不会自己报错，但它是交易规模那道天花板的分母：分母小了七倍，
+# 正确的 214,760,000 就被判成「比整家公司还贵」而作废 ——
+# 一个字段抽错，另一个字段凭空消失。
 _TOTAL_SHARES = [
     re.compile(r"已發行股份總數為?\s*([\d,]+)\s*股"),
-    re.compile(r"合共\s*([\d,]+)\s*股股份"),
+    re.compile(r"已發行股份為\s*([\d,]+)\s*股"),
+    re.compile(r"本公司已發行\s*([\d,]+)\s*股股份"),
     re.compile(r"已發行\s*([\d,]+)\s*股(?:股份)?"),
     re.compile(r"([\d,]{9,})\s*股已發行股份"),
+    # 「合共 N 股股份」两种意思都有，靠**前文**分（见 _bought_from_a_seller）：
+    #   3336：於本聯合公告日期合共1,200,008,445股股份        ← 已发行股本
+    #   01780：向售股股東收購合共84,000,000股股份             ← 买卖协议股数
+    re.compile(r"合共\s*([\d,]+)\s*股股份"),
 ]
+
+# 这处股数是不是「从卖方手上买的那批」，而不是已发行股本。
+_SHARES_FROM_SELLER = re.compile(r"收購|購買|出售|轉讓|售股股東|銷售股份|買賣協議")
+
+
+def _bought_from_a_seller(flat: str, at: int) -> bool:
+    before = flat[max(0, at - 40):at]
+    if "已發行" in before:
+        return False          # 「已發行合共 N 股」说的就是股本
+    return bool(_SHARES_FROM_SELLER.search(before))
 
 
 def extract_total_shares(pages: dict[int, str]) -> tuple[str, Evidence]:
+    """已发行股本总数。
+
+    ⚠️ 这个字段抽错不会自己报错，但它是交易规模那道天花板的**分母**：
+    01780 榮尊抽成 84,000,000（买卖协议股数，真值 620,000,000），分母小了
+    七倍，于是正确的交易规模 214,760,000 被判成「比整家公司还贵」而作废。
+    一个字段抽错，另一个字段凭空消失 —— 这类连锁最难查。
+    """
     for page in sorted(pages):
         flat = _flat(pages[page])
         for pattern in _TOTAL_SHARES:
-            m = pattern.search(flat)
-            if m:
+            for m in pattern.finditer(flat):
+                if _bought_from_a_seller(flat, m.start()):
+                    continue
                 start = max(0, m.start() - 40)
                 return (m.group(1).replace(",", ""),
                         Evidence(page, flat[start:m.end() + 10].strip()))
@@ -1447,7 +1477,7 @@ _OFFER_SIDE = re.compile(r"要約項下|根據要約|接納要約|要約獲|要�
 # 01980 天鴿互動写「本公司全部已發行股本的價值約為754.39百萬港元」，
 # 正好等于 0.68 × 11.09 亿股 —— 拿它当交易规模会把一单 4.7 亿的要约记成 7.5 亿。
 _EQUITY_VALUE = re.compile(
-    r"全部已發行股[本份](?:的)?(?:價值|總值)|已發行股本(?:的)?(?:價值|總值)")
+    r"(?:全部)?已發行股[本份](?:總額)?(?:之|的)?(?:價值|總值)")
 
 
 def _is_equity_value(flat: str, at: int) -> bool:

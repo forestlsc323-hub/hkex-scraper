@@ -308,3 +308,36 @@ def test_a_discount_over_one_hundred_percent_is_still_caught():
     from hkexdb import scoring as S
     bad = [{"股票代码": "01875", "公告日期": "2026-01-13", "主值溢价率(%)": "-114.67"}]
     assert any("01875" in p for p in S.sanity_check(bad))
+
+
+# ------------------------------- 旧版本抽的行不能悄悄参与评分（量错了比没量更糟）
+
+def test_a_row_from_an_older_extractor_is_flagged_in_the_error_list():
+    """存档跨次累积，只有落在本次日期范围里的行会被重抽。
+
+    范围外那些还是老规则的产物 —— 拿它们算准确率，量的是历史。
+    实跑吃过一次：08031 的方向复核在新版本里明明能改对，报告里却仍然
+    是旧的 -13.58，我差点回头去查一个已经修好的问题。
+    """
+    from hkexdb import scoring as S, store
+    got = [{"股票代码": "08031", "公告日期": "2026-01-19",
+            "主值溢价率(%)": "-13.58", "抽取器版本": "2026-08-A"}]
+    want = [{"股票代码": "08031", "公告日期": "2026-01-19",
+             "主值溢价率(%)": "13.58"}]
+    report = S.score(got, want)
+    assert report.stale == 1
+    assert report.version == store.EXTRACTOR_VERSION
+    text = report.text()
+    assert "旧版本 2026-08-A" in text
+    assert "先重跑再看这条" in text
+
+
+def test_a_current_row_is_not_flagged():
+    from hkexdb import scoring as S, store
+    got = [{"股票代码": "08031", "公告日期": "2026-01-19",
+            "主值溢价率(%)": "-13.58", "抽取器版本": store.EXTRACTOR_VERSION}]
+    want = [{"股票代码": "08031", "公告日期": "2026-01-19",
+             "主值溢价率(%)": "13.58"}]
+    report = S.score(got, want)
+    assert report.stale == 0
+    assert "旧版本" not in report.text()
