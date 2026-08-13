@@ -449,38 +449,71 @@ def _drop_impossible_offer_price(result) -> None:
         result.offer_price_evidence = Evidence()
 
 
-def _drop_impossible_deal_size(result) -> None:
-    """总代价不可能等于每股价。对不上就把规模清掉，绝不留一个假数。
+def _deal_size_problem(amount: str, price: str, shares: str) -> str:
+    """这个数当交易规模讲不讲得通。讲得通返回空串，讲不通返回一句人话。
 
-    铁律三：没有出处的字段一律留空。抽到一个**定义上就不可能**的数字，
-    比留空坏得多 —— 留空会被人补上，错数会被人直接粘进底稿。
+    只做两条算术上的硬约束，不做口径判断（铁律一）：
+      · 总代价不可能只有每股价的几百倍 —— 那多半抓到的是每股价本身；
+      · 付出去的钱不可能超过「按要约价把整家公司买下来」——
+        要约只买公众股东手上那部分。
     """
     try:
-        price = float(result.offer_price)
-        size = float(result.deal_size)
+        p_, a_ = float(price), float(amount)
     except (TypeError, ValueError):
-        return
-    if price <= 0 or size <= 0:
-        return
-    if size < price * _MIN_SHARES_IN_A_DEAL:
-        result.notes.append(
-            f"抽到的交易规模 {result.deal_size} 与每股 {result.offer_price} "
-            f"港元不相称（总代价不可能这么接近每股价），已作废，需人工读原文")
-        result.deal_size = ""
-        result.deal_size_evidence = Evidence()
-        return
+        return ""
+    if p_ <= 0 or a_ <= 0:
+        return ""
+    if a_ < p_ * _MIN_SHARES_IN_A_DEAL:
+        return (f"{amount} 与每股 {price} 港元不相称"
+                f"（总代价不可能这么接近每股价）")
+    n = _num_or_none(shares)
+    if n and a_ > p_ * n * 1.01:
+        return (f"{amount} 超过按要约价计的全部股本估值 {p_ * n:,.0f}"
+                f"（要约买不到比整家公司还多）")
+    return ""
 
-    # 天花板：要约只买公众股东手上那部分，付出去的钱不可能超过
-    # 「按要约价把整家公司买下来」。超了就是抓到了别的东西 ——
-    # 2025 实测 03626 / 01747 / 01489 三单都超了，不用看原文就知道错。
-    shares = _num_or_none(result.total_shares)
-    if shares and size > price * shares * 1.01:
-        whole = price * shares
-        result.notes.append(
-            f"抽到的交易规模 {result.deal_size} 超过按要约价计的全部股本估值 "
-            f"{whole:,.0f}（要约买不到比整家公司还多），已作废，需人工读原文")
+
+def _drop_impossible_deal_size(result) -> None:
+    """⚠️ 保留只为兼容旧调用。真正的取值在 `_choose_deal_size` ——
+    那里是**换下一个候选**，这里是**清空**，两者差别很大（见下）。"""
+    why = _deal_size_problem(result.deal_size, result.offer_price,
+                             result.total_shares)
+    if why:
+        result.notes.append(f"抽到的交易规模 {why}，已作废，需人工读原文")
         result.deal_size = ""
         result.deal_size_evidence = Evidence()
+
+
+def _choose_deal_size(result, candidates: list[tuple[str, int, str]]) -> None:
+    """按优先级挑第一个**讲得通**的候选。
+
+    ⚠️ 这是这一层最贵的一个教训。原来的做法是「先挑第一个候选，再拿
+    算术闸去检查它，不合格就清空」—— 于是一份公告里排第一的候选一旦
+    是个不可能的数（多半是买卖协议的对价，比按要约价买下整家公司还多），
+    整单交易规模就是空的，**哪怕第二个候选完全正确**。
+
+    实跑一整年：同样这些公告，拿「原文摘录」（只有相关段落）跑能抽出
+    40,077,750 / 202,910,500 / 44,715,000，跑真 PDF 却全是空 ——
+    差别就在真文档里前面多了几个候选，第一个被闸掉之后就没有然后了。
+
+    闸应该是**筛子**，不是**开关**。
+    """
+    rejected: list[str] = []
+    for amount, page, quote in candidates:
+        why = _deal_size_problem(amount, result.offer_price, result.total_shares)
+        if why:
+            rejected.append(why)
+            continue
+        result.deal_size = amount
+        result.deal_size_evidence = Evidence(page, quote)
+        break
+    else:
+        result.deal_size = ""
+        result.deal_size_evidence = Evidence()
+    if rejected:
+        result.notes.append(
+            "这些候选算术上讲不通，已跳过：" + "；".join(rejected[:3])
+            + ("…" if len(rejected) > 3 else ""))
 
 
 def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
@@ -1057,7 +1090,15 @@ _PLACEHOLDER = {"要約人", "要约人", "本公司", "該公司", "买方", "�
                 "offeror", "the offeror", "有限公司", "公司",
                 # 08220 比高集團实跑抽出「認購人可能」——「認購人」和
                 # 「要約人」一样是通称，配股清洗豁免那类公告里满篇都是。
-                "認購人", "认购人", "收購方", "投資者", "賣方", "卖方"}
+                "認購人", "认购人", "收購方", "投資者", "賣方", "卖方",
+                # 这一批是 2026-08 那次全年实跑抽出来的，都进了成品表：
+                #   00932 順騰國際 抽出「或」          —— 一个连词
+                #   01723 港亞控股 抽出「聯合要約人」  —— 通称
+                #   00167 IDT      抽出「聯席要約人」  —— 通称
+                #   00223 易生活   抽出「要約人(1)」   —— 带编号的通称
+                # 「或」尤其糟：它短到看不出是抽错了，粘进可比表没人会怀疑。
+                "或", "及", "與", "和", "聯合要約人", "联合要约人",
+                "聯席要約人", "联席要约人", "要約方", "要约方"}
 # 要约人段的右边界：接下来必然是动词、助动词或介词。
 # 「可能」是从 08220 那单补的：标题写「…代表認購人可能須提出…」，
 # 不挡住它就会把助动词粘进公司名里。
@@ -1098,10 +1139,17 @@ def _cut_fa(before: str) -> str:
 _SHORT_ROLE = re.compile(r"^.{0,3}人$")
 
 
+# 通称后面挂个编号还是通称：「要約人(1)」「要约人（2）」。
+_NUMBERED_ROLE = re.compile(r"[（(]\s*[\divxIVX]{1,3}\s*[)）]\s*$")
+
+
 def _is_placeholder(name: str) -> bool:
     text = name.strip()
     if text.lower() in _PLACEHOLDER:
         return True
+    bare = _NUMBERED_ROLE.sub("", text).strip()
+    if bare != text and bare.lower() in _PLACEHOLDER:
+        return True          # 00223 实跑抽出「要約人(1)」
     return bool(_SHORT_ROLE.match(text))
 
 
@@ -1333,7 +1381,7 @@ _MONEY_NOUN = r"(?:現金)?(?:總)?(?:現金)?(?:代價|金額|價值|款項)(?:
 #     現金代價總額**將約為**194,867,400港元      （08413 亞洲富思）
 # 少这一个「約」字，这两单的交易规模就是空的 —— 而溢价率都抽对了，
 # 说明 PDF 读到了，纯粹是措辞没认。
-_ABOUT_IS = r"(?:將)?\s*(?:約|大約)?\s*(?:將)?為"
+_ABOUT_IS = r"(?:上限|下限|最高|最低|封頂)?\s*(?:將)?\s*(?:約|大約)?\s*(?:將)?為"
 
 _DEAL_SIZE = [
     # 「須支付的最高現金代價約為5,440萬港元」
@@ -1619,19 +1667,10 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     # 候选算一遍就够 —— 主值和备注都从这一份里取。
     # （原来 extract_deal_size 里算一遍、写备注时又算一遍，
     #   而这个函数是整个抽取层第二贵的一项。）
+    # ⚠️ 这里只把候选算出来，**先不选** —— 选之前得先有要约价和股数，
+    #    否则算术闸没有参照物，等于没闸。真正的取值在下面 _choose_deal_size。
     others = deal_size_candidates(pages, result.notes)
-    if others:
-        amount, page, quote = others[0]
-        result.deal_size, result.deal_size_evidence = amount, Evidence(page, quote)
 
-    # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
-    # 比值连续散布在 0.019~3.201 —— 说明不是稳定取错了某个口径，
-    # 是每份公告里候选不同。把候选摆出来，「这里有得选」才看得见。
-    if len(others) > 1:
-        rest = "、".join(a for a, _, _ in others[1:5])
-        result.notes.append(
-            f"交易规模有 {len(others)} 个候选，取了 {result.deal_size}，"
-            f"其余：{rest}{'…' if len(others) > 5 else ''}（口径存疑请核原文）")
     result.total_shares, result.total_shares_evidence = extract_total_shares(pages)
     result.is_conditional, result.is_conditional_evidence = \
         extract_conditionality(title, pages)
@@ -1639,7 +1678,20 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         extract_debt_conversion(pages)
 
     _drop_impossible_offer_price(result)
-    _drop_impossible_deal_size(result)
+    _choose_deal_size(result, others)
+
+    # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
+    # 比值连续散布在 0.019~3.201 —— 说明不是稳定取错了某个口径，
+    # 是每份公告里候选不同。把候选摆出来，「这里有得选」才看得见。
+    #
+    # ⚠️ 这段必须写在**选完之后**：写在前面的话，「取了 X」那个 X 还是空的，
+    #    备注会变成「取了 ，其余：…」—— 一条自己打自己脸的备注。
+    if len(others) > 1:
+        rest = "、".join(a for a, _, _ in others if a != result.deal_size)
+        result.notes.append(
+            f"交易规模有 {len(others)} 个候选，取了 {result.deal_size or '（无）'}，"
+            f"其余：{'、'.join(rest.split('、')[:4])}"
+            f"{'…' if len(others) > 5 else ''}（口径存疑请核原文）")
 
     if not result.offer_type:
         result.notes.append("要约类型未识别，需人工判定")

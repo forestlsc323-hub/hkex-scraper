@@ -741,3 +741,76 @@ def test_mandatory_implies_full_scope():
 def test_a_whitewash_waiver_is_still_not_a_mandatory_offer():
     title = "公告 (1) 自願現金部分收購要約 及 (2) 申請豁免須提出強制性全面要約的責任"
     assert extractor.classify_offer(title, {}).label == "PO"
+
+
+# ------------------------------- 算术闸是筛子，不是开关（真跑一年才看出来的）
+
+def _ex(price, shares, notes=None):
+    ex = extractor.Extraction()
+    ex.offer_price, ex.total_shares = price, shares
+    return ex
+
+
+def test_an_impossible_first_candidate_falls_through_to_the_next():
+    """⚠️ 这一层最贵的教训。
+
+    原来是「先挑第一个候选，再拿算术闸检查它，不合格就清空」——
+    于是排第一的候选一旦是个不可能的数（多半是买卖协议对价，比按要约价
+    买下整家公司还多），整单交易规模就是空的，**哪怕第二个候选完全正确**。
+
+    实跑一整年：同样这几份公告，拿只含相关段落的「原文摘录」跑能抽出
+    40,077,750 / 202,910,500 / 44,715,000，跑真 PDF 却全是空 ——
+    差别就在真文档里前面多了几个候选。
+    """
+    ex = _ex("0.50", "154000000")           # 天花板 = 77,000,000
+    extractor._choose_deal_size(ex, [
+        ("155643703", 2, "買賣協議項下之總代價"),   # 超过整家公司，讲不通
+        ("40077750", 5, "要約項下應付之最高現金代價"),
+    ])
+    assert ex.deal_size == "40077750"
+    assert ex.deal_size_evidence.page == 5
+    assert any("讲不通" in n for n in ex.notes), "跳过了哪些必须说一声"
+
+
+def test_every_candidate_impossible_still_means_blank():
+    """一个都讲不通就留空 —— 绝不硬塞一个（铁律三）。"""
+    ex = _ex("0.50", "154000000")
+    extractor._choose_deal_size(ex, [("999999999", 2, "x")])
+    assert ex.deal_size == "" and ex.deal_size_evidence.page == 0
+
+
+def test_no_candidates_at_all_is_not_an_error():
+    ex = _ex("0.50", "154000000")
+    extractor._choose_deal_size(ex, [])
+    assert ex.deal_size == ""
+
+
+def test_without_share_count_there_is_no_ceiling_to_apply():
+    """抽不到股数就没有天花板可言 —— 不能因此作废一个可能对的数。"""
+    ex = _ex("0.50", "")
+    extractor._choose_deal_size(ex, [("155643703", 2, "x")])
+    assert ex.deal_size == "155643703"
+
+
+def test_a_number_too_close_to_the_per_share_price_is_skipped():
+    """总代价不可能只有每股价的几百倍 —— 那多半抓到的是每股价本身。"""
+    ex = _ex("0.50", "154000000")
+    extractor._choose_deal_size(ex, [("0.50", 1, "每股0.50港元"),
+                                     ("40077750", 5, "要約項下")])
+    assert ex.deal_size == "40077750"
+
+
+def test_the_junk_offerors_from_the_full_year_run_are_rejected():
+    """2026-08 全年实跑，这四种都当成要约方名字进了成品表。
+
+    「或」尤其糟：短到看不出是抽错了，粘进可比表没人会怀疑。
+    """
+    for junk in ["或", "及", "聯合要約人", "聯席要約人",
+                 "要約人(1)", "要約人（2）", "要約方"]:
+        assert extractor._is_placeholder(junk), junk
+
+
+def test_real_offeror_names_survive_the_new_rejects():
+    for name in ["中國移動香港有限公司", "MANGKON ROAD LIMITED",
+                 "駱葉飛先生", "天賦國際集團有限公司", "一木集團(BVI) 有限公司"]:
+        assert not extractor._is_placeholder(name), name

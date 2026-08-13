@@ -640,3 +640,15 @@ def test_a_zero_valued_component_is_not_added():
     """防错点 3：明写「價值為零」的分项不进合计。"""
     pages = {1: "股份要約之價值約為117,410,000港元，而購股權要約之價值為零。"}
     assert extractor.extract("", pages).deal_size == "117410000"
+
+
+def test_a_cap_written_as_shangxian_yueweiis_read():
+    """06808 高鑫：「根據該等要約應付之代價上限約為3,236,298,104港元」。
+
+    「上限」垫在「代價」和「約為」之间 —— 少认这两个字，这单交易规模就是空的。
+    你的口径正是「规模照抄公告封顶数」，而封顶数用的就是这个写法。
+    """
+    pages = {4: "倘所有股份均被提呈以供接納，而該等股份之持有人已有效選擇"
+                "部分遞延結算替代方案，則根據該等要約應付之代價上限約為"
+                "3,236,298,104港元。"}
+    assert extractor.extract("", pages).deal_size == "3236298104"
