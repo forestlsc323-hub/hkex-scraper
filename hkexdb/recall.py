@@ -42,9 +42,31 @@ _FOLLOW_UP = re.compile(
     r"截止|失效|派付代價|撤回接納|修訂要約|提高要約價|"
     r"獨立財務顧問(?:意見|之建議)|獨立董事委員會函件")
 
-# 但光有后续词还不够 —— 「寄發二零二五年年報」也命中「寄發」。
-# 必须同时看得出这是**要约**的后续。
-_ABOUT_AN_OFFER = re.compile(r"要約|收購|私有化|要约|收购")
+# 但光有后续词还不够。第一版用「要約|收購|私有化」当判据，实跑 9657 条
+# 报出 105 单，逐条看下来只有 11 单像真漏检 —— 那张表当场就废了。
+# 拆开看 105 单是什么：
+#     75 单  证据标题里根本没有「要約」两个字（收购资产、认购新股、
+#            发通函……「收購」在港股公告里太常见，不能当要约的证据）
+#     12 单  協議安排／第86條 私有化（不是三种要约，本来就在范围外）
+#      5 单  清洗豁免
+#      2 单  股份回购
+# 所以判据收紧成：**证据标题必须出现「要約」二字**。
+_ABOUT_AN_OFFER = re.compile(r"要約|要约")
+
+# 这几类整个就不在课题范围内（screening 的 special_species 也是这么分的）。
+# 一条命中，整单不算孤儿 —— 它不是漏了，是本来就不收。
+_OUT_OF_SCOPE = re.compile(
+    r"協議安排|计划安排|計劃安排|第\s*86\s*條|第\s*673\s*條|scheme\s*of\s*arrangement|"
+    r"股份購回|購回|回購|"
+    r"清洗豁免|whitewash|"
+    # 债券／票据要约不是股份要约（01030 新城發展「以現金購買其尚未償還的
+    # 2025年到期4.625%有擔保優先票據」）
+    r"優先票據|優先note|債券|票據", re.I)
+
+# 同一标的在这前后这么多天里已经留存过一份 T0 —— 那这一簇后续公告
+# 只是那一单的尾巴被 60 天间隔切开了，不是丢了一单。
+# 01749 杉杉品牌和 01217 中國創新投資实跑就是这么被误报的。
+NEAR_RETAINED_DAYS = 180
 
 RETAINED = "retained"
 
@@ -112,15 +134,25 @@ def find_orphans(screened: list, gap_days: int = GAP_DAYS) -> list[Orphan]:
 
     out: list[Orphan] = []
     for code, rows in sorted(by_code.items()):
+        kept = [d for d in (_day(r.get("date", "")) for r in rows
+                            if _bucket(r) == RETAINED) if d]
         for cluster in _clusters(rows, gap_days):
             if any(_bucket(r) == RETAINED for r in cluster):
                 continue      # 有 T0 留存，不是孤儿
+            # ⚠️ 范围外只看**那条证据本身**，不看整簇。一簇里混进一条
+            #    「購回股份」的无关公告，不该把整单交易一起判出局
+            #    （01939 東京中央拍賣第一版就是这么被误杀的）。
             proof = [r for r in cluster
                      if _FOLLOW_UP.search(r.get("title", ""))
-                     and _ABOUT_AN_OFFER.search(r.get("title", ""))]
+                     and _ABOUT_AN_OFFER.search(r.get("title", ""))
+                     and not _OUT_OF_SCOPE.search(r.get("title", ""))]
             if not proof:
                 continue      # 没有「有父」的证据，不算孤儿
             days = [d for d in (_day(r.get("date", "")) for r in cluster) if d]
+            if kept and days and min(
+                    abs((k - d).days) for k in kept for d in days
+            ) <= NEAR_RETAINED_DAYS:
+                continue      # 同一单的尾巴被 60 天间隔切开了，不是丢了一单
             out.append(Orphan(
                 code=code,
                 name=next((r.get("name", "") for r in cluster if r.get("name")), ""),

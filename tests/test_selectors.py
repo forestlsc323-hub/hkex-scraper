@@ -302,3 +302,20 @@ def test_a_zero_benchmark_never_divides():
 
 def test_nothing_picked_means_nothing_to_check():
     assert selectors.check_direction(None, "0.80") is None
+
+
+def test_the_config_never_knows_fewer_windows_than_the_code():
+    """⚠️ config.yaml 里那张退档表会**覆盖**代码默认值。
+
+    代码里新认了窗口（月度、90/120 日）而配置没跟着加，那些窗口就永远
+    轮不到 —— 09638 法拉帝整套梯子按月，退档一路退到「收市价」，
+    取到 -1.2%，而答案是 +27.20%。配置和代码脱节不会报错，只会静默取错。
+    """
+    import yaml as _yaml
+    from hkexdb import selectors as S
+
+    cfg = _yaml.safe_load(
+        (Path(__file__).parent.parent / "config.yaml").read_text(encoding="utf-8"))
+    shipped = cfg["primary_value_rules"]["premium"]["window_fallback"]
+    assert set(S.WINDOW_FALLBACK) <= set(shipped), \
+        f"config.yaml 少认了这些窗口：{set(S.WINDOW_FALLBACK) - set(shipped)}"
