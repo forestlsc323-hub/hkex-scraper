@@ -322,6 +322,8 @@ class Result:
     error: str = ""
     buckets: dict = field(default_factory=dict)
     qc_notes: list = field(default_factory=list)
+    # 一整单交易的公告全被灰掉、于是整单消失的那些。召回率的缺口。
+    orphans: int = 0
 
 
 DEFAULT_KEYWORDS = ["要約", "收購", "私有化"]
@@ -1103,6 +1105,16 @@ def _screen(records, result: Result, log):
     log(f"数量校验：{'平' if report_obj.reconciled else '不平 —— 需人工检查'}")
     for note in report_obj.notes:
         log(f"  · {note}")
+
+    # 孤儿单：一整单交易的公告全被灰掉了，于是这单凭空消失。
+    # 每一条单看都灰得对，合起来却丢掉一整单 —— 这是铁律二说的静默污染
+    # 最狠的一种表现，而且只有在**单**这个层面上才看得见。
+    from . import recall
+    orphans = recall.find_orphans(recs)
+    recall.write_report(orphans, ROOT)
+    for line in recall.gap_summary(recs, orphans):
+        log(line)
+    result.orphans = len(orphans)
     return recs, rules
 
 
