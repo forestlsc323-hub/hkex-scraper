@@ -202,6 +202,19 @@ def v16_benchmark_spread(labels_and_values: list[tuple[str, Decimal]],
                    f"（超过 {max_ratio} 倍就有一个读错了）")
 
 
+def v21_price_floor(offer_price: Decimal, spa_price: Decimal) -> Finding:
+    """V21：强制要约的要约价不得低于要约人此前付给卖方的价（規則26.3）。
+
+    低于就是这单有问题 —— 要么我把某个价读错了，要么公告本身有事。
+    这个比较同时是做可比时一眼要看的东西：给卖方的价和给公众股东的价
+    差多少，就是控制权溢价付了多少。
+    """
+    passed = offer_price >= spa_price
+    return Finding("V21", passed, "要约价底价",
+                   f"要约价 {offer_price} 对协议每股价 {spa_price}"
+                   f"（規則26.3：不得低于此前付出的最高价）")
+
+
 def run_price_comparisons(offer_price: Decimal, comparisons: list[PriceComparison],
                           low_6m: Decimal, high_6m: Decimal,
                           nonmarket_labels: frozenset[str] = frozenset()) -> list[Finding]:

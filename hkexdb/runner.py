@@ -280,6 +280,7 @@ class Deal:
     consideration: str = ""           # 现金 / 证券 / 现金＋证券
     offer_price: str = ""
     price_headline: str = ""          # 替代方案里含递延结算的那个价（如果有两套）
+    spa_price: str = ""               # 买卖协议每股价 —— 要约价的法定地板
     premium_pct: str = ""             # 主值溢价率
     premium_basis: str = ""           # 主值口径 —— 没有它这个数字没意义
     premium_ladder: dict = field(default_factory=dict)   # 全部比较项
@@ -1489,6 +1490,7 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             deal.consideration = ex.consideration
             deal.offer_price = ex.offer_price
             deal.price_headline = ex.price_headline
+            deal.spa_price = ex.spa_price
             deal.deal_size = ex.deal_size
             deal.listing_intent = ex.listing_intent
             deal.confidence = ex.confidence
@@ -1635,6 +1637,13 @@ def _run_checks(ex, validators, premium_pct: str = "") -> str:
     from decimal import Decimal, InvalidOperation
 
     floor: list = []
+    # V21 只对强制要约成立：自愿要约没有規則26.3 的地板。
+    if ex.offer_type == "MGO" and ex.spa_price and ex.offer_price:
+        try:
+            floor.append(validators.v21_price_floor(
+                Decimal(ex.offer_price), Decimal(ex.spa_price)))
+        except InvalidOperation:
+            pass
     if premium_pct:
         try:
             floor = [validators.v15_discount_floor("主值溢价率",
@@ -1688,7 +1697,7 @@ DEAL_COLUMNS = [
     "要约方", "要约方财务顾问",
     "要约类型", "义务基础", "要约范围", "条件", "对价形式",
     # 第二层：定价
-    "要约价(HKD)", "另一套要约价", "主值溢价率(%)", "主值口径",
+    "要约价(HKD)", "另一套要约价", "协议每股价", "主值溢价率(%)", "主值口径",
     *[f"较{c}(%)" for c in LADDER_COLUMNS], LADDER_OTHER,
     "六个月最低", "六个月最高", "泄露涨幅(%)",
     # 估值组 —— 和规模分开：付给公众股东的才是规模
@@ -1709,7 +1718,8 @@ def _deal_row(d: Deal) -> list[str]:
             d.offer_type, OBLIGATION_LABEL.get(d.obligation_basis, ""),
             SCOPE_LABEL.get(d.offer_scope, ""),
             d.is_conditional, d.consideration,
-            d.offer_price, d.price_headline, d.premium_pct, d.premium_basis,
+            d.offer_price, d.price_headline, d.spa_price,
+            d.premium_pct, d.premium_basis,
             *[d.premium_ladder.get(c, "") for c in LADDER_COLUMNS], other,
             d.six_month_low, d.six_month_high, d.runup_pct,
             d.nav_per_share, d.pb_ratio, d.implied_equity_value, d.total_shares,

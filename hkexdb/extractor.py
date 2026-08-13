@@ -132,6 +132,11 @@ class Extraction:
     # 同一单给了两个要约价（替代方案）时，即期那个进 offer_price，
     # 带递延结算的那个存这里 —— 两个都留着，不丢。
     price_headline: str = ""
+    # 买卖协议里每股销售股份的价 —— 要约价的法定地板（規則26.3），
+    # 同时也是做可比时一眼要看的东西：要约人给卖方的价和给公众股东的价
+    # 差多少，就是控制权溢价付了多少。
+    spa_price: str = ""
+    spa_price_evidence: Evidence = field(default_factory=Evidence)
     comparisons: list[Comparison] = field(default_factory=list)
     six_month_low: str = ""
     six_month_high: str = ""
@@ -471,7 +476,8 @@ def _drop_impossible_offer_price(result) -> None:
         result.offer_price_evidence = Evidence()
 
 
-def _deal_size_problem(amount: str, price: str, shares: str) -> str:
+def _deal_size_problem(amount: str, price: str, shares: str,
+                       equity_value: str = "") -> str:
     """这个数当交易规模讲不讲得通。讲得通返回空串，讲不通返回一句人话。
 
     只做两条算术上的硬约束，不做口径判断（铁律一）：
@@ -489,8 +495,17 @@ def _deal_size_problem(amount: str, price: str, shares: str) -> str:
         return (f"{amount} 与每股 {price} 港元不相称"
                 f"（总代价不可能这么接近每股价）")
     n = _num_or_none(shares)
-    if n and a_ > p_ * n * 1.01:
-        return (f"{amount} 超过按要约价计的全部股本估值 {p_ * n:,.0f}"
+    ceilings = [p_ * n for n in [n] if n]
+    stated = _num_or_none(equity_value)
+    if stated:
+        ceilings.append(stated)
+    if not ceilings:
+        return ""
+    # 两个参照物取**大**的那个：股数抽错时不至于误杀，而真正抓错了
+    # 东西（买卖协议对价那种）通常比两个都大。
+    top = max(ceilings)
+    if a_ > top * 1.01:
+        return (f"{amount} 超过按要约价计的全部股本估值 {top:,.0f}"
                 f"（要约买不到比整家公司还多）")
     return ""
 
@@ -506,7 +521,8 @@ def _drop_impossible_deal_size(result) -> None:
         result.deal_size_evidence = Evidence()
 
 
-def _choose_deal_size(result, candidates: list[tuple[str, int, str]]) -> None:
+def _choose_deal_size(result, candidates: list[tuple[str, int, str]],
+                      equity_value: str = "") -> None:
     """按优先级挑第一个**讲得通**的候选。
 
     ⚠️ 这是这一层最贵的一个教训。原来的做法是「先挑第一个候选，再拿
@@ -522,7 +538,8 @@ def _choose_deal_size(result, candidates: list[tuple[str, int, str]]) -> None:
     """
     rejected: list[str] = []
     for amount, page, quote in candidates:
-        why = _deal_size_problem(amount, result.offer_price, result.total_shares)
+        why = _deal_size_problem(amount, result.offer_price, result.total_shares,
+                                 equity_value)
         if why:
             rejected.append(why)
             continue
@@ -1287,6 +1304,8 @@ def extract_terms(title: str, pages: dict[int, str]) -> dict:
 _TOTAL_SHARES = [
     re.compile(r"已發行股份總數為?\s*([\d,]+)\s*股"),
     re.compile(r"已發行股份為\s*([\d,]+)\s*股"),
+    # 「本公司擁有已發行股份204,400,000股」（01451 萬成）
+    re.compile(r"已發行股份\s*([\d,]+)\s*股"),
     re.compile(r"本公司已發行\s*([\d,]+)\s*股股份"),
     re.compile(r"已發行\s*([\d,]+)\s*股(?:股份)?"),
     re.compile(r"([\d,]{9,})\s*股已發行股份"),
@@ -1299,8 +1318,15 @@ _TOTAL_SHARES = [
 # 这处股数是不是「从卖方手上买的那批」，而不是已发行股本。
 _SHARES_FROM_SELLER = re.compile(r"收購|購買|出售|轉讓|售股股東|銷售股份|買賣協議")
 
+# 后文写着「將受…要約規限」的，是**受要约股数**，不是已发行股本。
+# 01451 萬成：「本公司擁有已發行股份204,400,000股。扣除除外股份後，
+# 合共56,828,000股股份將受股份要約規限。」—— 抽中后一个就差了 3.6 倍。
+_SHARES_UNDER_OFFER = re.compile(r"將?受[^。；]{0,8}要約(?:規限|標的)|成為要約股份")
+
 
 def _bought_from_a_seller(flat: str, at: int) -> bool:
+    if _SHARES_UNDER_OFFER.search(flat[at:at + 40]):
+        return True           # 受要约股数，不是股本
     before = flat[max(0, at - 40):at]
     if "已發行" in before:
         return False          # 「已發行合共 N 股」说的就是股本
@@ -1590,6 +1616,44 @@ _BUNDLE_TOTAL = re.compile(
 _SCENARIO_SPAN = 500
 
 
+# 公告自己印的「已發行股本總值 X 港元」——用它反推股数，给天花板当第二个
+# 参照物。股数那一格抽错的代价太大（分母小七倍，正确的规模就被判成
+# 「比整家公司还贵」而作废），必须有个不依赖它的旁证。
+# 这是铁律一：拿公告自己的两个数字互相验。
+_EQUITY_VALUE_AMOUNT = re.compile(
+    rf"(?:全部)?已發行股[本份](?:總額)?(?:之|的)?(?:價值|總值)"
+    rf"{_GAP}{{0,16}}?{_AMOUNT}")
+
+
+def stated_equity_value(pages: dict[int, str]) -> str:
+    """公告自报的「按要约价计的全部股本价值」。没有就返回空串。"""
+    for page in sorted(pages):
+        m = _EQUITY_VALUE_AMOUNT.search(_flat(pages[page]))
+        if m:
+            return _amount_of(m)
+    return ""
+
+
+# 买卖协议里的每股价。01451 萬成写「總現金代價為60,000,000港元，
+# 相等於每股銷售股份0.80港元」；01780 榮尊写「（相當於每股股份代價0.52港元）」。
+_SPA_PRICE = re.compile(
+    rf"每股(?:銷售|待售)?股份(?:之)?(?:代價|價格)?{_GAP}{{0,6}}?{_AMOUNT}")
+
+
+def extract_spa_price(pages: dict[int, str]) -> tuple[str, Evidence]:
+    """买卖协议项下的每股价。只在讲协议对价的句子里找。"""
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        for m in _SPA_PRICE.finditer(flat):
+            before = flat[max(0, m.start() - 60):m.start()]
+            if not _SELLER_SIDE.search(before):
+                continue          # 不是在讲协议对价，跳过
+            start = max(0, m.start() - 40)
+            return m.group("num").replace(",", ""), Evidence(
+                page, flat[start:m.end() + 10].strip())
+    return "", Evidence()
+
+
 def _money_str(value: Decimal) -> str:
     """金额转字符串：不用科学计数法，也不补没有的小数位。"""
     text = f"{value:f}"
@@ -1755,8 +1819,9 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.debt_conversion, result.debt_conversion_evidence = \
         extract_debt_conversion(pages)
 
+    result.spa_price, result.spa_price_evidence = extract_spa_price(pages)
     _drop_impossible_offer_price(result)
-    _choose_deal_size(result, others)
+    _choose_deal_size(result, others, stated_equity_value(pages))
 
     # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
     # 比值连续散布在 0.019~3.201 —— 说明不是稳定取错了某个口径，

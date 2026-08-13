@@ -318,3 +318,19 @@ def test_v16_lets_a_normal_ladder_through():
 def test_v16_needs_at_least_two_benchmarks():
     assert V.v16_benchmark_spread([("收市价", Decimal("1"))]).passed
     assert V.v16_benchmark_spread([]).passed
+
+
+# ------------------------------------------ V21：強制要约的要约价有法定地板
+
+def test_v21_flags_an_offer_below_the_price_paid_to_the_seller():
+    """規則26.3：强制要约价不得低于要约人此前付出的最高价。
+
+    低于就是有问题 —— 要么我读错了某个价，要么公告本身有事。
+    """
+    assert not V.v21_price_floor(Decimal("0.70"), Decimal("0.80")).passed
+
+
+def test_v21_passes_when_the_two_prices_match():
+    """01451 萬成：协议 0.80、要约 0.80 —— 最常见的形态。"""
+    got = V.v21_price_floor(Decimal("0.80"), Decimal("0.80"))
+    assert got.passed and "0.80" in got.detail
