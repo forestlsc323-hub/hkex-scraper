@@ -894,3 +894,66 @@ def test_the_whole_company_valuation_is_still_classified_away():
 def test_the_share_count_is_the_issued_capital_not_the_offer_shares():
     """一段话里有 487,555,558（已发行）、188,063,370 和 195,685,840（受要约）。"""
     assert extractor.extract("", P03938).total_shares == "487555558"
+
+
+# ================================================================
+# PDF 文字层错位：数字被整体提到那一行的开头
+#
+# 这是**排版**问题不是措辞问题 —— 同一份公告正着读一个字都读不出来，
+# 而把「百分比前面最后一个小数就是基准价」这个位置关系用上，全在。
+# 08631 裕豐昌和德萊建業两单都是这个样子，以前两单三个字段全空。
+# ================================================================
+
+P08631 = {
+    5: "0.223每股要約股份現金港元0.223要約價每股要約股份港元，約相當於但不低於"
+       "羅先生於強制執行時支付的每股押0.223記股份約港元的價格。"
+       "要約價的比較0.223每股要約股份港元的要約價較："
+       "(i) 0.485 54.02%於最後交易日在聯交所所報收市價每股港元折讓約 ；"
+       "(ii) 5 0.468截至及包括最後交易日個連續交易日在聯交所所報收市價平均值"
+       "每股約港52.35%元折讓約 ；"
+       "(iii) 10 0.463截至及包括最後交易日個連續交易日在聯交所所報收市價平均值"
+       "每股約港51.84%元折讓約 ；"
+       "(iv) 30 0.505截至及包括最後交易日個連續交易日在聯交所所報收市價平均值"
+       "每股約港55.81%元折讓約 。最高及最低股價",
+    7: "根據要約價每股要約股份港元及基於要約的悉數接2,774,343納，"
+       "要約人根據要約應付現金代價將約為港元。確認要約可用財務資源",
+}
+
+
+def test_a_price_hoisted_in_front_of_its_words_is_still_read():
+    """「0.223每股要約股份港元」—— 正常语序是「每股要約股份0.223港元」。"""
+    assert extractor.extract("", P08631).offer_price == "0.223"
+
+
+def test_a_scrambled_ladder_is_read_by_position_not_adjacency():
+    """基准价和百分比被整段文字隔开，但「百分比前面最后一个小数」不变。"""
+    ex = extractor.extract("", P08631)
+    ladder = {c.window: c.stated_pct for c in ex.comparisons}
+    assert ladder == {"spot": "54.02", "5d": "52.35",
+                      "10d": "51.84", "30d": "55.81"}
+
+
+def test_the_direction_is_settled_by_arithmetic_when_the_words_are_far_away():
+    """错位的公告里「折讓」两个字离数字十万八千里，只能比大小。
+
+    0.223 低于每一个基准价 → 全是折让。表格读法原来一律猜成溢价，
+    符号正好反了 —— 而符号反了会把折让当成溢价放进可比表。
+    """
+    ex = extractor.extract("", P08631)
+    assert all(c.stated_direction == "discount" for c in ex.comparisons)
+    assert any("比大小定出来" in n for n in ex.notes)
+
+
+def test_a_deal_size_hoisted_into_the_middle_of_a_word_is_still_read():
+    """「基於要約的悉數接2,774,343納」—— 数字插进了「悉數接納」中间。"""
+    assert extractor.extract("", P08631).deal_size == "2774343"
+
+
+def test_the_scrambled_readers_only_run_when_the_normal_ones_find_nothing():
+    """⚠️ 这几条读法都很宽 —— 只在正常路子一条都没抽出来时才启用。
+
+    放到通用路径上会误伤：1417 那单的收市价一条立刻被判成 5 日均价。
+    """
+    ex = extractor.extract("", P01633)
+    assert [c.window for c in ex.comparisons] == ["spot", "5d", "10d", "30d", "nav"]
+    assert not any(c.direction_assumed for c in ex.comparisons)

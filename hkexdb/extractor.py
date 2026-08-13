@@ -103,6 +103,9 @@ class Comparison:
     quote: str
     at: int = -1               # 在「價值比較」一节里的偏移，按替代方案切块要用
     venue: str = ""            # hk / foreign —— 双重上市的公司会印两套梯子
+    # 表格读法里没有「溢價／折讓」两个字，方向是**按括号猜**的。
+    # 猜出来的方向不能和读出来的方向同等对待 —— 有要约价时按算术改正。
+    direction_assumed: bool = False
 
     @property
     def label(self) -> str:
@@ -561,6 +564,25 @@ def _choose_deal_size(result, candidates: list[tuple[str, int, str]],
             + ("…" if len(rejected) > 3 else ""))
 
 
+# PDF 文字层错位：数字被整体提到那一行的开头，于是变成
+#     「價值比較0.19每股要約股份港元之要約價較」（德萊建業）
+#     「0.223每股要約股份現金港元」（08631 裕豐昌）
+# 正常语序是「每股要約股份0.19港元」。这不是措辞问题，是排版问题 ——
+# 同一份公告里正着读一个字都读不出来，倒着读就全在。
+_PRICE_REVERSED = re.compile(
+    r"(?<![\d.])([\d,]+\.\d{1,4})\s*每股(?:要約)?股份(?:現金)?\s*港元")
+
+
+def _reversed_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        m = _PRICE_REVERSED.search(flat)
+        if m:
+            return m.group(1).replace(",", ""), Evidence(
+                page, flat[max(0, m.start() - 30):m.end() + 20].strip())
+    return "", Evidence()
+
+
 # 外币计价的要约（09638 法拉帝按 3.50 歐元），公告会在脚注里给港元等值：
 #     「僅供說明用途，代價3.50歐元相當於每股31.71港元，乃根據參考匯率計算」
 # 这是**摘录**公告自己算好的数，不是我们做汇率换算（铁律一）。
@@ -592,13 +614,14 @@ def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
             if m:
                 start = max(0, m.start() - 20)
                 return m.group(1), Evidence(page, flat[start:m.end() + 20].strip())
-    # 一个港元价都找不到时，看看是不是外币计价的单 —— 公告自己给了港元等值。
-    return _hkd_equivalent(pages)
+    # 正着读读不出来时，试试倒着读（文字层错位），再试外币等值。
+    got = _reversed_offer_price(pages)
+    return got if got[0] else _hkd_equivalent(pages)
 
 
 # ---------------------------------------------------------------- 价值比较
 
-_SECTION_START = re.compile(r"(?:要約價的)?價值比較")
+_SECTION_START = re.compile(r"(?:要約價的)?價值比較|要約價(?:的)?比較|要約價比較")
 _SECTION_END = re.compile(r"最高(?:與|及)最低股價|財務資源|可動用財務資源|"
                           r"要約(?:的)?總代價|確認具備充足財務資源")
 
@@ -830,6 +853,31 @@ def _classify(item: str) -> tuple[str, str]:
     return anchor or "last_trading_day", window
 
 
+# 文字层错位时窗口的数字也被提到了前面：
+#     「(iv) 30 0.505截至及包括最後交易日個連續交易日…」
+# 「30」和「個連續交易日」被拆得老远，正常的窗口正则够不着。
+# 但这一条里唯一的**裸整数**（没有小数点的那个）就是天数 ——
+# 基准价和百分比都带小数点，不会撞上。
+_BARE_INT = re.compile(r"(?<![\d.])(\d{1,3})(?![\d.%])")
+_TRADING_DAYS = re.compile(r"個(?:連續)?交易日|交易日")
+
+
+def _window_from_hoisted_number(item: str) -> str:
+    """⚠️ 只给**错位排版**那条路用（_comparisons_from_table）。
+
+    放到通用的 _classify 里会误伤：正常条文里也常有零散的裸整数，
+    1417 那单的收市价一条立刻被判成 5 日均价，而且看不出错。
+    错位的公告本来就已经「正着读一条都读不出来」，在那里放宽才安全。
+    """
+    if not _TRADING_DAYS.search(item):
+        return ""
+    for m in _BARE_INT.finditer(item):
+        for name, pat in _WINDOWS:
+            if pat.search(m.group(1) + "個"):
+                return name
+    return ""
+
+
 # 一条比较项长什么样：句子里同时有「溢價/折讓 X%」和「每股…港元」。
 # 这个形状比小标题稳得多 —— 小标题各家律所写法不一，形状是收购守则
 # 规则 3.5 要求披露的内容，不会变。
@@ -1014,6 +1062,37 @@ def _apply_election(result, pages: dict[int, str]) -> None:
         f"其余单子都是即期全现金，递延价里含时间价值，混在一起会高估溢价")
 
 
+def _fix_assumed_directions(result) -> None:
+    """表格读法猜出来的方向，用要约价和基准价的大小改正（铁律一）。
+
+    表格里没有「溢價／折讓」两个字，只能靠括号猜（08439 那种 (4.9)% 表示
+    负数）。但文字层错位的公告（德萊建業、08631 裕豐昌）连括号都没有，
+    于是全被猜成溢价 —— 德萊那单实际是**折让** 46.48%，符号正好反了。
+
+    这里不是判断，是比大小：要约价 0.19 低于基准 0.355，那就是折让。
+    只改「猜出来的」那些，读出来的一个字都不动。
+    """
+    price = _num_or_none(result.offer_price)
+    if not price:
+        return
+    fixed = 0
+    for c in result.comparisons:
+        if not c.direction_assumed or c.anchor == "nav":
+            continue
+        bench = _num_or_none(c.benchmark)
+        if not bench:
+            continue
+        right = PREMIUM if price > bench else DISCOUNT
+        if right != c.stated_direction:
+            c.stated_direction = right
+            fixed += 1
+    if fixed:
+        result.notes.append(
+            f"这份公告的价值比较是表格排版，没有「溢價／折讓」字样，"
+            f"方向按要约价 {result.offer_price} 与各基准价比大小定出来"
+            f"（改了 {fixed} 条）")
+
+
 def _note_alternative_prices(result) -> None:
     """一份公告给了**两套要约价**时，说出来。
 
@@ -1181,6 +1260,10 @@ def _comparisons_in(item: str, page: int,
 #   · 基准价**不带「港元」**，就是个光秃秃的数字；
 #   · 没有「溢價／折讓」两个字，靠**括号**表示负数：(4.9)% 是折让 4.9%；
 #   · 后面还跟着第二个百分比（计入特别股息后的口径），要的是**第一个**。
+# 一条里的百分比（不带「溢價／折讓」字样）和它前面的小数。
+_PCT_ANY = re.compile(r"(\d+\.?\d*)\s*[)）]?\s*%")
+_DECIMAL = re.compile(r"(?<![\d.])\d+\.\d{2,4}(?![\d.])")
+
 _TABLE_ROW = re.compile(
     # ⚠️ 基准价后面必须紧跟空白或左括号。少了这个前瞻，「0.125%」会被
     # 拆成基准 0.12 ＋ 百分比 5 —— 一条凭空捏出来的比较，且看着很正常。
@@ -1189,23 +1272,48 @@ _TABLE_ROW = re.compile(
 
 
 def _comparisons_from_table(section: str, page: int) -> list[Comparison]:
-    """把表格排版的价值比较捞出来。"""
+    """把表格排版／文字层错位的价值比较捞出来。
+
+    两种排版共用一条读法：**一条里的百分比是锚，基准价是它前面最后一个
+    带小数点的数**。
+
+        08439 新百利（表格）：  「(ix) …三十(30)個交易日 0.581 40.8% 58.0%」
+        08631 裕豐昌（错位）：  「(ii) 5 0.468截至…每股約港52.35%元折讓約」
+
+    后一种里基准价和百分比被整段文字隔开，按「紧挨着」读一条都读不出来；
+    但「百分比前面最后一个小数」这个位置关系在两种排版下都成立。
+
+    ⚠️ 这条读法只在正常路子一条都没抽出来时才启用，所以放宽是安全的。
+    方向一律标成**猜的**（direction_assumed），随后由 _fix_assumed_directions
+    用要约价比大小定夺 —— 错位的公告里「折讓」两个字离数字十万八千里。
+    """
     out: list[Comparison] = []
     for item in _split_items(section):
-        m = _TABLE_ROW.search(item)
+        m = _PCT_ANY.search(item)
         if not m:
+            continue
+        before = item[:m.start()]
+        bench_m = None
+        for b in _DECIMAL.finditer(before):
+            bench_m = b
+        if bench_m is None:
             continue
         anchor, window = _classify(item)
         if anchor == "unknown" and window == "unknown":
             continue
-        bench = m.group("bench")
+        if window == "spot":
+            window = _window_from_hoisted_number(item) or "spot"
+        bench = bench_m.group(0)
+        # 括号包着的百分比是负数（08439 那种 (4.9)%）——这一条读得出来
+        neg = bool(re.search(r"[（(]\s*$", before))
         out.append(Comparison(
             anchor=anchor, window=window,
             benchmark=bench, benchmark_decimals=_decimals(bench),
             benchmark_is_exact=True,          # 表格里印的就是精确值
-            stated_pct=m.group("pct"),
-            stated_direction=DISCOUNT if m.group("neg") else PREMIUM,
-            page=page, quote=item.strip()[:220], venue=_venue(item)))
+            stated_pct=m.group(1),
+            stated_direction=DISCOUNT if neg else PREMIUM,
+            page=page, quote=item.strip()[:220], venue=_venue(item),
+            direction_assumed=True))
     return out
 
 
@@ -1630,6 +1738,14 @@ _DEAL_SIZE = [
 ]
 
 
+# 文字层错位时的交易规模：数字在前，「應付…代價…港元」在后。
+_DEAL_SIZE_REVERSED = re.compile(
+    r"(?P<num>[\d,]+\.?\d*)"
+    r"(?:(?!每股)[^0-9。；]){0,40}?(?:應付|支付|須付)"
+    r"(?:(?!每股)[^0-9。；]){0,24}?(?:現金)?(?:總)?(?:代價|金額|款項)"
+    r"(?:(?!每股)[^0-9。；]){0,16}?港元")
+
+
 def _amount_of(m) -> str:
     """把一处匹配换算成整数金额字符串。
 
@@ -1904,6 +2020,21 @@ def deal_size_candidates(pages: dict[int, str],
                 start = max(0, m.start() - 40)
                 out.append((amount, page, flat[start:m.end() + 10].strip()))
                 funded.append(_in_funding_section(flat, m.start()))
+    if not out:
+        # 文字层错位的公告，数字被提到了词的前面：
+        #   「…基於要約的悉數接2,774,343納，要約人根據要約應付現金代價將約為港元」
+        # 正着读一条都读不出来。只在**一条都没有**时才启用，放宽是安全的。
+        for page in sorted(pages):
+            flat = _flat(pages[page])
+            for m in _DEAL_SIZE_REVERSED.finditer(flat):
+                amount = m.group("num").replace(",", "")
+                if amount in seen or _distractor_kind(flat, m.start()):
+                    continue
+                seen.add(amount)
+                out.append((amount, page,
+                            flat[max(0, m.start() - 20):m.end() + 10].strip()))
+                funded.append(False)
+
     if dropped and notes is not None:
         notes.append("这些数字长得像交易规模但口径不对，已按类归开："
                      + "、".join(dropped[:5])
@@ -1985,6 +2116,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         result.notes.append("要约类型未识别，需人工判定")
     if not result.comparisons:
         result.notes.append("未找到「價值比較」一节，溢价率无法抽取")
+    _fix_assumed_directions(result)
     _apply_election(result, pages)
     _note_alternative_prices(result)
     if not result.deal_size:
