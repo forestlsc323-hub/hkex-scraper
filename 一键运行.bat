@@ -1,7 +1,20 @@
 @echo off
-chcp 65001 >nul
+REM ---------------------------------------------------------------
+REM  NOTE: this file is stored in GBK (cp936) and must NOT contain
+REM  a `chcp` command.
+REM
+REM  cmd tracks its position in a batch file by BYTE OFFSET. Changing
+REM  the code page half way through a file that holds multi-byte
+REM  characters makes that offset drift, so cmd resumes reading from
+REM  the MIDDLE of a later line. That is what produced
+REM      'xxx' is not recognized as an internal or external command
+REM  on a line that was nothing but a Chinese comment.
+REM
+REM  A Chinese Windows console is already cp936, so the fix is to
+REM  store the file in that encoding and never switch.
+REM ---------------------------------------------------------------
 cd /d "%~dp0"
-title HKEX Scraper - è¿™ä¸ªé»‘çª—å£åˆ«å…³ï¼Œå‡ºé”™ä¿¡æ¯ä¼šæ˜¾ç¤ºåœ¨è¿™é‡Œ
+title HKEX Scraper - Õâ¸öºÚ´°¿Ú±ð¹Ø£¬³ö´íÐÅÏ¢»áÏÔÊ¾ÔÚÕâÀï
 
 set "PY="
 py -3 -c "import sys" >nul 2>&1
@@ -13,67 +26,67 @@ if not defined PY (
 )
 
 if not defined PY (
-  echo [X] Python not found / æ²¡æ‰¾åˆ° Python
+  echo [X] Python not found / Ã»ÕÒµ½ Python
   echo.
-  echo     è¯·è£… Python 3.13ï¼š
+  echo     Çë×° Python 3.13£º
   echo       https://www.python.org/downloads/windows/
-  echo       åœ¨å·¦è¾¹ "Stable Releases" é‡Œæ‰¾æœ€æ–°çš„ Python 3.13.x
-  echo       ç‚¹å®ƒä¸‹é¢çš„ "Windows installer (64-bit)"
-  echo       å³è¾¹ "Pre-releases" æ˜¯æµ‹è¯•ç‰ˆï¼Œä¸è¦é€‰
+  echo       ÔÚ×ó±ß "Stable Releases" ÀïÕÒ×îÐÂµÄ Python 3.13.x
+  echo       µãËüÏÂÃæµÄ "Windows installer (64-bit)"
+  echo       ÓÒ±ß "Pre-releases" ÊÇ²âÊÔ°æ£¬²»ÒªÑ¡
   echo.
-  echo     *** å®‰è£…ç¬¬ä¸€å±æœ€åº•ä¸‹é‚£ä¸ªå‹¾å¿…é¡»å‹¾ä¸Š ***
+  echo     *** °²×°µÚÒ»ÆÁ×îµ×ÏÂÄÇ¸ö¹´±ØÐë¹´ÉÏ ***
   echo         [v] Add python.exe to PATH
-  echo         ä¸å‹¾çš„è¯è£…å®Œè¿˜æ˜¯è¿™ä¸ªæç¤ºã€‚
+  echo         ²»¹´µÄ»°×°Íê»¹ÊÇÕâ¸öÌáÊ¾¡£
   echo.
-  echo     è£…å®Œå…³æŽ‰æœ¬çª—å£ï¼Œé‡æ–°åŒå‡»æœ¬æ–‡ä»¶å³å¯ã€‚
+  echo     ×°Íê¹Øµô±¾´°¿Ú£¬ÖØÐÂË«»÷±¾ÎÄ¼þ¼´¿É¡£
   echo.
-  echo     å¦‚æžœè¾“ python ä¼šå¼¹å‡ºå¾®è½¯å•†åº—ï¼ˆé‚£æ˜¯å ä½ç¬¦ï¼Œä¸æ˜¯çœŸ Pythonï¼‰ï¼š
-  echo       è®¾ç½® - åº”ç”¨ - é«˜çº§åº”ç”¨è®¾ç½® - åº”ç”¨æ‰§è¡Œåˆ«å
-  echo       æŠŠ python.exe å’Œ python3.exe ä¸¤ä¸ªå¼€å…³éƒ½å…³æŽ‰
+  echo     Èç¹ûÊä python »áµ¯³öÎ¢ÈíÉÌµê£¨ÄÇÊÇÕ¼Î»·û£¬²»ÊÇÕæ Python£©£º
+  echo       ÉèÖÃ - Ó¦ÓÃ - ¸ß¼¶Ó¦ÓÃÉèÖÃ - Ó¦ÓÃÖ´ÐÐ±ðÃû
+  echo       °Ñ python.exe ºÍ python3.exe Á½¸ö¿ª¹Ø¶¼¹Øµô
   echo.
   pause
   exit /b 1
 )
 
 if not exist ".venv\Scripts\python.exe" (
-  echo First run: creating environment / é¦–æ¬¡è¿è¡Œï¼Œæ­£åœ¨å‡†å¤‡çŽ¯å¢ƒ...
+  echo First run: creating environment / Ê×´ÎÔËÐÐ£¬ÕýÔÚ×¼±¸»·¾³...
   %PY% -m venv .venv
 )
 
 if not exist ".venv\Scripts\python.exe" (
-  echo [X] venv failed / åˆ›å»ºçŽ¯å¢ƒå¤±è´¥ï¼ŒæŠŠä¸Šé¢çš„æŠ¥é”™å‘ç»™ Claude
+  echo [X] venv failed / ´´½¨»·¾³Ê§°Ü£¬°ÑÉÏÃæµÄ±¨´í·¢¸ø Claude
   pause
   exit /b 1
 )
 
 .venv\Scripts\python.exe -c "import requests,yaml,bs4,pdfplumber" >nul 2>&1
 if not %errorlevel%==0 (
-  echo Installing dependencies, 1-2 min / æ­£åœ¨å®‰è£…ä¾èµ–ï¼Œçº¦ 1-2 åˆ†é’Ÿ...
+  echo Installing dependencies, 1-2 min / ÕýÔÚ°²×°ÒÀÀµ£¬Ô¼ 1-2 ·ÖÖÓ...
   .venv\Scripts\python.exe -m pip install --upgrade pip
   .venv\Scripts\python.exe -m pip install -r requirements.txt
 )
 
 .venv\Scripts\python.exe -c "import requests,yaml,bs4,pdfplumber" >nul 2>&1
 if not %errorlevel%==0 (
-  echo [X] install failed / å®‰è£…ä¾èµ–å¤±è´¥ï¼ŒæŠŠä¸Šé¢çš„æŠ¥é”™å‘ç»™ Claude
+  echo [X] install failed / °²×°ÒÀÀµÊ§°Ü£¬°ÑÉÏÃæµÄ±¨´í·¢¸ø Claude
   pause
   exit /b 1
 )
 
 echo.
-echo æ­£åœ¨æ‰“å¼€çª—å£... è¿™ä¸ªé»‘æ¡†è¯·ç•™ç€ï¼Œå‡ºé”™ä¿¡æ¯ä¼šæ˜¾ç¤ºåœ¨è¿™é‡Œã€‚
+echo ÕýÔÚ´ò¿ª´°¿Ú... Õâ¸öºÚ¿òÇëÁô×Å£¬³ö´íÐÅÏ¢»áÏÔÊ¾ÔÚÕâÀï¡£
 echo.
 
-REM ç”¨ python.exe è€Œä¸æ˜¯ pythonw.exeï¼š
-REM pythonw æ²¡æœ‰æŽ§åˆ¶å°ï¼Œç•Œé¢å¯åŠ¨å¤±è´¥æ—¶ä½ ä»€ä¹ˆéƒ½çœ‹ä¸åˆ°ï¼ˆé™é»˜å¤±è´¥ï¼‰ã€‚
+REM ÓÃ python.exe ¶ø²»ÊÇ pythonw.exe£º
+REM pythonw Ã»ÓÐ¿ØÖÆÌ¨£¬½çÃæÆô¶¯Ê§°ÜÊ±ÄãÊ²Ã´¶¼¿´²»µ½£¨¾²Ä¬Ê§°Ü£©¡£
 .venv\Scripts\python.exe app.py
 set "RC=%errorlevel%"
 
 if not "%RC%"=="0" (
   echo.
   echo ------------------------------------------------------------
-  echo  [X] ç¨‹åºå¼‚å¸¸é€€å‡ºï¼Œä»£ç  %RC%
-  echo      ä¸Šé¢çš„æŠ¥é”™è¯·æˆªå›¾ï¼Œæˆ–æŠŠ app_crash.txt / run_log.txt å‘ç»™ Claude
+  echo  [X] ³ÌÐòÒì³£ÍË³ö£¬´úÂë %RC%
+  echo      ÉÏÃæµÄ±¨´íÇë½ØÍ¼£¬»ò°Ñ app_crash.txt / run_log.txt ·¢¸ø Claude
   echo ------------------------------------------------------------
   pause
 )

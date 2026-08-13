@@ -283,7 +283,7 @@ def test_crash_guard_passes_through_success(tmp_path, monkeypatch):
 
 def test_launcher_keeps_a_console_for_errors():
     """一键运行.bat 不能用 pythonw.exe —— 那样启动失败就是静默的。"""
-    bat = (runner.Path(__file__).parent.parent / "一键运行.bat").read_bytes().decode("utf-8")
+    bat = (runner.Path(__file__).parent.parent / "一键运行.bat").read_bytes().decode("cp936")
     # 只看真正会执行的行 —— 注释里提到 pythonw 是在说明为什么不用它
     live = [ln for ln in bat.splitlines()
             if ln.strip() and not ln.strip().upper().startswith("REM")]
@@ -310,7 +310,7 @@ def test_the_update_bat_does_not_download_anything_itself():
     更新本身的安全性（不碰 data\\、包不对就不写）由 test_updater.py 守。
     """
     text = (runner.Path(__file__).parent.parent / "一键更新.bat"
-            ).read_bytes().decode("utf-8")
+            ).read_bytes().decode("cp936")
     # 只看会真正执行的行 —— REM 注释里写着这段历史，那是要留的
     code = "\n".join(ln for ln in text.lower().splitlines()
                      if not ln.strip().startswith("rem"))

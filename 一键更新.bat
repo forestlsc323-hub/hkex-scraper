@@ -1,23 +1,36 @@
 @echo off
-chcp 65001 >nul
+REM ---------------------------------------------------------------
+REM  NOTE: this file is stored in GBK (cp936) and must NOT contain
+REM  a `chcp` command.
+REM
+REM  cmd tracks its position in a batch file by BYTE OFFSET. Changing
+REM  the code page half way through a file that holds multi-byte
+REM  characters makes that offset drift, so cmd resumes reading from
+REM  the MIDDLE of a later line. That is what produced
+REM      'xxx' is not recognized as an internal or external command
+REM  on a line that was nothing but a Chinese comment.
+REM
+REM  A Chinese Windows console is already cp936, so the fix is to
+REM  store the file in that encoding and never switch.
+REM ---------------------------------------------------------------
 cd /d "%~dp0"
-title HKEX Scraper - æ›´æ–°åˆ°æœ€æ–°ç‰ˆ
+title HKEX Scraper - ¸üĞÂµ½×îĞÂ°æ
 
-REM è¿™ä¸ªæ–‡ä»¶ç°åœ¨åªåšä¸€ä»¶äº‹ï¼šè®©ç¨‹åºè‡ªå·±å»æ›´æ–°è‡ªå·±ã€‚
+REM Õâ¸öÎÄ¼şÏÖÔÚÖ»×öÒ»¼şÊÂ£ºÈÃ³ÌĞò×Ô¼ºÈ¥¸üĞÂ×Ô¼º¡£
 REM
-REM åŸæ¥å®ƒæ˜¯è‡ªå·±ä¸‹è½½ zipã€è§£å‹ã€è¦†ç›–æ–‡ä»¶çš„ï¼ˆcmd è°ƒ PowerShell è°ƒ
-REM Invoke-WebRequestï¼‰ã€‚åŠŸèƒ½æ²¡æ¯›ç—…ï¼Œä½†ã€Œä¸€ä¸ªè„šæœ¬ä»äº’è”ç½‘å–å†…å®¹å¹¶å°±åœ°
-REM è¦†ç›–å¯æ‰§è¡Œæ–‡ä»¶ã€æ­£æ˜¯ä¸‹è½½å™¨æœ¨é©¬çš„è¡Œä¸ºç‰¹å¾ â€”â€” å¡å·´æ–¯åŸºæŠŠå®ƒåˆ¤æˆ
-REM PDM:Trojan.Win32.Generic.nblk ç›´æ¥åˆ äº†ã€‚æ€è½¯æ²¡å†¤æ‰å®ƒã€‚
+REM Ô­À´ËüÊÇ×Ô¼ºÏÂÔØ zip¡¢½âÑ¹¡¢¸²¸ÇÎÄ¼şµÄ£¨cmd µ÷ PowerShell µ÷
+REM Invoke-WebRequest£©¡£¹¦ÄÜÃ»Ã«²¡£¬µ«¡¸Ò»¸ö½Å±¾´Ó»¥ÁªÍøÈ¡ÄÚÈİ²¢¾ÍµØ
+REM ¸²¸Ç¿ÉÖ´ĞĞÎÄ¼ş¡¹ÕıÊÇÏÂÔØÆ÷Ä¾ÂíµÄĞĞÎªÌØÕ÷ ¡ª¡ª ¿¨°ÍË¹»ù°ÑËüÅĞ³É
+REM PDM:Trojan.Win32.Generic.nblk Ö±½ÓÉ¾ÁË¡£É±ÈíÃ»Ô©Í÷Ëü¡£
 REM
-REM æ‰€ä»¥åˆ«å†è·Ÿå¯å‘å¼å¼•æ“è¾ƒåŠ²ï¼šä¸‹è½½å’Œè¦†ç›–éƒ½äº¤ç»™ hkexdb\updater.pyï¼Œ
-REM èµ°ç¨‹åºæœ¬æ¥å°±åœ¨ç”¨çš„é‚£æ¡ç½‘ç»œè·¯å¾„ã€‚
+REM ËùÒÔ±ğÔÙ¸úÆô·¢Ê½ÒıÇæ½Ï¾¢£ºÏÂÔØºÍ¸²¸Ç¶¼½»¸ø hkexdb\updater.py£¬
+REM ×ß³ÌĞò±¾À´¾ÍÔÚÓÃµÄÄÇÌõÍøÂçÂ·¾¶¡£
 REM
-REM æ›´çœäº‹çš„åŠæ³•ï¼šç›´æ¥å¼€ç¨‹åºï¼Œã€ŒæŠ“å–ã€é¡µå³ä¸‹è§’æœ‰ä¸ªã€Œæ£€æŸ¥æ›´æ–°ã€æŒ‰é’®ï¼Œ
-REM æ•ˆæœä¸€æ¨¡ä¸€æ ·ï¼Œä¹Ÿä¸éœ€è¦è¿™ä¸ª .batã€‚
+REM ¸üÊ¡ÊÂµÄ°ì·¨£ºÖ±½Ó¿ª³ÌĞò£¬¡¸×¥È¡¡¹Ò³ÓÒÏÂ½ÇÓĞ¸ö¡¸¼ì²é¸üĞÂ¡¹°´Å¥£¬
+REM Ğ§¹ûÒ»Ä£Ò»Ñù£¬Ò²²»ĞèÒªÕâ¸ö .bat¡£
 
 if not exist ".venv\Scripts\python.exe" (
-  echo [X] è¿˜æ²¡è£…å¥½ç¯å¢ƒã€‚è¯·å…ˆåŒå‡» ä¸€é”®è¿è¡Œ.bat è·‘ä¸€æ¬¡ã€‚
+  echo [X] »¹Ã»×°ºÃ»·¾³¡£ÇëÏÈË«»÷ Ò»¼üÔËĞĞ.bat ÅÜÒ»´Î¡£
   pause
   exit /b 1
 )

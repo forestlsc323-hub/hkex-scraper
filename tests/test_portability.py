@@ -31,7 +31,7 @@ def test_bat_files_use_crlf(name):
 
 def test_launcher_keeps_a_console_so_errors_are_visible():
     """pythonw.exe 没有控制台：界面若在启动阶段崩掉，用户什么都看不到。"""
-    bat = (ROOT / "一键运行.bat").read_bytes().decode("utf-8")
+    bat = (ROOT / "一键运行.bat").read_bytes().decode("cp936")
     live = [ln for ln in bat.splitlines()
             if ln.strip() and not ln.strip().upper().startswith("REM")]
     assert not any("pythonw" in ln for ln in live)
@@ -185,3 +185,39 @@ def test_the_bar_never_loses_the_real_progress_when_it_animates():
     assert 'state["progress"]' in text, "没有单独保存真实进度"
     finish = text.split("def finish(result)", 1)[1].split("def ", 1)[0]
     assert 'state["progress"]' in finish, "结束时没有用回真实进度"
+
+
+# ------------------------------------------- .bat 的编码：踩过一次，钉死
+
+@pytest.mark.parametrize("name", BATS)
+def test_bat_files_are_stored_in_the_console_code_page(name):
+    """.bat 必须存成 GBK（cp936）—— 中文 Windows 的控制台就是这个码页。
+
+    存成 UTF-8 再靠 `chcp 65001` 转，会踩 cmd 的一个老 bug：
+    它按**字节偏移**记住自己读到文件哪儿了，中途换码页会让偏移错位，
+    于是从后面某一行的**中间**接着读。实跑真的出过：
+
+        '执行文件」正是下载器木马的行为特征' is not recognized as an
+        internal or external command
+
+    那一行本来只是条中文注释。更新其实成功了，但用户看到的是一堆
+    像出错的红字 —— 而且内容还是「木马」两个字。
+    """
+    raw = (ROOT / name).read_bytes()
+    raw.decode("cp936")          # 解不开就说明存错编码了
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    else:
+        raise AssertionError(f"{name} 看起来还是 UTF-8，中文 cmd 会读乱")
+
+
+@pytest.mark.parametrize("name", BATS)
+def test_bat_files_never_switch_the_code_page(name):
+    """理由同上：文件本来就是控制台的码页，不需要也不能换。"""
+    text = (ROOT / name).read_bytes().decode("cp936")
+    live = [ln for ln in text.splitlines()
+            if ln.strip() and not ln.strip().upper().startswith("REM")]
+    assert not any(ln.strip().lower().startswith("chcp") for ln in live), \
+        f"{name} 里还有 chcp —— 换码页会让 cmd 的读取位置错位"
