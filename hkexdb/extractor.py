@@ -1442,7 +1442,8 @@ def extract_terms(title: str, pages: dict[int, str]) -> dict:
 # 一个字段抽错，另一个字段凭空消失。
 _TOTAL_SHARES = [
     re.compile(r"已發行股份總數為?\s*([\d,]+)\s*股"),
-    re.compile(r"已發行股份為\s*([\d,]+)\s*股"),
+    # 「則已發行股份**將**為487,555,558股」（03938 LFG）
+    re.compile(r"已發行股份(?:將|會|應)?為\s*([\d,]+)\s*股"),
     # 「本公司擁有已發行股份204,400,000股」（01451 萬成）
     re.compile(r"已發行股份\s*([\d,]+)\s*股"),
     re.compile(r"本公司已發行\s*([\d,]+)\s*股股份"),

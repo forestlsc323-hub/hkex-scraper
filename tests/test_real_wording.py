@@ -844,3 +844,53 @@ def test_a_window_written_with_full_width_brackets_is_recognised():
     assert ladder["10d"] == "47.92"
     assert ladder["30d"] == "40.87"
     assert ex.deal_size == "70672000"
+
+
+# ------------------- 03938 LFG 投資控股：打包加总与情境取大的**真原文**验收
+
+# 这一单同时考验三道工序，是唯一能验出「情境内加总」和「情境间取大」
+# 没串味的用例：
+#   情境甲（购股权不行使）：股份要约 112,838,022 + 购股权要约 5,950,408.05
+#                          公告自印合计 118,788,430.05
+#   情境乙（购股权悉数行使）：股份要约 117,411,504（购股权已行使掉，无从注销）
+#   干扰值：179,695,312.80（付给卖方）、292,533,334.80（整家公司估值）
+P03938 = {
+    5: "該等要約的總代價假設於該等要約截止前本公司的已發行股本概無變動及"
+       "尚未行使購股權未獲行使，則已發行股份將為487,555,558股。根據股份要約價"
+       "每股要約股份0.60港元計算，本公司全部已發行股本的價值將為292,533,334.80"
+       "港元。假設於該等要約截止前本公司的已發行股本概無變動，188,063,370股股份"
+       "將受股份要約規限及22,480,540份尚未行使購股權將受購股權要約規限。"
+       "倘股份要約及購股權要約獲悉數接納，(i)要約人就股份要約應付的最高代價的"
+       "價值為112,838,022港元；及(ii)要約人就根據購股權要約註銷全部購股權應付的"
+       "最高代價的價值為5,950,408.05港元。該等要約的總價值為118,788,430.05港元。"
+       "財務資源的確認假設剩餘購股權於該等要約截止前獲悉數行使，於扣除要約人"
+       "於緊隨完成後持有的299,492,188股股份後，195,685,840股股份將受股份要約規限。"
+       "倘股份要約獲悉數接納，要約人就股份要約應付的最高代價的價值為"
+       "117,411,504港元。",
+}
+
+
+def test_the_bundled_total_survives_the_real_wording():
+    """公告自印的合计优先（防错点 2），而且它比另一情境的合计大（③）。"""
+    ex = extractor.extract("", P03938)
+    assert ex.deal_size == "118788430.05"
+    assert "總價值" in ex.deal_size_evidence.quote
+
+
+def test_every_scenario_number_stays_visible_as_a_candidate():
+    """铁律二：没被选中的不等于不存在 —— 三个都要在候选里看得见。"""
+    got = {a for a, _p, _q in extractor.deal_size_candidates(P03938)}
+    assert {"118788430.05", "112838022", "5950408.05", "117411504"} <= got
+
+
+def test_the_whole_company_valuation_is_still_classified_away():
+    """292,533,334.80 = 0.60 × 487,555,558，是整家公司的估值，不是规模。"""
+    notes: list = []
+    got = {a for a, _p, _q in extractor.deal_size_candidates(P03938, notes)}
+    assert "292533334.80" not in got
+    assert any("整家公司的估值" in n for n in notes)
+
+
+def test_the_share_count_is_the_issued_capital_not_the_offer_shares():
+    """一段话里有 487,555,558（已发行）、188,063,370 和 195,685,840（受要约）。"""
+    assert extractor.extract("", P03938).total_shares == "487555558"
