@@ -957,3 +957,29 @@ def test_the_scrambled_readers_only_run_when_the_normal_ones_find_nothing():
     ex = extractor.extract("", P01633)
     assert [c.window for c in ex.comparisons] == ["spot", "5d", "10d", "30d", "nav"]
     assert not any(c.direction_assumed for c in ex.comparisons)
+
+
+# 02362 金川國際（部分要约，文字层错位）—— 三个字段一次全对的真原文
+P02362_PO = {
+    6: "要約價格的價值比較0.30要約價格為每股要約股份港元："
+       "(i) 0.64較於最後交易日在聯交所所報收市價每股53.13%港元折讓 ；"
+       "(ii)較截至最後交易日（包括該日）止最後五個連續交易日在聯交所所報股份"
+       "0.664 54.82%平均收市價每股約港元折讓約 ；"
+       "(iii) 10較截至最後交易日（包括該日）止最後個連續交易日在聯交所所報股份"
+       "0.684 56.14%平均收市價每股約港元折讓約 ；"
+       "(iv) 30較截至最後交易日（包括該日）止最後個連續交易日在聯交所所報股份"
+       "0.619 51.53%平均收市價每股約港元折讓約 。最高及最低股價",
+    7: "倘部分要約獲悉數接納，要約人根據部分要約應付的現金代價總額將為"
+       "39,000,000港元。",
+}
+
+
+def test_02362_partial_offer_reads_end_to_end():
+    """文字层错位 + 部分要约 + 30 日口径，一次全对（真原文）。"""
+    ex = extractor.extract("公告 提出附先決條件的自願現金部分要約", P02362_PO)
+    assert ex.offer_type == "PO"
+    assert ex.offer_price == "0.30"
+    assert ex.deal_size == "39000000"
+    ladder = {c.window: (c.stated_direction, c.stated_pct)
+              for c in ex.comparisons}
+    assert ladder["30d"] == ("discount", "51.53")

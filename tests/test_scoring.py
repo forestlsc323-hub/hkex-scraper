@@ -341,3 +341,23 @@ def test_a_current_row_is_not_flagged():
     report = S.score(got, want)
     assert report.stale == 0
     assert "旧版本" not in report.text()
+
+
+def test_a_real_offer_row_beats_a_nearer_unresolved_one():
+    """01102 環能國際：程序 02-07 抽出完整一行，02-27 那行是「待核」。
+
+    答案记的是 02-27，按「日期最近」会配到空的那一行，报告显示
+    「溢价率抽到（空）」—— 而程序其实完全答对了，只是配错了行。
+    「待核」是程序自己说的「这行不成立」，不该拿它去判自己错。
+    """
+    from hkexdb import scoring as S
+    got = [{"股票代码": "01102", "公告日期": "2025-02-07", "判定": "要约",
+            "主值溢价率(%)": "-20.38"},
+           {"股票代码": "01102", "公告日期": "2025-02-27", "判定": "待核",
+            "主值溢价率(%)": ""}]
+    want = [{"股票代码": "01102", "公告日期": "2025-02-27",
+             "主值溢价率(%)": "-20.38"}]
+    pairs, misses, _extra = S.pair_up(got, want)
+    assert not misses
+    assert pairs[0][1]["公告日期"] == "2025-02-07"
+    assert S.score(got, want).scores[0].right == 1

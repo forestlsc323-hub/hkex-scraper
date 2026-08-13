@@ -224,10 +224,17 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
                 gap = abs((cand_date - want_date).days)
                 if gap > near_days:
                     continue
-            # 日期一样近时挑**信息全**的那一行。同一单的两份文件抽出来的
-            # 东西可能一多一少，配到空的那一行就白丢一分 —— 而那一分
-            # 程序其实是答对了的。
-            rank = (gap, -_filled(cand))
+            # ⚠️ 「判定＝要约」的行排在最前，比日期近更重要。
+            # 01102 環能國際：程序在 2025-02-07 抽出了完整的一行
+            # （MGO 0.05 -20.38% 29,787,139），另有一行 2025-02-27 是
+            # 「待核」（打开的是延迟寄发公告，什么都没有）。答案记的是
+            # 02-27，于是配到了空的那一行，报告上显示「溢价率抽到（空）」——
+            # 而程序其实完全答对了，只是配错了行。
+            #
+            # 「待核／非要约」是程序自己说的「这行不成立」，拿它去参加评分
+            # 等于用一行已知无效的数据判自己错。
+            rank = (0 if str(cand.get("判定", "")).strip() in ("", "要约")
+                    else 1, gap, -_filled(cand))
             if best_rank is None or rank < best_rank:
                 best, best_gap, best_rank = cand, gap, rank
         if best is None:
