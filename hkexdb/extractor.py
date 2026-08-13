@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from functools import lru_cache
 
 MGO, VGO, PO = "MGO", "VGO", "PO"
@@ -1437,7 +1438,93 @@ def _paid_to_the_seller(flat: str, at: int) -> bool:
     return bool(_SELLER_SIDE.search(before)) and not _OFFER_SIDE.search(before)
 
 
-def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
+# ---------------------------------------------------- 打包加总（多要约的单）
+#
+# 一单交易常常同时提出好几个要约：股份要约 + 购股权要约 + 可换股票据要约
+# + 受限制股份单位要约。交易规模是**同一情境内这几项之和**，不是其中最大
+# 的那一项。01376 那单股份要约 32,340,000、可换股票据要约 12,375,000，
+# 公告自己印了合计 44,715,000 —— 程序原来取的是 32,340,000。
+#
+# 三道工序，顺序不能乱：
+#   ① 剔承诺   基数 = 受要约股份 − 不可撤销不接纳承诺（見 _in_funding_section）
+#   ② 打包加总 同一情境内分项相加            ← 这一节
+#   ③ 情境取大 各情境的**合计**互相比，取最大  ← 这一节末尾
+#
+# ⚠️ 三个防错点：
+#   1. **绝不跨情境拼装**。某情境假设「可换股票据全部转换」时，转换出的
+#      股份已经计进股份要约的基数，此时票据要约应为 0 —— 拿甲情境的股份
+#      要约去加乙情境的票据要约，得到的是一个不存在的数。所以只在**相邻**
+#      的一段文字里加（情境切换必然换段落）。
+#   2. **公告自印的合计优先于我的加总**。公告自己算的那个数天然规避了重复
+#      计算。但仍要加一遍做校验（V9）：对不上就写进备注让人看。
+#   3. 明写「價值為零」的分项不加；给了名义价（0.01/份）的要加 ——
+#      金额很小，但不算就和公告印的合计对不上。
+_COMPONENT_VALUE = re.compile(
+    rf"(?P<what>股份要約|購股權要約|可換股票據要約|可換股債券要約|"
+    rf"受限制股份單位要約)(?:項下)?(?:之|的)?(?:最高)?(?:現金)?"
+    rf"(?:價值|代價|總額){_GAP}{{0,20}}?{_AMOUNT}")
+
+_BUNDLE_TOTAL = re.compile(
+    rf"(?:該等|所有|各項|上述|全部)要約(?:項下)?(?:之|的)?"
+    rf"(?:總價值|總代價|價值總額|代價總額|總額){_GAP}{{0,20}}?{_AMOUNT}")
+
+# 同一情境的分项挨得很近（通常在同一段话里）。隔得比这远就当成换了情境，
+# 绝不相加 —— 宁可少加一项，也不能拼出一个不存在的数。
+_SCENARIO_SPAN = 500
+
+
+def _money_str(value: Decimal) -> str:
+    """金额转字符串：不用科学计数法，也不补没有的小数位。"""
+    text = f"{value:f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _bundled(flat: str, page: int) -> tuple[list[tuple[str, int, str]], list[str]]:
+    """这一页里的打包合计。返回 (候选, 校验提示)。
+
+    候选顺序：公告自印的合计在前，程序加总的在后（防错点 2）。
+    """
+    printed = [(m, _amount_of(m)) for m in _BUNDLE_TOTAL.finditer(flat)]
+    parts = [(m, m.group("what"), _amount_of(m))
+             for m in _COMPONENT_VALUE.finditer(flat)]
+
+    groups: list[list] = []
+    for item in parts:
+        if groups and item[0].start() - groups[-1][-1][0].end() <= _SCENARIO_SPAN:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+
+    sums: list[tuple[str, int, str]] = []
+    for group in groups:
+        by_kind: dict[str, str] = {}
+        for m, what, amount in group:
+            by_kind.setdefault(what, amount)      # 同一分项只算一次
+        if len(by_kind) < 2:
+            continue                              # 只有一项就不叫打包
+        # ⚠️ 用 Decimal 不用 float：112,838,022 + 5,950,408.05 拿 float 加完
+        # 再格式化，那两分钱会被抹掉，和答案 118,788,430.05 差 0.05。
+        # 钱的加总一分都不能糊。
+        total = sum((Decimal(v) for v in by_kind.values()), Decimal(0))
+        detail = " + ".join(f"{k} {by_kind[k]}" for k in by_kind)
+        text = _money_str(total)
+        sums.append((text, page, f"（分项加总）{detail} = {text}"))
+
+    notes: list[str] = []
+    for m, amount in printed:
+        for total, _page, _q in sums:
+            gap = abs(Decimal(total) - Decimal(amount))
+            if gap > max(Decimal(1), Decimal(amount) * Decimal("0.005")):
+                notes.append(
+                    f"V9 分项之和 {total} 与公告自印合计 {amount} 对不上，"
+                    f"已按公告印的取值，请人工核一眼")
+    out = [(a, page, flat[max(0, m.start() - 40):m.end() + 10].strip())
+           for m, a in printed] + sums
+    return out, notes
+
+
+def deal_size_candidates(pages: dict[int, str],
+                         notes: list | None = None) -> list[tuple[str, int, str]]:
     """一份公告里所有像「交易规模」的数。返回 [(金额, 页码, 引文)]。
 
     一份要约公告里通常同时印着好几个大额数字：控股权转让的对价、
@@ -1456,6 +1543,21 @@ def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
     out: list[tuple[str, int, str]] = []
     funded: list[bool] = []
     seen: set[str] = set()
+
+    # ② 打包加总先来：多要约的单里，交易规模是同一情境内各分项之和，
+    #    而不是其中最大的那一项。③ 各情境的合计互相比，取最大。
+    bundles: list[tuple[str, int, str]] = []
+    for page in sorted(pages):
+        found, checks = _bundled(_flat(pages[page]), page)
+        bundles.extend(found)
+        if notes is not None:
+            notes.extend(checks)
+    if bundles:
+        best = max(bundles, key=lambda c: Decimal(c[0]))  # ③ 情境间取最大
+        out.append(best)
+        seen.add(best[0])
+        funded.append(True)                # 打包合计永远排最前
+
     for pattern in _DEAL_SIZE:
         for page in sorted(pages):
             flat = _flat(pages[page])
@@ -1517,7 +1619,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     # 候选算一遍就够 —— 主值和备注都从这一份里取。
     # （原来 extract_deal_size 里算一遍、写备注时又算一遍，
     #   而这个函数是整个抽取层第二贵的一项。）
-    others = deal_size_candidates(pages)
+    others = deal_size_candidates(pages, result.notes)
     if others:
         amount, page, quote = others[0]
         result.deal_size, result.deal_size_evidence = amount, Evidence(page, quote)

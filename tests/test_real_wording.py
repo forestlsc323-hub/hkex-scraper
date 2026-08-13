@@ -583,3 +583,60 @@ def test_a_single_price_deal_is_untouched_by_the_election():
     for pages in (P03389, P00372, P01980, P01633, P01875):
         ex = extractor.extract("", pages)
         assert ex.price_headline == "", pages
+
+
+# ------------------------------------- 多要约打包加总（②）与情境间取大（③）
+
+# 01376 RAFFLESINTERIOR —— 股份要约 + 可换股票据要约，公告自己印了合计。
+P01376_SIZE = {
+    4: "假設股份要約獲悉數接納且本公司並無因行使可換股票據或其他原因而發行"
+       "任何股份，股份要約將涉及490,000,000股股份，而股份要約之價值約為"
+       "32,340,000港元。假設可換股票據未有於該等要約結束前獲贖回或轉換，"
+       "而可換股票據要約獲悉數接納，按25,500,000港元之未行使可換股票據面值"
+       "計算，可換股票據要約之價值約為12,375,000港元。綜上所述，該等要約之"
+       "總價值將約為44,715,000港元。",
+}
+
+# 01835 瑞威 —— 两个情境各自有合计，且都只印分项、不印合计。
+# 甲：购股权不行使 → 股份要约 112,838,022 + 购股权要约 5,950,408.05
+# 乙：购股权全行使 → 股份要约 117,410,000，购股权要约「價值為零」
+#     （行使掉就没有购股权可注销了 —— 防错点 1 的镜像）
+P01835_SIZE = {
+    5: "情境甲：假設概無購股權獲行使，股份要約之價值約為112,838,022港元，"
+       "而購股權要約之價值約為5,950,408.05港元。",
+    6: "情境乙：假設所有購股權獲悉數行使，股份要約之價值約為117,410,000港元，"
+       "而購股權要約之價值為零。",
+}
+
+
+def test_component_offers_are_added_up():
+    """②：交易规模是同一情境内各分项之和，不是其中最大的那一项。"""
+    assert extractor.extract("", P01376_SIZE).deal_size == "44715000"
+
+
+def test_the_printed_total_wins_over_my_own_sum():
+    """防错点 2：公告自己算的那个数天然规避了重复计算，优先用它。"""
+    ex = extractor.extract("", P01376_SIZE)
+    quote = ex.deal_size_evidence.quote
+    assert "總價值" in quote, "取的应当是公告自印的合计，不是我加出来的"
+
+
+def test_scenarios_are_compared_by_their_totals_and_the_largest_wins():
+    """③：甲 112,838,022 + 5,950,408.05 = 118,788,430.05 > 乙 117,410,000。"""
+    assert extractor.extract("", P01835_SIZE).deal_size == "118788430.05"
+
+
+def test_components_are_never_assembled_across_scenarios():
+    """防错点 1：绝不拿甲的股份要约去加乙的购股权要约。
+
+    乙情境里购股权已经全部行使掉，没有购股权可注销，购股权要约必然为零；
+    拼出来的 117,410,000 + 5,950,408.05 是一个不存在的数。
+    """
+    got = extractor.extract("", P01835_SIZE).deal_size
+    assert got != "123360408.05", "跨情境拼装了"
+
+
+def test_a_zero_valued_component_is_not_added():
+    """防错点 3：明写「價值為零」的分项不进合计。"""
+    pages = {1: "股份要約之價值約為117,410,000港元，而購股權要約之價值為零。"}
+    assert extractor.extract("", pages).deal_size == "117410000"
