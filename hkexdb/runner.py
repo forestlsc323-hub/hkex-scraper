@@ -29,6 +29,11 @@ class Cancelled(Exception):
     """用户点了停止。"""
 
 
+# 两个维度的中文写法。标签（MGO/VGO/PO）是这两列合成出来的：
+#     部分 → PO；全面＋强制 → MGO；全面＋自愿 → VGO
+OBLIGATION_LABEL = {"mandatory": "强制", "voluntary": "自愿"}
+SCOPE_LABEL = {"full": "全面", "partial": "部分"}
+
 VERDICT_LABEL = {"offer": "要约", "unclear": "待核", "not_offer": "非要约",
                  "mirror": "镜像重复", "duplicate": "同单重复"}
 
@@ -270,8 +275,11 @@ class Deal:
     last_trading_day: str = ""        # 停牌前最后交易日
     # 条款
     offer_type: str = ""
+    obligation_basis: str = ""        # 强制 / 自愿
+    offer_scope: str = ""             # 全面 / 部分
     consideration: str = ""           # 现金 / 证券 / 现金＋证券
     offer_price: str = ""
+    price_headline: str = ""          # 替代方案里含递延结算的那个价（如果有两套）
     premium_pct: str = ""             # 主值溢价率
     premium_basis: str = ""           # 主值口径 —— 没有它这个数字没意义
     premium_ladder: dict = field(default_factory=dict)   # 全部比较项
@@ -1476,8 +1484,11 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             deal.target_full = ex.target or row["name"]
             deal.last_trading_day = ex.last_trading_day
             deal.offer_type = ex.offer_type
+            deal.obligation_basis = ex.obligation_basis
+            deal.offer_scope = ex.offer_scope
             deal.consideration = ex.consideration
             deal.offer_price = ex.offer_price
+            deal.price_headline = ex.price_headline
             deal.deal_size = ex.deal_size
             deal.listing_intent = ex.listing_intent
             deal.confidence = ex.confidence
@@ -1531,7 +1542,7 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
             deal.nature = guess.label
             deal.nature_reasons = "；".join(guess.reasons)
 
-            deal.checks = _run_checks(ex, validators)
+            deal.checks = _run_checks(ex, validators, deal.premium_pct)
             deal.evidence = {
                 "当事方": [ex.parties_evidence.page, ex.parties_evidence.quote],
                 "要约类型": [ex.offer_type_evidence.page, ex.offer_type_evidence.quote],
@@ -1619,12 +1630,20 @@ def _reconcile_premium_direction(deal, pick, ex) -> None:
     deal.notes = "；".join(x for x in (deal.notes, note) if x)
 
 
-def _run_checks(ex, validators) -> str:
-    """跑 V4/V5/V6，把结果压成一行。铁律一：算术全在这里，不在抽取层。"""
-    from decimal import Decimal
+def _run_checks(ex, validators, premium_pct: str = "") -> str:
+    """跑 V4/V5/V6/V15，把结果压成一行。铁律一：算术全在这里，不在抽取层。"""
+    from decimal import Decimal, InvalidOperation
 
+    floor: list = []
+    if premium_pct:
+        try:
+            floor = [validators.v15_discount_floor("主值溢价率",
+                                                   Decimal(str(premium_pct)))]
+        except InvalidOperation:
+            floor = []
     if not ex.comparisons or not ex.offer_price:
-        return ""
+        bad = [f"{f.code}:{f.subject}" for f in floor if not f.passed]
+        return "未通过 " + "；".join(bad) if bad else ""
     offer = Decimal(ex.offer_price)
     comparisons = [validators.PriceComparison(
         label=c.label, benchmark=Decimal(c.benchmark),
@@ -1637,7 +1656,7 @@ def _run_checks(ex, validators) -> str:
     high = Decimal(ex.six_month_high) if ex.six_month_high else Decimal("9" * 12)
     nonmarket = frozenset(c.label for c in ex.comparisons if c.anchor == "nav")
     findings = validators.run_price_comparisons(offer, comparisons, low, high,
-                                                nonmarket_labels=nonmarket)
+                                                nonmarket_labels=nonmarket) + floor
     failed = [f"{f.code}:{f.subject}" for f in findings if not f.passed]
     return "全部通过" if not failed else "未通过 " + "；".join(failed[:3])
 
@@ -1663,9 +1682,9 @@ DEAL_COLUMNS = [
     "判定", "判定理由", "交易性质(待确认)", "性质依据",
     "公告日期", "股票代码", "板块", "受要约方", "受要约方全称",
     "要约方", "要约方财务顾问",
-    "要约类型", "条件", "对价形式",
+    "要约类型", "义务基础", "要约范围", "条件", "对价形式",
     # 第二层：定价
-    "要约价(HKD)", "主值溢价率(%)", "主值口径",
+    "要约价(HKD)", "另一套要约价", "主值溢价率(%)", "主值口径",
     *[f"较{c}(%)" for c in LADDER_COLUMNS], LADDER_OTHER,
     "六个月最低", "六个月最高", "泄露涨幅(%)",
     # 估值组 —— 和规模分开：付给公众股东的才是规模
@@ -1683,8 +1702,10 @@ def _deal_row(d: Deal) -> list[str]:
             d.nature, d.nature_reasons,
             d.date, d.code, d.board, d.name, d.target_full,
             d.offeror, d.offeror_fa,
-            d.offer_type, d.is_conditional, d.consideration,
-            d.offer_price, d.premium_pct, d.premium_basis,
+            d.offer_type, OBLIGATION_LABEL.get(d.obligation_basis, ""),
+            SCOPE_LABEL.get(d.offer_scope, ""),
+            d.is_conditional, d.consideration,
+            d.offer_price, d.price_headline, d.premium_pct, d.premium_basis,
             *[d.premium_ladder.get(c, "") for c in LADDER_COLUMNS], other,
             d.six_month_low, d.six_month_high, d.runup_pct,
             d.nav_per_share, d.pb_ratio, d.implied_equity_value, d.total_shares,

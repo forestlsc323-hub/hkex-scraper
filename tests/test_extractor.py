@@ -682,3 +682,62 @@ def test_a_waiver_of_rule_26_1_does_not_make_it_an_mgo():
     """清洗豁免公告满篇都是 26.1，说的却是这单**不必**做强制要约。"""
     pages = {1: "本公司將向執行人員申請豁免根據規則26.1提出強制性全面要約的責任。"}
     assert extractor.extract_offer_type("公告 有關清洗豁免", pages)[0] != "MGO"
+
+
+# ------------------------------------------- 类型＝两个维度合成，不是三个并列类别
+
+def test_the_two_dimensions_are_reported_separately():
+    """底层存维度、输出层合成标签 —— 换口径能重切，不用改判定逻辑。"""
+    got = extractor.classify_offer("聯合公告 自願無條件全面現金要約", {})
+    assert (got.obligation, got.scope, got.label) == ("voluntary", "full", "VGO")
+
+
+def test_voluntary_plus_full_is_a_vgo_even_when_unconditional():
+    """03389 亨得利：标题白纸黑字「自願無條件全面現金要約」。
+
+    做得成「无条件」说明要约人已持多数、規則26.1 根本没触发 ——
+    「無條件」讲的是条件，不是义务基础，不能拿它去判 MGO。
+    """
+    title = "聯合公告 自願無條件全面現金要約 及 恢復買賣"
+    assert extractor.classify_offer(title, {}).label == "VGO"
+
+
+def test_partial_scope_terminates_the_judgement():
+    """范围维度优先：只收固定数量就是 PO，正文里的「強制性」不再翻盘。
+
+    ⚠️ 这条和上一版**相反**。上一版是「強制性压过部分」，依据是
+    01980/01796/02362 三单答案记 MGO；口径复核后确认那三单应记 PO ——
+    强制要约必须全面（規則26 要求就全部股份提出），所以部分要约在
+    义务上必然是自愿的，两个词一起出现时说了算的是范围那一维。
+    """
+    pages = {1: "要約人須根據收購守則規則26.1提出要約。本公司宣佈自願現金"
+                "部分收購要約，收購最多755,300,000股要約股份。"}
+    got = extractor.classify_offer("聯合公告 及 恢復買賣", pages)
+    assert got.scope == "partial"
+    assert got.obligation == "voluntary", "部分要约在义务上一定是自愿的"
+    assert got.label == "PO"
+
+
+def test_a_partial_offer_in_the_body_beats_rule_26_1():
+    """同上，但换成 09638 那种标题不写、正文才写的。"""
+    pages = {1: "釋義：「收購守則」指公司收購及合併守則，包括規則26.1。",
+             2: "提出附帶先決條件的自願現金部份收購要約。"}
+    assert extractor.classify_offer("公告", pages).label == "PO"
+
+
+def test_a_stray_partial_that_is_not_a_partial_offer_does_not_flip_it():
+    """「部分股東之不可撤銷承諾」里的「部分」不是范围维度的证据。"""
+    title = "聯合公告 強制性無條件現金要約 及 部分股東之不可撤銷承諾"
+    got = extractor.classify_offer(title, {})
+    assert got.scope != "partial" and got.label == "MGO"
+
+
+def test_mandatory_implies_full_scope():
+    """規則26 的强制要约必须就全部股份提出 —— 范围不用另找证据。"""
+    got = extractor.classify_offer("聯合公告 強制性無條件現金要約", {})
+    assert (got.obligation, got.scope, got.label) == ("mandatory", "full", "MGO")
+
+
+def test_a_whitewash_waiver_is_still_not_a_mandatory_offer():
+    title = "公告 (1) 自願現金部分收購要約 及 (2) 申請豁免須提出強制性全面要約的責任"
+    assert extractor.classify_offer(title, {}).label == "PO"

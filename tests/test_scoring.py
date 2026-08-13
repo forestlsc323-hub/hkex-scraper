@@ -134,7 +134,10 @@ def test_the_shipped_answer_key_loads_and_is_checked():
     rows = S.load(path)
     assert len(rows) >= 25
     assert rows[0]["股票代码"].startswith("0"), "代码列前导零被吞了"
-    assert any("01875" in p for p in S.sanity_check(rows))
+    # 自检以前会报 01875 東曜的 -114.67%（折让不可能超过 100%）——
+    # 那一格已按口径复核改成 +114.67%，所以现在整张表应当是干净的。
+    # 这条断言从「抓得到那个错」翻成「一个错都不剩」，是有意的。
+    assert S.sanity_check(rows) == []
 
 
 # ------------------------------------------------- 配对：日期差几天还是同一单
@@ -298,3 +301,10 @@ def test_the_more_complete_row_wins_when_the_dates_tie():
                                  **{"要约类型": "VGO", "主值溢价率(%)": "-2.23"})])
     rate = {s.field: s.right for s in report.scores}
     assert rate["主值溢价率(%)"] == 1, "配到空的那一行去了"
+
+
+def test_a_discount_over_one_hundred_percent_is_still_caught():
+    """把 01875 修好之后，这条规则本身还得有测试守着。"""
+    from hkexdb import scoring as S
+    bad = [{"股票代码": "01875", "公告日期": "2026-01-13", "主值溢价率(%)": "-114.67"}]
+    assert any("01875" in p for p in S.sanity_check(bad))

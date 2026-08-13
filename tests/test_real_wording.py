@@ -537,3 +537,49 @@ def test_the_whole_company_valuation_is_not_the_deal_size():
     got = extractor.extract("", P01980_SIZE)
     assert got.deal_size != "754390000"
     assert got.deal_size == "515780000"
+
+
+# 「確認財務資源」那一节印的是要约人真正要掏的钱：受要约股份扣掉已承诺
+# 不接纳的部分，再乘要约价。别处那个「要約的價值」是没扣承诺的面值。
+P_FUNDING = {
+    3: "要約價值根據要約價每股要約股份0.68港元及要約將涉及合共758,495,162股"
+       "股份計算，要約價值約為515.78百萬港元。",
+    4: "確認財務資源要約人根據要約應付之最高代價（不包括非接納股份及要約人"
+       "及其一致行動人士已擁有或同意收購之股份）金額約為469.85百萬港元。",
+}
+
+
+def test_the_funding_section_number_wins():
+    """口径裁定：主值取「確認財務資源」节里那个数（已扣不可撤销不接纳承诺）。"""
+    ex = extractor.extract("", P_FUNDING)
+    assert ex.deal_size == "469850000"
+    assert any("515780000" in n for n in ex.notes), "面值那个要留作次要候选"
+
+
+def test_the_funding_preference_does_not_reorder_within_a_section():
+    """同在（或同不在）財務資源节里的候选，仍按原来的口径优先级排。"""
+    pages = {1: "確認財務資源要約人根據要約應付之最高現金代價約為100,000,000港元，"
+                "而要約項下應付的現金代價總額為90,000,000港元。"}
+    assert extractor.extract("", pages).deal_size == "100000000"
+
+
+def test_the_upfront_alternative_is_the_one_that_prices_the_premium():
+    """06808 高鑫：1.58（部分遞延結算）／ 1.38（全額預付），溢价率用 1.38。
+
+    口径裁定：其余单子都是即期全现金，可比性要求折算成即期现金等价值；
+    1.58 里含着递延部分的时间价值，混进同一张表会系统性高估溢价。
+    两个价都留着 —— 另一个进 price_headline，不丢。
+    """
+    ex = extractor.extract("", P06808)
+    assert ex.offer_price == "1.38"
+    assert ex.price_headline == "1.58"
+    assert {c.stated_pct for c in ex.comparisons} == {
+        "25.00", "2.86", "44.35", "43.06"}, "递延那一套的比较项应当已经切掉"
+    assert any("即期" in n for n in ex.notes)
+
+
+def test_a_single_price_deal_is_untouched_by_the_election():
+    """绝大多数单只有一个价 —— 这条路一个字都不该动它们。"""
+    for pages in (P03389, P00372, P01980, P01633, P01875):
+        ex = extractor.extract("", pages)
+        assert ex.price_headline == "", pages

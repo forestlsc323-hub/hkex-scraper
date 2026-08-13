@@ -29,24 +29,43 @@ PREMIUM, DISCOUNT = "premium", "discount"
 # —— 多是风险警示语「要約未必會成為無條件要約」。全文词频会得出相反答案。
 # 所以类型只在**标题**和**明确的类型短语**里判。
 
-# ⚠️ 「部份」和「部分」在港交所公告里是混用的，后者是简体习惯，
-# 前者才是港式繁体的常见写法。只认「部分」会把一单部分要约判成别的类型 ——
-# 09638 法拉帝实跑被判成 VGO（应为 PO），标题写的是「部份」。
-_TYPE_PHRASES = [
-    # 顺序即优先级：部分要约最特殊，先判
-    (PO, re.compile(r"部[分份](?:收購)?要約|partial\s+offer", re.I)),
-    (MGO, re.compile(r"強制性[^，。；]{0,10}要約|強制[^，。；]{0,6}現金要約|"
-                     r"mandatory\s+(?:unconditional\s+)?(?:cash\s+)?offer", re.I)),
-    (VGO, re.compile(r"自願性?[^，。；]{0,12}要約|voluntary\s+(?:conditional\s+)?"
-                     r"(?:cash\s+)?offer", re.I)),
-]
+# ⚠️ MGO / VGO / PO 是**两个维度**压成的三个标签，不是三个并列的类别。
+# 把它们当并列类别处理，就会一直在「强制压过部分」和「部分压过强制」
+# 之间来回改，改一个错造出另一个错 —— 实跑里来回改过三轮。
+#
+#     义务基础 obligation ：强制（规则 26 触发）／自愿
+#     要约范围 scope      ：全面（全部股份）／部分（固定数量）
+#
+#     部分            →  PO
+#     全面 + 强制     →  MGO
+#     全面 + 自愿     →  VGO
+#
+# 关键一条：**强制要约必须是全面的**（規則26 要求向全体股东就全部股份
+# 提出），所以「部分要约」在义务上必然是自愿的 —— 部分要约要执行人员
+# 同意，不是守则强加的义务。于是**范围维度优先**：只要确定是只收固定
+# 数量，就是 PO，终止判定，正文里那个「強制性」不再翻盘。
+#
+# 底层两个维度都存进结果（deals.csv 里各占一列），标签在输出层合成 ——
+# 以后换任何口径都能重切，不用回来改判定逻辑。
 
-# 「強制性」和「部分」不可能同时成立：收購守則規則 26 要求的强制要约
-# 必须向**全体**股东、就**全部**股份提出；部分要约要执行人员同意，
-# 本质上是自願的。两个词一起出现时，「強制性」是那个说了算的 ——
-# 「部分」多半出现在别处（例如「部分股東已承諾接納」）。
-# 01796 实跑被判成 PO，答案是 MGO。
-_MANDATORY = _TYPE_PHRASES[1][1]
+# 「部份」和「部分」在港交所公告里混用，前者才是港式繁体的常见写法。
+# 只认「部分」会把一单部分要约判成别的类型（09638 法拉帝就是）。
+_SCOPE_PARTIAL = re.compile(r"部[分份](?:收購)?要約|partial\s+offer", re.I)
+_SCOPE_FULL = re.compile(
+    r"全面(?:性)?[^，。；]{0,8}要約|全部已發行股份[^，。；]{0,16}要約|"
+    r"general\s+offer", re.I)
+
+_OBLIGATION_MANDATORY = re.compile(
+    r"強制性[^，。；]{0,10}要約|強制[^，。；]{0,6}現金要約|"
+    r"mandatory\s+(?:unconditional\s+)?(?:cash\s+)?offer", re.I)
+_OBLIGATION_VOLUNTARY = re.compile(
+    r"自願性?[^，。；]{0,12}要約|voluntary\s+(?:conditional\s+)?"
+    r"(?:cash\s+)?offer", re.I)
+
+MANDATORY, VOLUNTARY = "mandatory", "voluntary"
+FULL, PARTIAL = "full", "partial"
+
+_MANDATORY = _OBLIGATION_MANDATORY      # 老名字，别处还在用
 
 # ⚠️ 但「強制性全面要約」这个词组最常见的出处其实是**清洗豁免**：
 # 「申請豁免…須提出強制性全面要約的責任」。那种句子说的是这单
@@ -79,6 +98,7 @@ class Comparison:
     stated_direction: str
     page: int
     quote: str
+    at: int = -1               # 在「價值比較」一节里的偏移，按替代方案切块要用
 
     @property
     def label(self) -> str:
@@ -102,8 +122,15 @@ class Extraction:
     last_trading_day: str = ""        # 停牌前最后交易日
     offer_type: str = ""
     offer_type_evidence: Evidence = field(default_factory=Evidence)
+    # 合成标签的两个维度。存底层、输出层再合成 —— 以后换口径能重切，
+    # 不用回来改判定逻辑（三个标签来回改过三轮，就是因为没拆开）。
+    obligation_basis: str = ""        # mandatory / voluntary
+    offer_scope: str = ""             # full / partial
     offer_price: str = ""
     offer_price_evidence: Evidence = field(default_factory=Evidence)
+    # 同一单给了两个要约价（替代方案）时，即期那个进 offer_price，
+    # 带递延结算的那个存这里 —— 两个都留着，不丢。
+    price_headline: str = ""
     comparisons: list[Comparison] = field(default_factory=list)
     six_month_low: str = ""
     six_month_high: str = ""
@@ -209,57 +236,109 @@ def _waived(text: str, m) -> bool:
     return bool(_WAIVER.search(text[max(0, m.start() - 30):m.end()]))
 
 
-def _phrase_type(text: str):
-    """在一段文字里找类型短语。返回 (类型, match) 或 (None, None)。"""
-    for kind, pattern in _TYPE_PHRASES:
-        m = pattern.search(text)
-        if not m:
-            continue
-        # 「強制性」压过「部分」：规则 26 的强制要约必须就全部股份提出，
-        # 不可能同时是部分要约。见 _MANDATORY 处的说明。
-        if kind is PO:
-            hard = _MANDATORY.search(text)
-            if hard and not _waived(text, hard):
-                return MGO, hard
-        elif kind is MGO and _waived(text, m):
-            continue          # 被豁免掉的那个不算，接着看下一档
-        return kind, m
+def _hit(pattern, *texts):
+    """在几段文字里按先后顺序找，返回 (第几段, match)。找不到返回 (None, None)。"""
+    for index, text in enumerate(texts):
+        m = pattern.search(text or "")
+        if m:
+            return index, m
     return None, None
 
 
-def extract_offer_type(title: str, pages: dict[int, str]) -> tuple[str, Evidence]:
-    """证据从硬到软排三档：标题 → 規則26.1 → 正文首几页的类型短语。
+def _unwaived(pattern, *texts):
+    """同上，但跳过被「豁免／清洗」包着的那些命中。
 
-    绝不做全文词频 —— 3336 那单会被判成相反的类型。
-
-    **規則26.1 排在正文短语前面**，这是这一版改的。
-    26.1 是强制性全面要约的法律依据，一份公告写下它就等于说
-    「这单是规则 26 触发的强制要约」；而正文里蹦出来一个「部分」，
-    可能只是「部分股東已承諾接納」「部分代價以股份支付」。
-    法条比措辞硬 —— 实跑里 01980 / 01796 / 02362 三单被正文的「部分」
-    判成 PO，答案都是 MGO。
-
-    但标题仍然排在最前：标题写明「部分收購要約」是最权威的，
-    而几乎每份收购文件的释义节都会顺带提到 26.1。
+    「強制性全面要約」最常见的出处其实是清洗豁免：
+    「申請豁免…須提出強制性全面要約的責任」—— 那句话说的是这单
+    **不必**做强制要约，照字面读正好读反。
     """
-    kind, m = _phrase_type(title or "")
-    if kind:
-        return kind, Evidence(0, m.group(0))
+    for index, text in enumerate(texts):
+        for m in pattern.finditer(text or ""):
+            if not _waived(text, m):
+                return index, m
+    return None, None
 
+
+@dataclass
+class OfferClass:
+    """要约类型的两个维度，外加合成出来的标签。"""
+
+    label: str = ""              # MGO / VGO / PO
+    obligation: str = ""         # mandatory / voluntary
+    scope: str = ""              # full / partial
+    evidence: Evidence = field(default_factory=Evidence)
+
+
+def classify_offer(title: str, pages: dict[int, str]) -> OfferClass:
+    """判要约类型 —— 先各判一个维度，最后再合成标签。
+
+    证据从硬到软：标题 → 正文前三页 → 全文（只有規則26.1 用到全文，
+    因为释义节在后面）。绝不做全文词频：3336 全文出现 11 次「無條件」，
+    没有一次在描述要约类型，按词频会得出相反答案。
+    """
     head = _flat("".join(pages.get(p, "") for p in sorted(pages)[:3]))
     whole = _flat("".join(pages.values()))
-    rule = _RULE_26.search(whole)
-    if rule and not _WAIVER.search(whole[max(0, rule.start() - 40):rule.end()]):
-        return MGO, Evidence(_find_page(pages, rule.group(0)),
-                             whole[max(0, rule.start() - 40):rule.end() + 40].strip())
+    out = OfferClass()
 
-    kind, m = _phrase_type(head)
-    if kind:
-        start = max(0, m.start() - 30)
-        return kind, Evidence(_find_page(pages, m.group(0)) or 1,
-                              head[start:m.end() + 30].strip())
+    # ── 范围维度 ──
+    rank_p, m_p = _hit(_SCOPE_PARTIAL, title, head)
+    rank_f, m_f = _hit(_SCOPE_FULL, title, head)
+    scope_m = None
+    if m_p is not None and (m_f is None or rank_p <= rank_f):
+        out.scope, scope_m = PARTIAL, m_p
+    elif m_f is not None:
+        out.scope, scope_m = FULL, m_f
 
-    return "", Evidence()
+    # ── 义务维度 ──
+    rank_m, m_m = _unwaived(_OBLIGATION_MANDATORY, title, head)
+    rank_v, m_v = _hit(_OBLIGATION_VOLUNTARY, title, head)
+    ob_m = None
+    if m_m is not None and (m_v is None or rank_m <= rank_v):
+        out.obligation, ob_m = MANDATORY, m_m
+    elif m_v is not None:
+        out.obligation, ob_m = VOLUNTARY, m_v
+    else:
+        # 規則26.1 是强制性全面要约的法律依据，比措辞硬 —— 但它在释义节里
+        # 几乎每份收购文件都会顺带提一句，所以只在措辞都没命中时才用它。
+        rule = _RULE_26.search(whole)
+        if rule and not _WAIVER.search(whole[max(0, rule.start() - 40):rule.end()]):
+            out.obligation = MANDATORY
+            ob_m = rule
+            whole_hit = whole[max(0, rule.start() - 40):rule.end() + 40].strip()
+            out.evidence = Evidence(_find_page(pages, rule.group(0)), whole_hit)
+
+    # ── 两个维度互相约束 ──
+    if out.scope == PARTIAL:
+        # 强制要约必须全面 → 部分要约在义务上一定是自愿的。
+        # 范围维度优先，终止判定（这条是口径裁定，不是推断）。
+        out.obligation = VOLUNTARY
+    elif out.obligation == MANDATORY and not out.scope:
+        out.scope = FULL
+
+    # ── 合成标签 ──
+    if out.scope == PARTIAL:
+        out.label = PO
+    elif out.obligation == MANDATORY:
+        out.label = MGO
+    elif out.obligation == VOLUNTARY:
+        out.label = VGO
+
+    # ── 出处：取决定标签的那一处（铁律三）──
+    decider = scope_m if out.label == PO else (ob_m or scope_m)
+    if decider is not None and not out.evidence.quote:
+        # 标题里找到的 match，位置和原文都对得上；否则它来自正文前三页。
+        from_title = bool(title) and title[decider.start():decider.end()] == decider.group(0)
+        source = title if from_title else head
+        out.evidence = Evidence(
+            0 if from_title else (_find_page(pages, decider.group(0)) or 1),
+            source[max(0, decider.start() - 30):decider.end() + 30].strip())
+    return out
+
+
+def extract_offer_type(title: str, pages: dict[int, str]) -> tuple[str, Evidence]:
+    """老接口：只要标签和出处。两个维度请用 classify_offer。"""
+    got = classify_offer(title, pages)
+    return got.label, got.evidence
 
 
 # ---------------------------------------------------------------- 要约价
@@ -661,6 +740,30 @@ def _scan_whole_document(joined: str) -> list[tuple[int, str]]:
     return out
 
 
+def _joined(pages: dict[int, str]) -> tuple[str, dict[int, int]]:
+    """全文拼成一条，同时记住每一段从哪一页来。"""
+    joined, page_of = "", {}
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        page_of[len(joined)] = page
+        joined += flat
+    return joined, page_of
+
+
+def _section_at(joined: str, start) -> tuple[str, int]:
+    """从小标题往后切出「價值比較」整节。返回 (节文, 它在全文里的偏移)。"""
+    rest = joined[start.end():]
+    end = _SECTION_END.search(rest)
+    return (rest[:end.start()] if end else rest[:2500]), start.end()
+
+
+def value_section(pages: dict[int, str]) -> str:
+    """「價值比較」整节的文字。没有小标题就返回空串。"""
+    joined, _ = _joined(pages)
+    start = _SECTION_START.search(joined)
+    return _section_at(joined, start)[0] if start else ""
+
+
 def extract_comparisons(pages: dict[int, str],
                         notes: list | None = None) -> list[Comparison]:
     """抽「价值比较」。
@@ -669,19 +772,11 @@ def extract_comparisons(pages: dict[int, str],
       1. 有「價值比較」小标题 → 按小标题切出整节，再按编号切条（最精确）；
       2. 没有小标题 → 全文按「形状」捞（兜底，覆盖 46% 的漏抽）。
     """
-    joined, page_of = "", {}
-    for page in sorted(pages):
-        flat = _flat(pages[page])
-        page_of[len(joined)] = page
-        joined += flat
-
+    joined, page_of = _joined(pages)
     start = _SECTION_START.search(joined)
     if not start:
         return _comparisons_from_scan(joined, page_of, notes)
-    rest = joined[start.end():]
-    end = _SECTION_END.search(rest)
-    section = rest[:end.start()] if end else rest[:2500]
-    offset = start.end()
+    section, offset = _section_at(joined, start)
 
     def page_at(pos: int) -> int:
         best = 0
@@ -696,7 +791,7 @@ def extract_comparisons(pages: dict[int, str],
     for item in _split_items(section):
         pos = section.find(item, cursor)
         cursor = pos + len(item)
-        found, skipped = _comparisons_in(item, page_at(pos))
+        found, skipped = _comparisons_in(item, page_at(pos), pos)
         out.extend(found)
         parallel = parallel or skipped
 
@@ -707,6 +802,82 @@ def extract_comparisons(pages: dict[int, str],
     if parallel and notes is not None:
         notes.append(_PARALLEL_NOTE)
     return out
+
+
+# 同一单给两个要约价的写法：一个即期全现金，一个带递延／分期结算。
+# 06808 高鑫零售就是 1.38 港元（全額預付替代方案）对 1.58 港元
+#（部分遞延結算替代方案下的最高代价）。
+#
+# 口径裁定：**溢价率用即期那一个**。其余三十单全是即期全现金，可比性
+# 要求折算成即期现金等价值；1.58 里含着递延部分的时间价值，拿它算溢价
+# 会系统性高估。另一个价存成 price_headline，不丢。
+_LEAD_IN = re.compile(r"每股要約股份\s*(?:之|為)?\s*(?P<price>[\d,]+\.?\d*)\s*港元")
+_DEFERRED = re.compile(r"遞延|递延|延期|分期")
+_UPFRONT = re.compile(r"全額預付|全额预付|預付|即期|一次(?:性|過)")
+
+
+@dataclass
+class _Election:
+    main: str = ""
+    headline: str = ""
+    lo: int = 0                 # 主方案那一块在节里的起止
+    hi: int = 0
+
+
+def _elect_consideration(section: str) -> _Election | None:
+    """一节里印了两个要约价（替代方案）时，选即期那一个。
+
+    返回 None 表示没有分叉 —— 绝大多数单都走这条。
+    """
+    # ⚠️ 「較」离价格可以隔得很远：06808 那句在价格和「較」之间塞了
+    # 「即根據部分遞延結算替代方案應付之最高代價（假設應付可變利息為
+    #   最高可變利息）」整整 40 个字。窗口开到 60 才够。
+    leads = [m for m in _LEAD_IN.finditer(section)
+             if re.search(r"較|代表|相當於", section[m.end():m.end() + 60])]
+    prices = {m.group("price") for m in leads}
+    if len(leads) < 2 or len(prices) < 2:
+        return None
+
+    def kind(m) -> str:
+        near = section[max(0, m.start() - 40):m.end() + 40]
+        if _DEFERRED.search(near):
+            return "deferred"
+        return "upfront" if _UPFRONT.search(near) else ""
+
+    tagged = [(m, kind(m)) for m in leads]
+    upfront = [m for m, k in tagged if k == "upfront"]
+    deferred = [m for m, k in tagged if k == "deferred"]
+    if not upfront or not deferred:
+        return None          # 分不出哪个是即期，就不选，交给备注
+
+    main = upfront[0]
+    starts = sorted(m.start() for m in leads)
+    after = [s for s in starts if s > main.start()]
+    other = next((m for m, k in tagged if k == "deferred"), None)
+    return _Election(main=main.group("price"),
+                     headline=other.group("price") if other else "",
+                     lo=main.start(),
+                     hi=after[0] if after else len(section))
+
+
+def _apply_election(result, pages: dict[int, str]) -> None:
+    """两套要约价时，主值切到即期那一套（口径裁定，见 _elect_consideration）。"""
+    section = value_section(pages)
+    if not section:
+        return
+    picked = _elect_consideration(section)
+    if picked is None:
+        return
+    kept = [c for c in result.comparisons if picked.lo <= c.at < picked.hi]
+    if not kept:
+        return          # 切完一条不剩就别切，宁可维持原样
+    result.price_headline = result.offer_price
+    result.offer_price = picked.main
+    result.comparisons = kept
+    result.notes.append(
+        f"本单有两套要约价（替代方案）：即期 {picked.main} 港元 ／ "
+        f"含递延结算 {picked.headline} 港元。溢价率按**即期**那一套算 —— "
+        f"其余单子都是即期全现金，递延价里含时间价值，混在一起会高估溢价")
 
 
 def _note_alternative_prices(result) -> None:
@@ -744,7 +915,8 @@ def _note_alternative_prices(result) -> None:
             + "、".join(clash[:3]) + "。主值取的是先出现的那套，请核原文")
 
 
-def _comparisons_in(item: str, page: int) -> tuple[list[Comparison], bool]:
+def _comparisons_in(item: str, page: int,
+                    offset: int = 0) -> tuple[list[Comparison], bool]:
     """一条（可能含多项）比较文字 → 若干 Comparison。
 
     ⚠️ 基准价取的是**百分比左边最近的那一个**，不是这段话里的第一个。
@@ -783,7 +955,7 @@ def _comparisons_in(item: str, page: int) -> tuple[list[Comparison], bool]:
             benchmark=number, benchmark_decimals=_decimals(number),
             benchmark_is_exact=not approx,   # 「約」在哪一侧都算约整值
             stated_pct=p.number, stated_direction=p.direction,
-            page=page, quote=item.strip()[:220]))
+            page=page, quote=item.strip()[:220], at=offset + p.start))
     return out, skipped
 
 
@@ -1239,6 +1411,22 @@ def _is_equity_value(flat: str, at: int) -> bool:
     return bool(_EQUITY_VALUE.search(flat[max(0, at - 60):at + 10]))
 
 
+# 「確認財務資源」那一节印的是要约人**真正要掏出去的钱**：受要约股份
+# 减掉已承诺不接纳的部分，再乘要约价。口径复核确认这是全库通用的取法
+# （中國燃氣 187.8M、德萊 41.8M、美佳音 111.74M、東曜 2,790.3M 同口径），
+# 而正文别处那个「要約的價值」是没扣承诺的面值，只作次要字段。
+#
+# 运算顺序不可颠倒：**先剔承诺，再跨情境取合计最大值**。
+_FUNDING_SECTION = re.compile(
+    r"確認財務資源|財務資源|可動用財務資源|足夠(?:的)?財務資源|"
+    r"信納[^。；]{0,20}財務資源")
+
+
+def _in_funding_section(flat: str, at: int) -> bool:
+    """这处金额是不是落在「確認財務資源」那一节里。"""
+    return bool(_FUNDING_SECTION.search(flat[max(0, at - 400):at + 10]))
+
+
 def _paid_to_the_seller(flat: str, at: int) -> bool:
     """这处金额讲的是不是「付给卖方」那一笔。
 
@@ -1266,6 +1454,7 @@ def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
     让「这里有得选」这件事在结果里看得见，而不是静默地选了一个。
     """
     out: list[tuple[str, int, str]] = []
+    funded: list[bool] = []
     seen: set[str] = set()
     for pattern in _DEAL_SIZE:
         for page in sorted(pages):
@@ -1281,7 +1470,10 @@ def deal_size_candidates(pages: dict[int, str]) -> list[tuple[str, int, str]]:
                     continue          # 整家公司的估值，不是要约规模
                 start = max(0, m.start() - 40)
                 out.append((amount, page, flat[start:m.end() + 10].strip()))
-    return out
+                funded.append(_in_funding_section(flat, m.start()))
+    # 「確認財務資源」节里的排前面（口径裁定），同组内保持原来的优先级。
+    order = sorted(range(len(out)), key=lambda i: (not funded[i], i))
+    return [out[i] for i in order]
 
 
 def extract_deal_size(pages: dict[int, str]) -> tuple[str, Evidence]:
@@ -1315,7 +1507,9 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.listing_intent_evidence = terms["listing_intent_evidence"]
     result.last_trading_day = terms["last_trading_day"]
 
-    result.offer_type, result.offer_type_evidence = extract_offer_type(title, pages)
+    kind = classify_offer(title, pages)
+    result.offer_type, result.offer_type_evidence = kind.label, kind.evidence
+    result.obligation_basis, result.offer_scope = kind.obligation, kind.scope
     result.offer_price, result.offer_price_evidence = extract_offer_price(pages)
     result.comparisons = extract_comparisons(pages, result.notes)
     result.six_month_low, result.six_month_high, result.six_month_evidence = \
@@ -1349,6 +1543,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         result.notes.append("要约类型未识别，需人工判定")
     if not result.comparisons:
         result.notes.append("未找到「價值比較」一节，溢价率无法抽取")
+    _apply_election(result, pages)
     _note_alternative_prices(result)
     if not result.deal_size:
         result.notes.append("交易规模未识别")

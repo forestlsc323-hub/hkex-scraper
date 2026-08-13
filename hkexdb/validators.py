@@ -165,6 +165,21 @@ def v8_magnitude(subject: str, per_share_values: list[tuple[str, Decimal]],
                    f"（阈值 {max_ratio}x）")
 
 
+def v15_discount_floor(subject: str, signed_pct: Decimal) -> Finding:
+    """V15：折让不可能超过 100%。
+
+    价格最低只能到 0，也就是 -100%；再往下要求要约价是负数，
+    即要约人一边拿走股份一边收钱 —— 逻辑不成立。
+
+    这条最早只用来查**答案表**（它在那儿抓到 01875 東曜的 -114.67%
+    是符号笔误）。但程序自己也会把溢价写成折让，同一个算术约束
+    对两边都成立，所以搬进校验器，对产出也跑一遍。
+    """
+    passed = signed_pct > Decimal("-100")
+    return Finding("V15", passed, subject,
+                   f"主值溢价率 {signed_pct}% —— 折让超过 100% 意味着要约价为负")
+
+
 def run_price_comparisons(offer_price: Decimal, comparisons: list[PriceComparison],
                           low_6m: Decimal, high_6m: Decimal,
                           nonmarket_labels: frozenset[str] = frozenset()) -> list[Finding]:
