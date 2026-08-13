@@ -1655,8 +1655,12 @@ def _run_checks(ex, validators, premium_pct: str = "") -> str:
     low = Decimal(ex.six_month_low) if ex.six_month_low else Decimal(0)
     high = Decimal(ex.six_month_high) if ex.six_month_high else Decimal("9" * 12)
     nonmarket = frozenset(c.label for c in ex.comparisons if c.anchor == "nav")
-    findings = validators.run_price_comparisons(offer, comparisons, low, high,
-                                                nonmarket_labels=nonmarket) + floor
+    # V16 只看市价类基准 —— 每股净资产和市价差几倍是常态，不算异常。
+    spread = [(c.label, Decimal(c.benchmark)) for c in ex.comparisons
+              if c.anchor != "nav" and c.benchmark]
+    findings = (validators.run_price_comparisons(offer, comparisons, low, high,
+                                                 nonmarket_labels=nonmarket)
+                + floor + [validators.v16_benchmark_spread(spread)])
     failed = [f"{f.code}:{f.subject}" for f in findings if not f.passed]
     return "全部通过" if not failed else "未通过 " + "；".join(failed[:3])
 

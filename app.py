@@ -663,11 +663,15 @@ def main() -> int:
         append(f"已更新 {len(result.written)} 个文件：")
         for rel in result.written[:20]:
             append(f"      {rel}")
+        notes = updater.sidecar_notes(result.written)
+        for note in notes:
+            append(f"  ⚠ {note}")
         messagebox.showinfo(
             "检查更新",
             f"更新了 {len(result.written)} 个文件。\n\n"
             "关掉这个窗口重新打开，新版才生效。\n"
-            "（你的数据和存档没有被动过。）")
+            "（你的数据和存档没有被动过。）"
+            + ("\n\n" + "\n".join(notes) if notes else ""))
 
     btn_run.configure(command=start)
     btn_cat.configure(command=probe_categories)

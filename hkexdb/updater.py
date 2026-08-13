@@ -34,6 +34,15 @@ BRANCH = "claude/hkex-disclosure-data-extraction-unftw7"
 # 这些目录属于你，不属于代码仓库，永远不碰。
 KEEP = {"data", "logs", ".venv", ".git", "__pycache__", ".pytest_cache"}
 
+# data/ 是你的数据，更新器一个字都不动 —— 这是对的。
+# 但答案表是个例外：它同时是**你的数据**和**我改过的东西**（口径复核之后
+# 我在仓库里改了几行）。更新器不动它，于是那些修改永远到不了你机器上，
+# 而准确率报告照旧按老答案算，看起来像「改了没用」。
+#
+# 折中：仓库里的版本单独落成一个 `.仓库版.csv`，**绝不覆盖你的原件**，
+# 更新日志里告诉你有新版本、差在哪儿。要不要换、换哪几行，你说了算。
+SIDECAR = {"data/answer_key.csv": "data/answer_key.仓库版.csv"}
+
 # 更新完必须还在的东西。zip 里少了它就说明下错了包（比如代理返回了
 # 一个登录页），这时候宁可什么都不做。
 SENTINEL = "app.py"
@@ -101,12 +110,13 @@ def _entries(zf: zipfile.ZipFile) -> dict[str, str]:
         if len(parts) < 2:
             continue
         rel_parts = parts[1:]
-        if any(p in KEEP for p in rel_parts):
+        rel = "/".join(rel_parts)
+        if any(p in KEEP for p in rel_parts) and rel not in SIDECAR:
             continue
         # zip 里出现 .. 或绝对路径就是恶意包，直接跳过（zip slip）
         if any(p in ("..", "") for p in rel_parts):
             continue
-        out["/".join(rel_parts)] = name
+        out[SIDECAR.get(rel, rel)] = name
     return out
 
 
@@ -142,6 +152,14 @@ def apply_zip(data: bytes, root: Path) -> UpdateResult:
     return UpdateResult(True, written=written)
 
 
+def sidecar_notes(written: list[str]) -> list[str]:
+    """更新里带下来的「仓库版」文件，各说一句该怎么处理。"""
+    return [f"{path}：这是我按口径复核改过的答案表。"
+            f"和你的 {path.replace('.仓库版', '')} 比一下，"
+            f"确认无误后改名换掉它（更新器绝不会自己动你的原件）。"
+            for path in written if ".仓库版" in path]
+
+
 def update(root: Path, *, session=None, repo: str = REPO,
            branch: str = BRANCH, fetch=None, on_retry=None) -> UpdateResult:
     """下载并覆盖。网络出错变成一句人话，不往上抛。"""
@@ -170,6 +188,8 @@ def main() -> int:
     if not result.ok:
         print(f"[X] {result.error}")
         return 1
+    for note in sidecar_notes(result.written):
+        print(f"[!] {note}")
     if not result.written:
         print("[OK] 已经是最新版，没有文件需要更新。")
     else:

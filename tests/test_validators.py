@@ -290,3 +290,31 @@ def test_appendix_d5_nominal_vs_actual_gap():
     n = fx["numbers"]
     assert Decimal(str(n["offer_max_cash"])) == \
         Decimal(n["offer_shares"]) * Decimal("2.20")     # 无缺口
+
+
+# ---------------------------------------------- V16：基准价之间不该差出数量级
+
+def test_v16_catches_a_benchmark_that_is_off_by_orders_of_magnitude():
+    """03389 亨得利：0.122 / 0.119 中间夹着一个 12.00（公告自己印错）。
+
+    这是 V6 之外的第二道网 —— V6 要有六个月高低价才跑得动，
+    而 03389 和 09929 两单一个都没印。
+    """
+    got = V.v16_benchmark_spread([
+        ("最后交易日收市价", Decimal("12.00")),
+        ("前5日均价", Decimal("0.122")),
+        ("前30日均价", Decimal("0.119"))])
+    assert not got.passed
+    assert "12.00" in got.detail
+
+
+def test_v16_lets_a_normal_ladder_through():
+    got = V.v16_benchmark_spread([
+        ("收市价", Decimal("0.115")), ("前5日均价", Decimal("0.114")),
+        ("前30日均价", Decimal("0.109"))])
+    assert got.passed
+
+
+def test_v16_needs_at_least_two_benchmarks():
+    assert V.v16_benchmark_spread([("收市价", Decimal("1"))]).passed
+    assert V.v16_benchmark_spread([]).passed

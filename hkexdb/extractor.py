@@ -201,6 +201,26 @@ _FOOTER = re.compile(r"[-–—]\s*\d{1,4}\s*[-–—]")
 
 _SPACES = re.compile(r"[ \t　]+")
 
+# 港交所的 PDF 会把中文一个字一个字地排开：
+#     「元 天 持 有602,800,000股 股 份」「發 行 股 本 約」「聯 合 公 佈」
+# 实测四份真公告里每份有 6~27 处。这种字里带空格的段落，任何一条写着
+# 「已發行股本」的正则都对不上 —— 而且它不会报错，只会让那一格是空的。
+#
+# ⚠️ 但**不能把空白全删掉**：08439 那种表格排版靠空格分隔基准价和百分比
+#（「0.860 (4.9)%」），全删之后表格读法就废了。
+# 所以只删「两个汉字之间」的空白，数字、括号、字母周围的一律不动。
+_CJK_GAP = re.compile(r"(?<=[\u3400-\u9fff])[ \t　]+(?=[\u3400-\u9fff])")
+
+# 全角数字/字母/百分号折成半角。**只折这些，标点一律不动** ——
+# 整段 NFKC 会把「，」也折成「,」，而释义节切名字靠的正是那个全角逗号，
+# 折完之后要约方名字后面就多粘一个逗号（樺欣投資控股有限公司,）。
+# 归一化要按需要来，不能图省事整段过一遍。
+_WIDE = {ord(c): ord(a) for c, a in zip(
+    "０１２３４５６７８９％", "0123456789%")}
+_WIDE.update({ord(c): ord(c) - 0xFEE0
+              for c in "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
+                       "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"})
+
 
 @lru_cache(maxsize=512)
 def _flat(text: str) -> str:
@@ -211,7 +231,9 @@ def _flat(text: str) -> str:
     它是纯函数（同一页永远得同一个结果），所以加记忆就够，
     不必去改十几个调用方的结构。
     """
-    flat = _SPACES.sub(" ", text.replace("\n", ""))
+    flat = text.replace("\n", "").translate(_WIDE)
+    flat = _SPACES.sub(" ", flat)
+    flat = _CJK_GAP.sub("", flat)          # 「發 行 股 本」→「發行股本」
     return _FOOTER.sub("", flat)
 
 
@@ -1506,6 +1528,23 @@ def _in_funding_section(flat: str, at: int) -> bool:
     return bool(_FUNDING_SECTION.search(flat[max(0, at - 400):at + 10]))
 
 
+# 长得像交易规模、但口径不对的那些数字，各自有名字。
+# 只是「跳过」的话，备注里看不出为什么；归了类就能一眼看懂，
+# 也能在准确率报告里按类统计到底哪一类最常骗到人。
+_DISTRACTORS = [
+    ("整家公司的估值", lambda flat, at: _is_equity_value(flat, at)),
+    ("付给卖方的对价", lambda flat, at: _paid_to_the_seller(flat, at)),
+]
+
+
+def _distractor_kind(flat: str, at: int) -> str:
+    """这处金额属于哪一类干扰值。不是干扰值就返回空串。"""
+    for name, test in _DISTRACTORS:
+        if test(flat, at):
+            return name
+    return ""
+
+
 def _paid_to_the_seller(flat: str, at: int) -> bool:
     """这处金额讲的是不是「付给卖方」那一笔。
 
@@ -1621,6 +1660,7 @@ def deal_size_candidates(pages: dict[int, str],
     out: list[tuple[str, int, str]] = []
     funded: list[bool] = []
     seen: set[str] = set()
+    dropped: list[str] = []
 
     # ② 打包加总先来：多要约的单里，交易规模是同一情境内各分项之和，
     #    而不是其中最大的那一项。③ 各情境的合计互相比，取最大。
@@ -1644,13 +1684,21 @@ def deal_size_candidates(pages: dict[int, str],
                 if amount in seen:
                     continue
                 seen.add(amount)
-                if _paid_to_the_seller(flat, m.start()):
-                    continue          # 付给卖方的，不是要约规模
-                if _is_equity_value(flat, m.start()):
-                    continue          # 整家公司的估值，不是要约规模
+                # 被排除的候选**不是消失**，而是归到一个有名字的类里
+                # （铁律二：软删除）。写进备注之后，「这个数为什么没被选」
+                # 一眼就有答案，不用回去翻原文。
+                kind = _distractor_kind(flat, m.start())
+                if kind:
+                    if notes is not None:
+                        dropped.append(f"{amount}（{kind}）")
+                    continue
                 start = max(0, m.start() - 40)
                 out.append((amount, page, flat[start:m.end() + 10].strip()))
                 funded.append(_in_funding_section(flat, m.start()))
+    if dropped and notes is not None:
+        notes.append("这些数字长得像交易规模但口径不对，已按类归开："
+                     + "、".join(dropped[:5])
+                     + ("…" if len(dropped) > 5 else ""))
     # 「確認財務資源」节里的排前面（口径裁定），同组内保持原来的优先级。
     order = sorted(range(len(out)), key=lambda i: (not funded[i], i))
     return [out[i] for i in order]

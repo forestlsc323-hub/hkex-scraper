@@ -214,3 +214,39 @@ def test_each_retry_is_announced(tmp_path):
     except requests.ConnectionError:
         pass
     assert said == [1, 2, 3]        # 最后一次失败不报「稍后重试」
+
+
+# ------------------------------- 答案表：我改过的那份要送到，但绝不覆盖用户的
+
+def _zip_with(files: dict) -> bytes:
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for rel, body in files.items():
+            zf.writestr(f"hkex-scraper-main/{rel}", body)
+    return buf.getvalue()
+
+
+def test_the_repo_answer_key_lands_beside_the_users_one(tmp_path):
+    """⚠️ 绝不覆盖用户那份 —— 那是他自己核过的数据。"""
+    (tmp_path / "data").mkdir()
+    mine = tmp_path / "data" / "answer_key.csv"
+    mine.write_text("我自己填的", encoding="utf-8")
+
+    got = updater.apply_zip(_zip_with({
+        "app.py": "x", "data/answer_key.csv": "仓库改过的"}), tmp_path)
+
+    assert got.ok
+    assert mine.read_text(encoding="utf-8") == "我自己填的", "原件被动了"
+    assert (tmp_path / "data" / "answer_key.仓库版.csv").read_text(
+        encoding="utf-8") == "仓库改过的"
+    assert any("仓库版" in n for n in updater.sidecar_notes(got.written))
+
+
+def test_other_files_under_data_are_still_never_touched(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "deals.csv").write_text("我的产出", encoding="utf-8")
+    updater.apply_zip(_zip_with({"app.py": "x", "data/deals.csv": "别的"}),
+                      tmp_path)
+    assert (tmp_path / "data" / "deals.csv").read_text(
+        encoding="utf-8") == "我的产出"

@@ -180,6 +180,28 @@ def v15_discount_floor(subject: str, signed_pct: Decimal) -> Finding:
                    f"主值溢价率 {signed_pct}% —— 折让超过 100% 意味着要约价为负")
 
 
+def v16_benchmark_spread(labels_and_values: list[tuple[str, Decimal]],
+                         max_ratio: Decimal = Decimal(3)) -> Finding:
+    """V16：同一份公告里各期基准价之间不该差出数量级。
+
+    收市价、5 日、10 日、30 日、60 日均价讲的是同一只股票同一段时间，
+    彼此相差三倍以上在真实市场里几乎不可能 —— 出现就说明有一个数读错了：
+        03389 亨得利：0.122 / 0.119 中间夹着一个 12.00（公告自己印错）
+        09929 澳達  ：0.11 中间夹着一个 220.0（PDF 文字层错位）
+    这是 V6（六个月区间）之外的第二道网：V6 要有六个月高低价才跑得动，
+    而那两单一个都没印。
+    """
+    values = [(name, v) for name, v in labels_and_values if v > 0]
+    if len(values) < 2:
+        return Finding("V16", True, "基准价跨度", "少于两个基准价，不适用")
+    lo = min(values, key=lambda x: x[1])
+    hi = max(values, key=lambda x: x[1])
+    ratio = hi[1] / lo[1]
+    return Finding("V16", ratio <= max_ratio, "基准价跨度",
+                   f"最高 {hi[0]} {hi[1]} 对最低 {lo[0]} {lo[1]} = {ratio:.1f} 倍"
+                   f"（超过 {max_ratio} 倍就有一个读错了）")
+
+
 def run_price_comparisons(offer_price: Decimal, comparisons: list[PriceComparison],
                           low_6m: Decimal, high_6m: Decimal,
                           nonmarket_labels: frozenset[str] = frozenset()) -> list[Finding]:
