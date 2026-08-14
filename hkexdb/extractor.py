@@ -450,7 +450,7 @@ def _num_or_none(value):
 _PRICE_SANITY_MULTIPLE = 10
 
 
-def _drop_impossible_offer_price(result) -> None:
+def _drop_impossible_offer_price(result, candidates=()) -> None:
     """要约价高出六个月最高价一个数量级 —— 那不是要约价，是别的数字。
 
     ⚠️ 这条防的不是正则写得松，是**PDF 的文字顺序乱了**。
@@ -465,24 +465,43 @@ def _drop_impossible_offer_price(result) -> None:
 
     正则救不了排版错乱，但**算术能**：这家公司六个月最高价 0.116 港元，
     要约价 220 是它的一千九百倍。留一个这样的数比留空坏得多。
+
+    ⚠️ 这道闸是**筛子，不是开关**：数量级不对就换下一个候选，不是把字段
+    清空。09929 那份的第一个候选是 220.0，第二个就是 0.11（读得清清楚楚）——
+    按开关写，整单要约价留空，连带交易规模和溢价率一起报废。
     """
-    price = _num_or_none(result.offer_price)
     # 参照物有两个来源，谁在就用谁：六个月最高价，或价值比较里最高的
     # 那个基准价。09929 那份排版错乱到连六个月最高价都没抽到，
     # 只靠一个来源这道闸就形同虚设。
     refs = [_num_or_none(result.six_month_high)]
     refs += [_num_or_none(c.benchmark) for c in result.comparisons]
     refs = [r for r in refs if r and r > 0]
-    if not price or not refs:
+    if not refs:
         return
     high = max(refs)
-    if price > high * _PRICE_SANITY_MULTIPLE:
+
+    def impossible(value: str) -> bool:
+        num = _num_or_none(value)
+        return bool(num) and num > high * _PRICE_SANITY_MULTIPLE
+
+    if not impossible(result.offer_price):
+        return
+    dropped = result.offer_price
+    for value, evidence in candidates:
+        if impossible(value):
+            continue
+        result.offer_price, result.offer_price_evidence = value, evidence
         result.notes.append(
-            f"抽到的要约价 {result.offer_price} 是参照价 {high} 的 "
-            f"{price / high:.0f} 倍（数量级不对，多半是 PDF 里数字与文字错位），"
-            f"已作废，需人工读原文")
-        result.offer_price = ""
-        result.offer_price_evidence = Evidence()
+            f"抽到的要约价 {dropped} 是参照价 {high} 的 "
+            f"{_num_or_none(dropped) / high:.0f} 倍（数量级不对，多半是 PDF 里"
+            f"数字与文字错位），已换成同一份公告里的 {value}")
+        return
+    result.notes.append(
+        f"抽到的要约价 {dropped} 是参照价 {high} 的 "
+        f"{_num_or_none(dropped) / high:.0f} 倍（数量级不对，多半是 PDF 里"
+        f"数字与文字错位），已作废，需人工读原文")
+    result.offer_price = ""
+    result.offer_price_evidence = Evidence()
 
 
 def _deal_size_problem(amount: str, price: str, shares: str,
@@ -607,22 +626,37 @@ def _hkd_equivalent(pages: dict[int, str]) -> tuple[str, Evidence]:
     return "", Evidence()
 
 
-def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
-    """按模式优先级扫，而不是按页码。
+def offer_price_candidates(pages: dict[int, str]) -> list[tuple[str, Evidence]]:
+    """按模式优先级排出**一串**要约价候选，而不是只给第一个。
 
     定义节（「要約價」指…）往往在文末，正文里则会出现 2.2 这种省略写法。
     先扫页会让宽松模式在前面的页上抢先命中，抽到 2.2 而不是 2.20。
+
+    ⚠️ 为什么要一串：数量级那道闸（_drop_impossible_offer_price）原来是个
+    **开关**——第一个候选不合格就把整个字段清空。09929 澳達的文字层错位，
+    第一个候选是 220.0（其实是股本总额，单位百万），于是要约价整个留空，
+    而同一份公告里 0.11 那句读得清清楚楚。同一个病在交易规模上栽过一次，
+    当时的结论是「闸要当筛子用，不是开关」——这里补上。
     """
     flats = {page: _flat(pages[page]) for page in sorted(pages)}
+    out: list[tuple[str, Evidence]] = []
     for pattern in _OFFER_PRICE:
         for page, flat in flats.items():
-            m = pattern.search(flat)
-            if m:
+            for m in pattern.finditer(flat):
                 start = max(0, m.start() - 20)
-                return m.group(1), Evidence(page, flat[start:m.end() + 20].strip())
+                out.append((m.group(1),
+                            Evidence(page, flat[start:m.end() + 20].strip())))
     # 正着读读不出来时，试试倒着读（文字层错位），再试外币等值。
-    got = _reversed_offer_price(pages)
-    return got if got[0] else _hkd_equivalent(pages)
+    for got in (_reversed_offer_price(pages), _hkd_equivalent(pages)):
+        if got[0]:
+            out.append(got)
+    return out
+
+
+def extract_offer_price(pages: dict[int, str]) -> tuple[str, Evidence]:
+    """要约价：候选里的第一个。"""
+    got = offer_price_candidates(pages)
+    return got[0] if got else ("", Evidence())
 
 
 # ---------------------------------------------------------------- 价值比较
@@ -678,7 +712,10 @@ def _pcts(text: str) -> list:
         found.append(_Pct(m.group(1), m.group(2), m.start(), m.end()))
     for m in _PCT_NUM_FIRST.finditer(text):
         # 「折讓約 14.13%」在两个正则下都会命中一次，位置重叠的算一处
-        if any(f.start < m.end() and m.start < f.end for f in found):
+        # ⚠️ m.start 少一对括号就是个 bound method，和 int 比大小直接抛
+        # TypeError，而且因为 and 短路，只有**真的重叠**时才会走到那一边 ——
+        # 于是 250 份公告里只有 02003 一份炸了（91 页，整份作废）。
+        if any(f.start < m.end() and m.start() < f.end for f in found):
             continue
         found.append(_Pct(m.group(2), m.group(1), m.start(), m.end()))
     found.sort(key=lambda f: f.start)
@@ -1210,6 +1247,82 @@ def _repair_dropped_decimal_point(result) -> None:
                 f"已按要约价 {result.offer_price} 复算为 {c.stated_pct}%")
 
 
+# 印刷四舍五入能解释的误差上限（百分点），和 selectors 的复核阈值同一个数。
+_PCT_ROUNDING_TOL = Decimal("0.6")
+
+
+def _premium_envelope(price, bench, decimals: int):
+    """基准价印成 N 位小数，真值就在末位 ±半格之间；返回这段区间对应的溢价范围。
+
+    为什么要区间而不是一个数：公告是拿**未舍入**的均价算百分比的，
+    我们只看得见舍入后的。09929 澳達印的是 0.103／溢價6.36%，
+    拿 0.103 直接复算得 6.80%，差 0.44 个百分点 —— 按等式核，
+    对的那几行会被判成错的。
+    """
+    step = Decimal(1).scaleb(-decimals) / 2 if decimals else Decimal(0)
+    lo, hi = bench - step, bench + step
+    if lo <= 0:
+        return None
+    a, b = abs(price - lo) / lo * 100, abs(price - hi) / hi * 100
+    if (price - lo) * (price - hi) < 0:
+        return Decimal(0), max(a, b)      # 区间跨过要约价，下界是 0
+    return min(a, b), max(a, b)
+
+
+def _recompute_broken_percentages(result) -> None:
+    """公告印的百分比和它自己印的基准价对不上时，**信价格**。
+
+    09929 澳達第 (iv) 行印的是：
+
+        …前三十個連續交易日…平均收市價每股股份約0.080港元…溢價約27%
+
+    要约价 0.11 对 0.080 是溢价 37.5%，不是 27%。舍入解释不了 10 个
+    百分点。而第 (iv) 行正是 30 日均价 —— 主值那一档。
+
+    为什么信价格不信百分比：基准价是市场数据，公告别处（每月收市价表、
+    六个月最高最低价）还会再印一遍，错了容易露馅；百分比是算出来的，
+    是最容易打错的那一个。做 precedent 时也没人把新闻稿里的百分比直接
+    敲进表 —— 都是拿价格自己算。这一条就是把那个习惯写进代码。
+
+    ⚠️ 一道自证的闸：**只有当这套梯子里大多数行都能用这个要约价复算对，
+    才敢改剩下那几行**。01310 香港寬頻的整套梯子是按调整前的 5.075 港元
+    算的，而我们记的要约价是 4.91 —— 那种情况下一行都对不上，
+    说明对不上的是要约价而不是百分比，一个字都不能动。
+
+    外币那一套梯子（双重上市）直接跳过：港元要约价对欧元基准价，
+    复算出来的是无意义的数。
+    """
+    price = _dec_or_none(result.offer_price)
+    if not price or price <= 0:
+        return
+    rows, ok = [], []
+    for c in result.comparisons:
+        bench, stated = _dec_or_none(c.benchmark), _dec_or_none(c.stated_pct)
+        if c.venue == "foreign" or not bench or bench <= 0 or stated is None:
+            continue
+        envelope = _premium_envelope(price, bench, c.benchmark_decimals)
+        if envelope is None:
+            continue
+        rows.append((c, bench))
+        ok.append(envelope[0] - _PCT_ROUNDING_TOL <= stated
+                  <= envelope[1] + _PCT_ROUNDING_TOL)
+    good = sum(ok)
+    if good < 2 or good < len(ok) - good:
+        return                    # 对不上的是要约价，不是百分比
+    for (c, bench), fine in zip(rows, ok):
+        if fine:
+            continue
+        printed = c.stated_pct
+        c.stated_pct = f"{abs(price - bench) / bench * 100:.2f}"
+        c.stated_direction = PREMIUM if price > bench else DISCOUNT
+        result.notes.append(
+            f"公告印的百分比和它自己印的基准价对不上：「{c.label}」印的是 "
+            f"{printed}%，而要约价 {result.offer_price} 对基准价 "
+            f"{c.benchmark} 港元复算是 {c.stated_pct}%（差得超出四舍五入能"
+            f"解释的范围）。同一张梯子上另外 {good} 行都对得上，"
+            f"所以按基准价复算的这个数取值，原文那个数留在这里备查")
+
+
 def _note_alternative_prices(result) -> None:
     """一份公告给了**两套要约价**时，说出来。
 
@@ -1477,12 +1590,16 @@ _LADDER_LABEL = re.compile(r"交易日|收市價|收市价|平均價|平均价|[
 # 还有一段引子，引子自己也编着 (i)(ii)，把表格的 (i)(ii) 挤出了序列 ——
 # 于是第一行的标签一路吃到第二行，「五(5)個」跟着进来，收市价那行被判成
 # 5 日均价。这里换两条更贴合排版的判据：
-#   · 编号后面得有个空白（「五(5)個」「(30)個交易日」紧贴着「個」，出局）；
 #   · 编号前面不能是中文数字 —— 折行时窗口里的括号数字恰好也会落在数字列
 #     前面并带上空格：「…及包括該日在內的十(10) 0.354 131.1%」。
 #     「十(10) 」看着和真编号一模一样，认了它，本行标签只剩个「個交易日」。
+#   · 编号后面不能紧跟「個」「日」：「五(5)個交易日」「(30)個」那种是窗口
+#     本身的一部分，当编号会把标签拦腰劈开。
+# ⚠️ 判据**不能**写成「后面得有个空白」：09929 澳達的编号紧贴着正文
+#（「(ii)較股份於緊接最後交易日…」），按空白判一个编号都认不出来，
+# 整套梯子读不出来 —— 那单的主值因此只剩净资产那一条。
 _LADDER_MARK = re.compile(
-    r"(?<![一二三四五六七八九十百])[(（]\s*(?:[ivx]{1,5}|[a-z]|\d{1,2})\s*[)）]\s")
+    r"(?<![一二三四五六七八九十百])[(（]\s*(?:[ivx]{1,5}|[a-z]|\d{1,2})\s*[)）]\s*(?![個日])")
 
 
 def _comparisons_from_ladder(section: str, page_at) -> list[Comparison]:
@@ -1563,6 +1680,23 @@ def _comparisons_from_scan(joined: str, page_of: dict[int, int],
                 continue
             seen.add(key)
             out.append(cmp_)
+
+    # 没有小标题**又**文字层错位的，形状判据也够不着：09929 澳達那四条
+    # 写成「…前三十個連續交易日於聯交所所報0.080 27%的平均收市價每股股份
+    # 約港元…溢價約 ；」——「溢價約」后面根本没有数字，形状对不上，
+    # 于是整套梯子只剩净资产那两条。表格读法认的是「基准价 空格 百分比」
+    # 这个形状，正好读得出来。
+    # ⚠️ 全文捞比在小节里捞松得多，所以行标签必须像一行价值比较
+    #（_LADDER_LABEL 那道闸），而且认购价/配售价那张同款表要排掉。
+    printed = {(c.benchmark, c.stated_pct) for c in out}
+    for cmp_ in _comparisons_from_ladder(joined, page_at):
+        if (cmp_.benchmark, cmp_.stated_pct) in printed:
+            continue
+        if _FAKE_COMPARISON.search(cmp_.quote):
+            continue
+        printed.add((cmp_.benchmark, cmp_.stated_pct))
+        out.append(cmp_)
+
     if parallel and notes is not None:
         notes.append(_PARALLEL_NOTE)
     return out
@@ -1956,6 +2090,56 @@ _DEAL_SIZE = [
 ]
 
 
+# 文字层错位把金额从「百萬港元」里抽走了，只剩下量词。09929 澳達两处都这样：
+#
+#     …應付的最高現金代價將為百0.11萬港元乃按每股要約股份港元…   ← 中间夹了别人
+#     …要約人根據要約應付的最高總額將為百萬港元。                 ← 干脆空着
+#
+# 真句子是「…將為 55.0 百萬港元」，55.0 被提到了三十个字之前。
+#
+# 判据很硬：「百萬」是一个词，中间夹数字在中文里不可能出现；而「百萬港元」
+# 前面不接数字也同样不可能（「數百萬」那种约数除外，单独排掉）。
+# signature 一旦出现，就说明这一句的排版已经乱了 —— 正着读出来的数
+# （0.11 → 1,100）必错，所以这一路的候选排在所有读法**前面**。
+# ⚠️ 光认「百萬港元」远远不够 —— 一份公告里「百萬港元」能出现十几次
+# （贷款额、可换股债券所得款项、募资用途逐条列举…），而这条读法是往左
+# 抓最近的一个数，抓错一个就出一个天文数字。第一版没加下面这两道闸，
+# 08631 抓到了王先生的贷款 5.5 百萬、00195 抓到了股数 1,366,000,000
+# （乘一百万变成 1.366 千万亿）。
+# 所以「百萬港元」跟前必须是**要约代价**的说法，而且这句得在讲要约。
+_SPLIT_MILLIONS = re.compile(
+    r"(?:應付|支付|須付|代價|總額|總金額|款項)[^0-9。；]{0,20}?"
+    r"(?:百\s*[\d,]+\.?\d*\s*萬|(?<![0-9數几幾上逾])百萬)\s*港元")
+# 被提到前面的那个数：往左找最近的一个独立数字，跳过百分比。
+_LOOSE_NUM = re.compile(r"(?<![\d.,])([\d,]+\.?\d*)(?!\s*%)")
+# 「X 百萬港元」里的 X 不会有七位数 —— 有的话抓到的多半是股数。
+_MILLIONS_CEILING = 1_000_000
+
+
+def _split_millions(pages: dict[int, str], seen: set) -> list[tuple]:
+    """「百萬」被拆开时，把被提到前面的那个金额捞回来。"""
+    out = []
+    for page in sorted(pages):
+        flat = _flat(pages[page])
+        for m in _SPLIT_MILLIONS.finditer(flat):
+            head = flat[max(0, m.start() - 120):m.start()]
+            if "要約" not in head + m.group(0):
+                continue
+            nums = list(_LOOSE_NUM.finditer(head))
+            if not nums:
+                continue
+            raw = nums[-1].group(1).replace(",", "")
+            if float(raw) >= _MILLIONS_CEILING:
+                continue
+            amount = f"{float(raw) * 1_000_000:.0f}"
+            if amount in seen or _distractor_kind(flat, m.start()):
+                continue
+            seen.add(amount)
+            out.append((amount, page,
+                        (head[-60:] + m.group(0)).strip(), True))
+    return out
+
+
 # 文字层错位时的交易规模：数字在前，「應付…代價…港元」在后。
 _DEAL_SIZE_REVERSED = re.compile(
     r"(?P<num>[\d,]+\.?\d*)"
@@ -2004,7 +2188,11 @@ _OFFER_SIDE = re.compile(r"要約項下|根據要約|接納要約|要約獲|要�
 # 01980 天鴿互動写「本公司全部已發行股本的價值約為754.39百萬港元」，
 # 正好等于 0.68 × 11.09 亿股 —— 拿它当交易规模会把一单 4.7 亿的要约记成 7.5 亿。
 _EQUITY_VALUE = re.compile(
-    r"(?:全部)?已發行股[本份](?:總額)?(?:之|的)?(?:價值|總值)")
+    r"(?:全部)?已發行股[本份](?:總額)?(?:之|的)?(?:價值|總值)|"
+    # 09929 澳達不写「價值」两个字，直接说「本公司的已發行股本總額將為
+    # 220.0百萬港元」——一样是整家公司的估值。「總額的25%」那种是股数占比，
+    # 所以必须跟着一个「為」才算。
+    r"已發行股[本份]總額\s*(?:將|約)?\s*為")
 
 
 def _is_equity_value(flat: str, at: int) -> bool:
@@ -2041,8 +2229,13 @@ def _in_funding_section(flat: str, at: int) -> bool:
 # 01428 耀才證券实跑取到 5,285,714,451（含协议），答案是 2,752,957,490.24
 #（纯要约）。这个数骗过了「付给卖方」那条判据 —— 因为它同一句里
 # 既有「購股協議」也有「要約獲」，两边的标记都齐。
+# ⚠️「項下」和「及」之间会插一小段插入语，插进来这条就断了：
+#     01428 耀才：「要約人於購股協議項下及要約獲全數接納時應付的最高總金額」
+#     01657 樺欣：「要約人於購股協議項下（包括利息）及要約獲全數接納時…」
+# 01657 那句只多了「（包括利息）」四个字，于是 266,329,230（协议＋要约）
+# 被当成了交易规模，真值 66,833,690（只有要约那一笔）差了四倍。
 _SPA_PLUS_OFFER = re.compile(
-    r"(?:購股協議|買賣協議|股份收購協議)(?:項下)?(?:及|與|和)(?:該)?要約|"
+    r"(?:購股協議|買賣協議|股份收購協議)(?:項下)?[^0-9。；]{0,16}?(?:及|與|和)(?:該)?要約|"
     r"要約(?:及|與|和)(?:購股|買賣)協議(?:項下)?")
 
 
@@ -2253,6 +2446,11 @@ def deal_size_candidates(pages: dict[int, str],
                 start = max(0, m.start() - 40)
                 out.append((amount, page, flat[start:m.end() + 10].strip()))
                 funded.append(_in_funding_section(flat, m.start()))
+    # 「百萬」被拆开的那种错位，比上面所有读法都硬 —— 排最前面。
+    split = _split_millions(pages, seen)
+    out = [(a, p, q) for a, p, q, _ in split] + out
+    funded = [True] * len(split) + funded
+
     if not out:
         # 文字层错位的公告，数字被提到了词的前面：
         #   「…基於要約的悉數接2,774,343納，要約人根據要約應付現金代價將約為港元」
@@ -2311,7 +2509,9 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     kind = classify_offer(title, pages)
     result.offer_type, result.offer_type_evidence = kind.label, kind.evidence
     result.obligation_basis, result.offer_scope = kind.obligation, kind.scope
-    result.offer_price, result.offer_price_evidence = extract_offer_price(pages)
+    price_candidates = offer_price_candidates(pages)
+    result.offer_price, result.offer_price_evidence = (
+        price_candidates[0] if price_candidates else ("", Evidence()))
     result.comparisons = extract_comparisons(pages, result.notes)
     result.six_month_low, result.six_month_high, result.six_month_evidence = \
         extract_six_month(pages)
@@ -2329,7 +2529,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
         extract_debt_conversion(pages)
 
     result.spa_price, result.spa_price_evidence = extract_spa_price(pages)
-    _drop_impossible_offer_price(result)
+    _drop_impossible_offer_price(result, price_candidates)
     _choose_deal_size(result, others, stated_equity_value(pages))
 
     # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
@@ -2352,6 +2552,9 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     _fix_assumed_directions(result)
     _repair_dropped_decimal_point(result)
     _apply_election(result, pages)
+    # ⚠️ 必须排在替代方案选价**之后**：06808 高鑫两套要约价各带一套梯子，
+    # 选价之前拿其中一个价去核另一套梯子，会把好好的四条比较全改掉。
+    _recompute_broken_percentages(result)
     _note_alternative_prices(result)
     if not result.deal_size:
         result.notes.append("交易规模未识别")
