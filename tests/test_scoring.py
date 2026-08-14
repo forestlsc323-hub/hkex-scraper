@@ -361,3 +361,26 @@ def test_a_real_offer_row_beats_a_nearer_unresolved_one():
     assert not misses
     assert pairs[0][1]["公告日期"] == "2025-02-07"
     assert S.score(got, want).scores[0].right == 1
+
+
+def test_a_row_with_no_readable_date_never_wins_over_a_dated_one():
+    """读不出日期的候选不能当成「日期正好对上」。
+
+    gap 原来初始化成 0，读不出日期就一路带着 0 走 —— 于是存档里那些老行
+    （日期列空着或格式对不上）在**任何**答案日期下都是零天误差的完美匹配，
+    把真正同一天的那行挤掉。
+
+    实跑里 00195、00167、01912 六个错项全是这么来的：程序日志上明明抽对了
+    （00195 -34.21%／55,000,000），报告上却显示抽错。
+    """
+    answers = [{"股票代码": "00195", "公告日期": "2026-05-29",
+                "主值溢价率(%)": "-34.21"}]
+    got = [
+        {"股票代码": "00195", "公告日期": "", "判定": "要约",
+         "主值溢价率(%)": "-63.43"},              # 老行，日期读不出来
+        {"股票代码": "00195", "公告日期": "2026-05-29", "判定": "要约",
+         "主值溢价率(%)": "-34.21"},              # 同一天，真身
+    ]
+    report = scoring.score(got, answers)
+    premium = next(s for s in report.scores if s.field == "主值溢价率(%)")
+    assert premium.right == 1, "没日期的老行把同一天那行挤掉了"

@@ -226,8 +226,16 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
         for cand in pool.get(code, []):
             if id(cand) in used:
                 continue
-            gap = 0
+            # ⚠️ 读不出日期的候选**不能**当成「日期正好对上」。
+            # 原来 gap 初始化成 0，读不出日期就一路带着 0 走 ——
+            # 于是存档里那些老行（日期列空着或格式对不上）在任何一个
+            # 答案日期下都是「零天误差」的完美匹配，把真正同一天的那行
+            # 挤掉。实跑里 00195、00167、01912 六个错项全是这么来的：
+            # 程序日志上明明抽对了（00195 -34.21%／55,000,000，
+            # 00167 -71.98%／71,800,000），报告上却显示抽错。
             cand_date = _date(cand)
+            undated = bool(want_date) and not cand_date
+            gap = 0
             if want_date and cand_date:
                 gap = abs((cand_date - want_date).days)
                 if gap > near_days:
@@ -241,8 +249,9 @@ def pair_up(got_rows: list[dict], answer_rows: list[dict],
             #
             # 「待核／非要约」是程序自己说的「这行不成立」，拿它去参加评分
             # 等于用一行已知无效的数据判自己错。
+            # 有日期的一律排在没日期的前面，再比谁近。
             rank = (0 if str(cand.get("判定", "")).strip() in ("", "要约")
-                    else 1, gap, -_filled(cand))
+                    else 1, 1 if undated else 0, gap, -_filled(cand))
             if best_rank is None or rank < best_rank:
                 best, best_gap, best_rank = cand, gap, rank
         if best is None:
