@@ -1126,6 +1126,90 @@ def _fix_assumed_directions(result) -> None:
             f"（改了 {fixed} 条）")
 
 
+def _dec_or_none(value):
+    """按 Decimal 读一个数。钱和百分比一律不走 float（铁律一）。"""
+    try:
+        return Decimal(str(value).replace(",", "").strip())
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+
+
+def _shift_back(bench, mid):
+    """把丢了小数点的基准价挪回兄弟们的量级。挪不回去返回 None。
+
+    只认整十倍的挪动（小数点就是这么丢的），而且挪完必须落在中位数的
+    ±40% 以内 —— 同一张梯子上不同窗口的均价本来就差不了几个百分点，
+    落不进这个区间说明它不是同一个东西，别动它。
+    """
+    if bench is None or bench <= 0 or mid <= 0:
+        return None
+    if mid / 10 <= bench <= mid * 10:
+        return None               # 同一个量级，没丢小数点
+    for shift in (Decimal(10), Decimal(100), Decimal(1000)):
+        for guess in (bench / shift, bench * shift):
+            if mid * Decimal("0.6") <= guess <= mid * Decimal("1.4"):
+                return guess
+    return None
+
+
+def _repair_dropped_decimal_point(result) -> None:
+    """原文把基准价的小数点印丢了 —— 一整行数字因此全错。
+
+    01953 RIMBACO 的价值比较第 (iv) 行，公告原文就是这么印的：
+
+        (ii)  …前最後五個連續交易日…平均收市價每股0.664港元折讓約74.8%
+        (iii) …前最後10個連續交易日…平均收市價每股0.608港元折讓約72.5%
+        (iv)  …前最後30個連續交易日…平均收市價每股63.7港元折讓約0.460%
+                                                  ↑ 少了个小数点
+
+    这是**公告自己印错**，不是我们读错（逐字符核过 x 坐标，PDF 里就是
+    「63.7」）。而且错的不止一处：印出来的百分比 0.460% 也不对
+    （按 0.637 复算是折让 73.8%），所以两个数字没法互相印证。
+
+    偏偏第 (iv) 行就是 30 日均价 —— 主值那一档。不管它的话，成品表里
+    这单的溢价率是 -0.46%，一个看着完全正常的数。
+
+    判据只能来自**同一张梯子上的兄弟**：同一个锚点的其他几档都在
+    0.6 上下，63.7 差了一百倍。除以 10／100／1000，哪一档落回兄弟们
+    的量级，小数点就丢在哪一位。落不回去就一个字不动 —— 宁可留个错的
+    让校验去拦，也不凭空改数。
+
+    改完百分比按修好的基准价重算（铁律一：算术归 Python），
+    并在备注里把原文那两个数原样留着。
+    """
+    price = _dec_or_none(result.offer_price)
+    if not price or price <= 0:
+        return                    # 没有要约价就复算不了百分比，不动
+    # ⚠️ 按「锚点＋交易所」分组，不是只按锚点。双重上市的公告会同时列
+    # 港交所和境外那套梯子，两套价格本来就是两个币种、两个量级 ——
+    # 混在一起取中位数，正常的境外价会被当成「丢了小数点」改掉。
+    groups: dict[tuple[str, str], list] = {}
+    for c in result.comparisons:
+        bench = _dec_or_none(c.benchmark)
+        if c.anchor != "nav" and bench and bench > 0:
+            groups.setdefault((c.anchor, c.venue), []).append(c)
+    for rows in groups.values():
+        if len(rows) < 3:
+            continue              # 兄弟太少，中位数说明不了量级
+        values = sorted(_dec_or_none(c.benchmark) for c in rows)
+        mid = values[len(values) // 2]
+        for c in rows:
+            fixed = _shift_back(_dec_or_none(c.benchmark), mid)
+            if fixed is None:
+                continue
+            printed = (c.benchmark, c.stated_pct)
+            c.benchmark = f"{fixed.normalize():f}"
+            c.benchmark_decimals = _decimals(c.benchmark)
+            c.stated_direction = PREMIUM if price > fixed else DISCOUNT
+            c.stated_pct = f"{abs(price - fixed) / fixed * 100:.2f}"
+            result.notes.append(
+                f"公告原文把「{c.label}」那一档的基准价小数点印丢了："
+                f"印的是 {printed[0]} 港元（同一张梯子上其他几档在 "
+                f"{mid} 上下），按 {c.benchmark} 港元读；"
+                f"印的百分比 {printed[1]}% 也跟着错，"
+                f"已按要约价 {result.offer_price} 复算为 {c.stated_pct}%")
+
+
 def _note_alternative_prices(result) -> None:
     """一份公告给了**两套要约价**时，说出来。
 
@@ -2266,6 +2350,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     if not result.comparisons:
         result.notes.append("未找到「價值比較」一节，溢价率无法抽取")
     _fix_assumed_directions(result)
+    _repair_dropped_decimal_point(result)
     _apply_election(result, pages)
     _note_alternative_prices(result)
     if not result.deal_size:

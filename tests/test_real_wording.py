@@ -430,9 +430,19 @@ def test_a_percentage_printed_before_the_word_is_still_read():
 
 
 def test_a_benchmark_that_never_says_per_share_is_still_found():
-    """03389 通篇写「每一股份」「股份平均收市價」，一次「每股」都没有。"""
+    """03389 通篇写「每一股份」「股份平均收市價」，一次「每股」都没有。
+
+    ⚠️ 这一节的收市价那条，公告原文印的是「收市價12.00港元有大約0.125%
+    之溢價」—— 要约价 0.14 对 12.00 是**折让 98.8%**，可原文自己写的是
+    「溢價」，两个数一个字都对不上。同一张梯子上另外两档是 0.122 / 0.119，
+    所以 12.00 是 0.12 掉了小数点（0.14 对 0.12 恰好是溢价 16.67%）。
+    小数点复位那道工序把这一行改回自洽（见 _repair_dropped_decimal_point）。
+    """
     _ex, ladder = _ladder(P03389)
-    assert ladder[("last_trading_day", "spot")] == "0.125"
+    assert ladder[("last_trading_day", "spot")] == "16.67"
+    spot = next(c for c in _ex.comparisons
+                if (c.anchor, c.window) == ("last_trading_day", "spot"))
+    assert (spot.benchmark, spot.stated_direction) == ("0.12", "premium")
 
 
 def test_bare_roman_numbering_is_recognised():
@@ -1098,3 +1108,51 @@ def test_a_hoisted_date_is_not_read_as_a_window():
     assert ladder["5d"] == ("discount", "37.50")
     assert ladder["10d"] == ("discount", "35.90")
     assert ladder["30d"] == ("discount", "34.21")
+
+
+# 01953 RIMBACO（真原文，页 8）—— 公告自己把基准价的小数点印丢了
+P01953 = {
+    8: "要約價為每股要約股份0.167港元，較："
+       "(i) 股份於2026年4月10日（即最後交易日）在聯交所所報收市價每股0.650港元"
+       "折讓約74.3%；"
+       "(ii) 股份於緊接最後交易日（包括該日）前最後五個連續交易日在聯交所所報"
+       "平均收市價每股0.664港元折讓約74.8%；"
+       "(iii) 股份於緊接最後交易日（包括該日）前最後10個連續交易日在聯交所所報平"
+       "均收市價每股0.608港元折讓約72.5%；"
+       "(iv) 股份於緊接最後交易日（包括該日）前最後30個連續交易日在聯交所所報平"
+       "均收市價每股63.7港元折讓約0.460%；及"
+       "(v) 本公司截至2025年10月31日止年度的年報所披露的於2025年10月31日本公"
+       "司股東應佔綜合經審核資產淨值每股約0.099令吉（相當於約0.183港元）折"
+       "讓約8.74%。最高及最低股價",
+}
+
+
+def test_a_dropped_decimal_point_in_the_benchmark_is_put_back():
+    """公告原文印错了 —— 逐字符核过 x 坐标，PDF 里就是「63.7」。
+
+    第 (iv) 行是 30 日均价，也就是主值那一档。不管它的话，成品表里
+    这单的溢价率是 -0.46%，一个看着完全正常的数。
+
+    两个数字都错（基准价丢了小数点，百分比也跟着错），没法互相印证，
+    所以判据只能来自同一张梯子上的兄弟：另外三档都在 0.6 上下，
+    63.7 差了一百倍，除以 100 正好落回去。
+    改完百分比按修好的基准价复算（铁律一），原文那两个数留在备注里。
+    """
+    ex = extractor.extract("聯合公告 強制性無條件現金要約", P01953)
+    ladder = {(c.anchor, c.window): (c.benchmark, c.stated_pct)
+              for c in ex.comparisons}
+    assert ladder[("last_trading_day", "30d")] == ("0.637", "73.78")
+    assert ladder[("last_trading_day", "10d")] == ("0.608", "72.5")   # 没动
+    assert any("小数点印丢了" in n for n in ex.notes)
+
+
+def test_a_benchmark_in_the_same_order_of_magnitude_is_never_touched():
+    """小数点复位只管**数量级**差了十倍以上的。
+
+    同一张梯子上不同窗口的均价本来就差几个百分点，一档都不许动 ——
+    这道工序改的是原文的印刷错误，不是把数字往中位数上凑。
+    """
+    ex = extractor.extract("", P00372)
+    assert [c.benchmark for c in ex.comparisons] == \
+        ["0.180", "0.155", "0.160", "0.157", "0.179"]
+    assert not any("小数点" in n for n in ex.notes)
