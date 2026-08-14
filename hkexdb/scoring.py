@@ -81,7 +81,7 @@ class FieldScore:
     field: str
     graded: int = 0        # 答案表里填了值的条数
     right: int = 0
-    wrong: list = field(default_factory=list)   # (key, 抽到的, 应该是, 抽取器版本)
+    wrong: list = field(default_factory=list)   # (key, 抽到的, 应该是, 版本, 配到哪一行)
 
     @property
     def rate(self) -> float:
@@ -116,10 +116,18 @@ class Report:
             lines += ["", "错在哪里", "-" * 56]
             any_wrong = False
             for s in self.scores:
-                for key, got, want, ver in s.wrong:
+                for key, got, want, ver, paired in s.wrong:
                     any_wrong = True
                     lines.append(f"[{s.field}] {'/'.join(key)}")
                     lines.append(f"    抽到：{got or '（空）'}")
+                    # ⚠️ 「抽错了」和「配错行了」看起来一模一样，而修法完全
+                    # 相反。同一个标的先后做过好几单要约时（00195 綠科三单），
+                    # 答案的那一天可能被配到另一单上去 —— 不把配到的日期
+                    # 印出来，就会去改一个根本没错的正则。
+                    if paired and paired[1]:
+                        lines.append(
+                            f"    ↳ 这一行配的是程序里 {paired[0]} 那一单，"
+                            f"相隔 {paired[1]} 天 —— 同一标的多单时先看是不是配错了行")
                     lines.append(f"    应为：{want}")
                     hint = _hint(got, want)
                     if hint:
@@ -276,7 +284,8 @@ def score(got_rows: list[dict], answer_rows: list[dict]) -> Report:
                 s.right += 1
             else:
                 s.wrong.append((key, str(got), str(want),
-                                str(got_row.get("抽取器版本", "")).strip()))
+                                str(got_row.get("抽取器版本", "")).strip(),
+                                (str(got_row.get("公告日期", "")).strip(), _gap)))
 
     extra = [_key(r) for r in leftovers]
     # 旧版本抽的行拿来算准确率，量的是历史不是现在的规则 —— 必须说出来。
