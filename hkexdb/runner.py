@@ -1117,16 +1117,30 @@ def _screen(records, result: Result, log):
         log(line)
     result.orphans = len(orphans)
 
-    # 捞回来：孤儿簇里那一条 T0 改判进「捞回」桶，跟着留存桶一起抽。
-    # ⚠️ 不改成 retained ——「它是被捞回来的」这件事必须一路带到成品表，
+    # 捞回来：孤儿簇里最像 T0 的**那几份**一起改判进「捞回」桶，跟着
+    # 留存桶一起抽。
+    #
+    # ⚠️ 为什么是几份而不是一份：标题排序只能猜。01145 勇利投資那一簇里
+    # 四条标题都写着「提出自願性有條件全面現金要約」，挑中的那份打开一看
+    # 正文里连「要約價」都没有 —— 于是这单还是丢了，而且日志上只说
+    # 「非要约」，看不出是捞错了文件。判准归**正文**：多开几份，
+    # 抽得出要约字段的那份自然胜出，抽不出的照旧标成非要约，不进成品表。
+    #
+    # ⚠️ 也不改成 retained ——「它是被捞回来的」这件事必须一路带到成品表，
     # 看表的人得知道这一行的桶是程序推出来的，不是词表判出来的（铁律二）。
-    for _o, row in recall.rescue_all(orphans)[0]:
-        was = row["verdict"].bucket
-        row["verdict"].bucket = recall.RESCUED
-        row["verdict"].reasons.append(
-            f"孤儿单捞回：这一簇有后续公告却一条都没留存，"
-            f"说明存在过一份 T0；按「提出…要約、不带程序动作、最早」"
-            f"挑出这一条，原判 {was}")
+    opened = 0
+    for _o, queue in recall.rescue_all(orphans)[0]:
+        for rank, row in enumerate(queue):
+            was = row["verdict"].bucket
+            row["verdict"].bucket = recall.RESCUED
+            row["verdict"].reasons.append(
+                f"孤儿单捞回（队列第 {rank + 1}/{len(queue)} 份）：这一簇有"
+                f"后续公告却一条都没留存，说明存在过一份 T0；"
+                f"哪一份是它由正文说了算，原判 {was}")
+            opened += 1
+    if opened:
+        log(f"     —— 这几单一共排了 {opened} 份公告去开，"
+            f"抽得出要约字段的那份算数（标题排序只是猜，判准归正文）")
     return recs, rules
 
 

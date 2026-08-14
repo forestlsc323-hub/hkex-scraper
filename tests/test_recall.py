@@ -282,3 +282,43 @@ def test_the_report_keeps_the_whole_title():
     path = recall.write_report(recall.find_orphans(rows), Path(__import__(
         "tempfile").mkdtemp()))
     assert tail in path.read_text(encoding="utf-8-sig")
+
+
+def test_a_whole_queue_is_opened_not_just_the_best_guess():
+    """标题排序只能**猜**哪一份是 T0。
+
+    01145 勇利投資那一簇里四条标题都写着「提出自願性有條件全面現金要約」，
+    实跑挑中的那份打开一看，正文里连「要約價」都没有 —— 这单还是丢了，
+    而日志上只说「非要约」，看不出是捞错了文件。
+
+    所以这一层只排队，判准归正文：多开几份，抽得出要约字段的那份算数。
+    和交易规模那道闸是同一条教训 —— 闸要当筛子用，不是开关。
+    """
+    rows = [
+        row("01145", "2025-01-17",
+            "聯合公佈 寄發綜合文件 內容有關 結好證券有限公司為及代表華建"
+            "有限公司提出自願性有條件全面現金要約以收購勇利投資集團有限公司",
+            "excluded", "勇利投資"),
+        row("01145", "2025-01-17",
+            "聯合公佈 (1)結好證券有限公司為及代表華建有限公司提出自願性"
+            "有條件全面現金要約以收購勇利投資集團有限公司之全部已發行股份；"
+            "及(2)恢復買賣", "excluded"),
+        row("01145", "2025-02-18", "聯合公佈 要約結果", "excluded"),
+    ]
+    orphans = recall.find_orphans(rows)
+    queue = recall.rescue_ranked(orphans[0])
+    # 不带程序动作的那份排在前面，但寄发那份也在队里 —— 猜错了还有得救
+    assert [("寄發" in r["title"]) for r in queue] == [False, True]
+    assert recall.rescue(orphans[0]) is queue[0]
+
+
+def test_the_queue_is_capped():
+    """一簇里可能有几十条（00701 CNT 有 28 条），不能全打开。"""
+    rows = [row("00701", f"2026-04-{d:02d}",
+                f"聯合公告 由禹銘投資管理有限公司提出強制性有條件現金要約"
+                f"以收購CNT集團全部已發行股份（第{d}份）", "manual", "CNT")
+            for d in range(10, 20)]
+    rows.append(row("00701", "2026-05-20", "聯合公告 寄發北海要約的綜合文件",
+                    "excluded"))
+    orphans = recall.find_orphans(rows)
+    assert len(recall.rescue_ranked(orphans[0])) == recall.RESCUE_TRIES

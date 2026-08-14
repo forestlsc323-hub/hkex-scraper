@@ -215,24 +215,44 @@ def _t0_score(row: dict) -> tuple:
     return (tier, str(row.get("date", "")))
 
 
-def rescue(orphan: Orphan) -> dict | None:
-    """从一簇孤儿公告里挑出那份 T0。挑不出返回 None。
+# 一簇里最多打开几份来试。标题排序只是**猜**哪一份是 T0，猜错了就得换
+# 下一份 —— 判准归正文，不归标题（见 rescue_ranked）。
+RESCUE_TRIES = 3
 
-    挑不出**不是失败**，是另一种答案：那份 T0 根本没被抓到
+
+def rescue_ranked(orphan: Orphan, limit: int = RESCUE_TRIES) -> list:
+    """一簇孤儿公告里，最像 T0 的那几份，从像到不像排好。
+
+    ⚠️ 为什么给**一队**而不是一个：标题排序只能猜。01145 勇利投資那一簇里
+    四条标题都写着「提出自願性有條件全面現金要約」，靠标题分不出哪条是
+    T0、哪条是寄发通知；实跑挑中的那份打开一看，正文里连「要約價」都没有。
+
+    所以这一层只负责**排队**，判准交给正文：打开第一份，抽不出要约字段
+    就换下一份，直到有一份抽得出来或者队列用完。这和交易规模那道闸是
+    同一条教训 —— 闸要当筛子用，不是开关。
+
+    空队列**不是失败**，是另一种答案：那份 T0 根本没被抓到
     （02350 數科的要約期間 2025-04-29 就开始了，可簇里最早的一条是
     05-23 —— 04-29 那份压根不在列表里，是抓取层漏的，不是筛查层）。
     这两种缺口得分开报，修法完全不同。
     """
-    best = min(orphan.rows, key=_t0_score)
-    return best if _t0_score(best)[0] < 2 else None
+    ranked = sorted(orphan.rows, key=_t0_score)
+    return [r for r in ranked if _t0_score(r)[0] < 2][:limit]
 
 
-def rescue_all(orphans: list[Orphan]) -> tuple[list, list]:
-    """返回 (捞回来的 [(orphan, row)], 簇里根本没有 T0 的 orphan)。"""
+def rescue(orphan: Orphan) -> dict | None:
+    """队首那一份。只给报告用 —— 真正开哪一份由正文说了算。"""
+    ranked = rescue_ranked(orphan, 1)
+    return ranked[0] if ranked else None
+
+
+def rescue_all(orphans: list[Orphan], limit: int = RESCUE_TRIES
+               ) -> tuple[list, list]:
+    """返回 (捞回来的 [(orphan, 候选队列)], 簇里根本没有 T0 的 orphan)。"""
     found, empty = [], []
     for o in orphans:
-        row = rescue(o)
-        (found.append((o, row)) if row is not None else empty.append(o))
+        queue = rescue_ranked(o, limit)
+        (found.append((o, queue)) if queue else empty.append(o))
     return found, empty
 
 
@@ -282,12 +302,14 @@ def summary(orphans: list[Orphan]) -> list[str]:
              "     （判据不是猜的：有「寄發綜合文件／要約結果」这类后续公告，"
              "就一定存在过一份 T0）"]
     found, empty = rescue_all(orphans)
-    for o, row in found[:8]:
+    for o, queue in found[:8]:
+        row = queue[0]
         lines.append(f"     {o.code} {o.name}　{o.first}~{o.last}　"
-                     f"{o.count} 条　捞回 {row.get('date', '')} "
+                     f"{o.count} 条　排队开 {len(queue)} 份，先开 "
+                     f"{row.get('date', '')}"
                      f"（原判 {_bucket(row)}"
                      + (f"，被「{'、'.join(_killed_by(row))}」判的" if _killed_by(row) else "")
-                     + f"）：{row.get('title', '')[:40]}")
+                     + f"）：{row.get('title', '')[:36]}")
     for o in empty[:4]:
         lines.append(f"     {o.code} {o.name}　{o.first}~{o.last}　"
                      f"{o.count} 条　⚠️ 这一簇里**没有**T0 —— "
