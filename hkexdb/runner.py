@@ -1400,9 +1400,20 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
 
     # 存的是标记之后的结果。镜像那一行也要更新回存档，
     # 否则下次复用出来又是重复的。
+    never_read = [d for d in deals
+                  if d.news_id in fresh_ids and not _was_read(d)]
+    if never_read:
+        log(f"  有 {len(never_read)} 份**没能读到**（下载失败／解析超时），"
+            f"不进存档，下次重跑会自动重试：")
+        for d in never_read[:6]:
+            log(f"      {d.code} {d.name}　{str(d.notes or '')[:60]}")
+        if len(never_read) > 6:
+            log(f"      …还有 {len(never_read) - 6} 份")
+
     to_save = [d for d in deals
-               if d.news_id and (d.news_id in fresh_ids
-                                 or d.verdict in ("mirror", "duplicate"))]
+               if d.news_id and _was_read(d)
+               and (d.news_id in fresh_ids
+                    or d.verdict in ("mirror", "duplicate"))]
     if to_save:
         rows = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
                  **dict(zip(DEAL_COLUMNS, _deal_row(d)))} for d in to_save]
@@ -1622,6 +1633,28 @@ def _extract_one(row, opener, cancel_event, extractor, pdf_source,
                 deal.confidence = "low"
                 deal.verdict, deal.verdict_reason = "unclear", f"抽取失败：{exc}"
     return deal
+
+
+# 这两句开头的备注意味着「这份文件我们根本没读到」，不是「读了没找到」。
+_NEVER_READ = ("抽取失败", "解析超时")
+
+
+def _was_read(deal) -> bool:
+    """这份公告到底读到了没有。**决定它该不该进存档。**
+
+    存档的口径是「抽过的别再抽」——而下载失败、解析超时意味着我们连文件
+    都没打开，手上根本没有结果可复用。
+
+    上次实跑有 8 单栽在 ConnectionReset／SSLError／ProxyError 上
+    （01451、01780、01117、01432、01796、01417、06613、08395），
+    全部被当成「待核」写进了存档。只要抽取器版本不变，下一次重跑就会
+    直接复用这 8 条空结果 —— **一次网络抖动变成永久的空洞**，
+    而日志上只会显示「本次全部可复用」，什么都看不出来。
+    这次没爆是因为版本号刚好动了，纯属侥幸。
+
+    「正文只找到一半」那类**要**存：那是真读过之后的结论，不是没读到。
+    """
+    return not str(deal.notes or "").startswith(_NEVER_READ)
 
 
 def _note_other_anchor(deal, pick) -> None:

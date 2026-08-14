@@ -534,3 +534,43 @@ def test_a_resumed_run_does_not_re_download_what_was_flushed(isolated, monkeypat
                           open_pdf=lambda u: (opened.append(u),
                                               fake_open_pdf(u))[1])
     assert len(opened) < first_round, "续跑时又把存过的重下了一遍"
+
+
+def test_a_download_failure_is_not_written_into_the_archive(isolated, monkeypatch):
+    """网络抖一下，不能变成永久的空洞。
+
+    实跑有 8 单栽在 ConnectionReset／SSLError／ProxyError 上，全部被当成
+    「待核」写进了存档。只要抽取器版本不变，下一次重跑会直接复用这 8 条
+    空结果，而日志上只显示「本次全部可复用」—— 什么都看不出来。
+
+    存档的口径是「抽过的别再抽」，而下载失败意味着**我们连文件都没打开**。
+    「正文只找到一半」那类要存：那是真读过之后的结论。
+    """
+    from hkexdb import screening as S
+    from tests.test_runner import fake_open_pdf
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 1, "keyword", ["要約"]))
+    rows = [{"row_id": f"n{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
+            for i in range(4)]
+
+    def flaky(url):
+        if url.endswith(("1.pdf", "3.pdf")):
+            raise ConnectionError("远程主机强迫关闭了一个现有的连接")
+        return fake_open_pdf(url)
+
+    runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
+                          open_pdf=flaky)
+    saved = set(store.load_deals(isolated))
+    assert "n0" in saved and "n2" in saved
+    assert not (saved & {"n1", "n3"}), "下载失败被当成结果存进了存档"
+
+    # 再跑一次：失败那两份必须重新打开
+    opened = []
+    runner._extract_deals(rows, lambda *_: None, lambda *_: None, None,
+                          open_pdf=lambda u: (opened.append(u), flaky(u))[1])
+    again = {u.rsplit("/", 1)[-1] for u in opened}
+    assert {"1.pdf", "3.pdf"} <= again, "失败的那两份没有重试"
+    assert not (again & {"0.pdf", "2.pdf"}), "成功的那两份又重下了一遍"
