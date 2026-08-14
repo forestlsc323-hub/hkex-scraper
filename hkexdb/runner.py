@@ -1097,7 +1097,8 @@ def _screen(records, result: Result, log):
                         "／".join(v.matched_retain), "；".join(v.manual_flags),
                         "；".join(v.reasons), r["title"], r["pdf_url"], rules.version])
 
-    labels = {S.RETAINED: "留存（进抽取）", S.MANUAL: "人工复核",
+    labels = {S.RETAINED: "留存（进抽取）", "rescued": "孤儿单捞回（进抽取，待人工确认）",
+              S.MANUAL: "人工复核",
               S.EXCLUDED: "已灰（后续/程序公告）", S.SPECIAL: "特殊品种",
               S.SUPERSEDED: "被取代", S.IRRELEVANT: "题材无关"}
     for bucket, n in sorted(result.buckets.items(), key=lambda kv: -kv[1]):
@@ -1115,6 +1116,17 @@ def _screen(records, result: Result, log):
     for line in recall.gap_summary(recs, orphans):
         log(line)
     result.orphans = len(orphans)
+
+    # 捞回来：孤儿簇里那一条 T0 改判进「捞回」桶，跟着留存桶一起抽。
+    # ⚠️ 不改成 retained ——「它是被捞回来的」这件事必须一路带到成品表，
+    # 看表的人得知道这一行的桶是程序推出来的，不是词表判出来的（铁律二）。
+    for _o, row in recall.rescue_all(orphans)[0]:
+        was = row["verdict"].bucket
+        row["verdict"].bucket = recall.RESCUED
+        row["verdict"].reasons.append(
+            f"孤儿单捞回：这一簇有后续公告却一条都没留存，"
+            f"说明存在过一份 T0；按「提出…要約、不带程序动作、最早」"
+            f"挑出这一条，原判 {was}")
     return recs, rules
 
 
@@ -1137,7 +1149,9 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
 
     on_activity = on_activity or (lambda _text: None)
 
-    targets = [r for r in rows if r["verdict"].bucket == "retained"]
+    from . import recall, screening
+    targets = [r for r in rows
+               if r["verdict"].bucket in (screening.RETAINED, recall.RESCUED)]
     if not targets:
         log("  留存桶为空，没有要抽的公告。")
         return []

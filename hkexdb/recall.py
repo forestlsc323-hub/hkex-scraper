@@ -170,20 +170,107 @@ def _bucket(row: dict) -> str:
     return str(row.get("bucket", ""))
 
 
+# ---------------------------------------------------------------- 把它捞回来
+#
+# 上面那张表只回答「漏了多少」。这一段回答「怎么捞」。
+#
+# 捞的依据不是换个词表 —— 换词表是在猜，而且改一个词会牵动全市场 9657 条。
+# 依据是**结构**：这一簇里有后续公告，就一定存在过一份 T0，那份 T0 就在
+# 这一簇里（或者压根没抓到，那是抓取层的事，这里也要说清楚）。
+# 所以捞回来这件事只剩一个问题：**簇里哪一条是那份 T0**。
+#
+# ⚠️ 捞回来的行不进留存桶，进一个单独的「捞回」桶，并且原样带着
+# 「它本来被判成什么、被哪个词判的」。铁律二：分类层的改动必须看得见，
+# 不能悄悄多出几行来。
+
+RESCUED = "rescued"
+
+# T0 的签名：**提出**一个要约。后续公告会把要约全称复述一遍，但不会说
+# 「提出」——它们说的是「寄發」「延遲」「結果」。
+_T0_VERB = re.compile(r"提出|作出|提呈")
+_T0_KIND = re.compile(r"強制性|强制性|自願|自愿|部[分份].{0,4}要約|全面.{0,6}要約|"
+                      r"無條件.{0,6}要約|有條件.{0,6}要約")
+
+# 纯程序动作。带这些词的那一条不管怎么复述要约全称，都不是 T0。
+_PROCEDURAL = re.compile(
+    r"寄發|延遲|綜合文件|接納表格|過戶表格|通知信函|回條|"
+    r"要約結果|要約截止|接納水平|成為無條件|結算|"
+    r"翌日披露|月報表|規則\s*22|交易披露")
+
+
+def _t0_score(row: dict) -> tuple:
+    """这一条像不像那份 T0。排序用，越小越像。
+
+    三档，档内按日期从早到晚（T0 总是一簇里最早的那一条）：
+      0  说了「提出…要約」，而且不带任何程序动作的词 —— 就是它
+      1  说了「提出…要約」，但同一条里还带着程序动作（打包公告）
+      2  剩下的
+    """
+    title = row.get("title", "")
+    signed = bool(_T0_VERB.search(title) and _T0_KIND.search(title))
+    if signed:
+        tier = 1 if _PROCEDURAL.search(title) else 0
+    else:
+        tier = 2
+    return (tier, str(row.get("date", "")))
+
+
+def rescue(orphan: Orphan) -> dict | None:
+    """从一簇孤儿公告里挑出那份 T0。挑不出返回 None。
+
+    挑不出**不是失败**，是另一种答案：那份 T0 根本没被抓到
+    （02350 數科的要約期間 2025-04-29 就开始了，可簇里最早的一条是
+    05-23 —— 04-29 那份压根不在列表里，是抓取层漏的，不是筛查层）。
+    这两种缺口得分开报，修法完全不同。
+    """
+    best = min(orphan.rows, key=_t0_score)
+    return best if _t0_score(best)[0] < 2 else None
+
+
+def rescue_all(orphans: list[Orphan]) -> tuple[list, list]:
+    """返回 (捞回来的 [(orphan, row)], 簇里根本没有 T0 的 orphan)。"""
+    found, empty = [], []
+    for o in orphans:
+        row = rescue(o)
+        (found.append((o, row)) if row is not None else empty.append(o))
+    return found, empty
+
+
 def write_report(orphans: list[Orphan], root: Path) -> Path:
-    """落一张盘，好逐单查。"""
+    """落一张盘，好逐单查。
+
+    ⚠️ 标题**不截断**。第一版截到 60 字，结果几条 T0 在报告里看着
+    像该留的，实跑却被灰掉了 —— 杀死它的那个词正好在第 60 字之后。
+    报告的用处就是告诉人「是哪个词干的」，截断把这个用处砍掉了。
+    """
     out_dir = root / "data" / "screening"
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "orphans.csv"
     with path.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["股票代码", "名称", "最早", "最晚", "公告数",
-                    "证明这单存在过的标题", "桶", "全部标题"])
+                    "证明这单存在过的标题", "桶",
+                    "捞回来的那一条（日期）", "捞回来的那一条（标题）",
+                    "它本来在哪个桶", "被哪个词判的", "全部标题"])
         for o in orphans:
-            w.writerow([o.code, o.name, o.first, o.last, o.count, o.evidence,
-                        "／".join(sorted({_bucket(r) for r in o.rows})),
-                        "｜".join(r.get("title", "")[:60] for r in o.rows)])
+            pick = rescue(o)
+            w.writerow([
+                o.code, o.name, o.first, o.last, o.count, o.evidence,
+                "／".join(sorted({_bucket(r) for r in o.rows})),
+                (pick or {}).get("date", ""),
+                (pick or {}).get("title", ""),
+                _bucket(pick) if pick else "",
+                "、".join(_killed_by(pick)) if pick else "",
+                "｜".join(r.get("title", "") for r in o.rows)])
     return path
+
+
+def _killed_by(row: dict) -> list:
+    """这一条是被哪些词判出局的。看得见才改得动。"""
+    verdict = row.get("verdict")
+    if verdict is None:
+        return []
+    return list(getattr(verdict, "matched_exclude", None) or [])
 
 
 def summary(orphans: list[Orphan]) -> list[str]:
@@ -194,11 +281,21 @@ def summary(orphans: list[Orphan]) -> list[str]:
              f"于是整单从成品表里消失",
              "     （判据不是猜的：有「寄發綜合文件／要約結果」这类后续公告，"
              "就一定存在过一份 T0）"]
-    for o in orphans[:8]:
+    found, empty = rescue_all(orphans)
+    for o, row in found[:8]:
         lines.append(f"     {o.code} {o.name}　{o.first}~{o.last}　"
-                     f"{o.count} 条　{o.evidence[:46]}")
-    if len(orphans) > 8:
-        lines.append(f"     …还有 {len(orphans) - 8} 单，见 data/screening/orphans.csv")
+                     f"{o.count} 条　捞回 {row.get('date', '')} "
+                     f"（原判 {_bucket(row)}"
+                     + (f"，被「{'、'.join(_killed_by(row))}」判的" if _killed_by(row) else "")
+                     + f"）：{row.get('title', '')[:40]}")
+    for o in empty[:4]:
+        lines.append(f"     {o.code} {o.name}　{o.first}~{o.last}　"
+                     f"{o.count} 条　⚠️ 这一簇里**没有**T0 —— "
+                     f"那份公告压根没抓到，是抓取层的缺口")
+    if len(found) + len(empty) > 12:
+        lines.append(f"     …其余见 data/screening/orphans.csv")
+    lines.append(f"     捞得回来 {len(found)} 单（筛查层判错），"
+                 f"捞不回来 {len(empty)} 单（抓取层没抓到）—— 两种缺口修法不同。")
     lines.append("     这张表的长度就是召回率的缺口 —— 比抽错严重得多。")
     return lines
 

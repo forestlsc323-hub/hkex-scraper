@@ -196,3 +196,89 @@ def test_one_unrelated_title_does_not_kill_the_whole_cluster():
                 "綜合文件", "excluded")]
     got = recall.find_orphans(rows)
     assert len(got) == 1 and "強制性無條件現金要約" in got[0].evidence
+
+
+# ---------------------------------------------------------------- 捞回来那一条
+
+def test_the_t0_is_picked_out_of_an_orphan_cluster():
+    """01145 勇利投資的真实形态：四条里有一条是 T0，另外三条是寄发。
+
+    T0 的签名是「**提出**…要約」。后续公告会把要约全称一字不差地复述
+    一遍（这正是「排除优先于保留」存在的理由），但它们说的是
+    「寄發」「綜合文件」，不是「提出」。
+    """
+    rows = [
+        row("01145", "2025-01-17",
+            "聯合公佈 (1)結好證券有限公司為及代表華建有限公司提出自願性有條件"
+            "全面現金要約以收購勇利投資集團有限公司之全部已發行股份；及"
+            "(2)恢復買賣", "excluded", "勇利投資"),
+        row("01145", "2025-02-11",
+            "聯合公佈 寄發綜合文件 內容有關 結好證券有限公司為及代表華建有限"
+            "公司提出自願性有條件全面現金要約以收購勇利投資集團有限公司",
+            "excluded"),
+        row("01145", "2025-02-11",
+            "綜合文件 結好證券有限公司為及代表華建有限公司提出自願性有條件"
+            "全面現金要約以收購勇利投資集團有限公司之全部已發行股份",
+            "excluded"),
+        row("01145", "2025-02-18", "聯合公佈 要約結果", "excluded"),
+    ]
+    orphans = recall.find_orphans(rows)
+    assert len(orphans) == 1
+    picked = recall.rescue(orphans[0])
+    assert picked is not None
+    assert picked["date"] == "2025-01-17"
+
+
+def test_the_earliest_filing_is_not_blindly_taken():
+    """最早的那一条不一定是 T0 —— 00701 CNT 的簇里，前二十条是规则 22
+    的交易披露，T0 排在它们后面。
+
+    所以排序是「先按像不像 T0 分档，档内才按日期」，不是「取最早」。
+    """
+    rows = [row("00701", f"2026-04-{d:02d}", "根據《收購守則》規則22作出的交易披露",
+                "manual", "CNT GROUP") for d in range(23, 28)]
+    rows.append(row("00701", "2026-05-06",
+                    "有關由禹銘投資管理有限公司代表PRIME SURPLUS LIMITED"
+                    "提出強制性有條件現金要約以收購CNT集團有限公司全部已發行"
+                    "股份之聯合公告", "manual"))
+    rows.append(row("00701", "2026-05-20", "聯合公告 - 寄發北海要約的綜合文件",
+                    "excluded"))
+    orphans = recall.find_orphans(rows)
+    assert len(orphans) == 1
+    assert recall.rescue(orphans[0])["date"] == "2026-05-06"
+
+
+def test_a_cluster_with_no_t0_in_it_is_reported_as_a_fetch_gap():
+    """02350 數科的真实形态：要約期間 2025-04-29 就开始了，可簇里最早的
+    一条是 05-23 —— 04-29 那份公告压根不在列表里。
+
+    这是**抓取层**漏的，不是筛查层判错的。捞不出来不是失败，是另一种
+    答案；两种缺口修法完全不同，报告里得分开说。
+    """
+    rows = [
+        row("02350", "2025-05-23",
+            "聯合公告 延遲寄發有關聖衡金融控股有限公司代表QH TECHNOLOGY "
+            "就收購數科集團之綜合要約及回應文件", "excluded", "數科集團"),
+        row("02350", "2025-07-14", "聯合公告 要約結果", "excluded"),
+    ]
+    orphans = recall.find_orphans(rows)
+    found, empty = recall.rescue_all(orphans)
+    assert not found and len(empty) == 1
+    assert any("抓取层" in line for line in recall.gap_summary(rows, orphans))
+
+
+def test_the_report_keeps_the_whole_title():
+    """报告的用处就是告诉人「是哪个词把这条 T0 判出局的」。
+
+    第一版把标题截到 60 字，杀死它的那个词正好在第 60 字之后 ——
+    于是报告里看着该留的那条，实跑却被灰掉了，怎么看都看不出所以然。
+    """
+    tail = "；及(2)恢復買賣"
+    long_title = ("聯合公佈 (1)結好證券有限公司為及代表華建有限公司提出自願性"
+                  "有條件全面現金要約以收購勇利投資集團有限公司之全部已發行股份"
+                  + tail)
+    rows = [row("01145", "2025-01-17", long_title, "excluded", "勇利投資"),
+            row("01145", "2025-02-11", "聯合公佈 寄發綜合文件 有關要約", "excluded")]
+    path = recall.write_report(recall.find_orphans(rows), Path(__import__(
+        "tempfile").mkdtemp()))
+    assert tail in path.read_text(encoding="utf-8-sig")
