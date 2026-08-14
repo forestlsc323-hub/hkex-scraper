@@ -175,11 +175,56 @@ def test_a_comparison_laid_out_as_a_table_is_still_read():
     负数）、后面还跟着第二个百分比。按句子形式读，一条都读不出来。
     """
     ex = extractor.extract("聯合公告 可能強制性無條件現金要約", P08439)
-    assert len(ex.comparisons) == 9
-    ladder = {(c.anchor, c.window): (c.stated_direction, c.stated_pct)
+    ladder = {(c.anchor, c.window): (c.stated_direction, c.stated_pct,
+                                     c.benchmark)
               for c in ex.comparisons}
-    assert ladder[("last_trading_day", "30d")] == ("premium", "40.8")
-    assert ladder[("last_trading_day", "spot")] == ("discount", "4.9")
+    # 印了十行就得读出十行，一行不少 —— 缺哪一行都不会报错，
+    # 只会让主值悄悄取到另一档。
+    assert len(ex.comparisons) == 10
+    assert ladder == {
+        ("undisturbed", "spot"): ("premium", "147.9", "0.330"),
+        ("undisturbed", "5d"): ("premium", "135.1", "0.348"),
+        ("undisturbed", "10d"): ("premium", "131.1", "0.354"),
+        ("undisturbed", "30d"): ("premium", "129.8", "0.356"),
+        ("undisturbed", "60d"): ("premium", "137.1", "0.345"),
+        ("last_trading_day", "spot"): ("discount", "4.9", "0.860"),
+        ("last_trading_day", "5d"): ("discount", "6.0", "0.870"),
+        ("last_trading_day", "10d"): ("discount", "8.1", "0.890"),
+        ("last_trading_day", "30d"): ("premium", "40.8", "0.581"),
+        ("last_trading_day", "60d"): ("premium", "76.3", "0.464"),
+    }
+
+
+def test_a_sentence_after_the_table_does_not_hide_the_whole_table():
+    """08439 的真原文比摘录多两句：表格后面还跟着两句净资产口径的散文。
+
+        (x) 直至及包括最後交易日的六十(60)個交易日 0.464 76.3% 97.8%
+        股份要約價每股要約股份0.818港元亦表示：(i) 較…經審核綜合資產淨值
+        每股約0.427港元…溢價約91.6%；及(ii) …0.410港元…溢價約99.5%。
+
+    那两句是**散文**，正常读法抽得到 —— 于是「一条都没抽出来才读表格」
+    这个条件永远不成立，十行梯子一条都没进去。实跑主值取到 91.6%
+    （净资产口径），答案是 40.8%（最後交易日前 30 日）。
+
+    教训：「有没有抽到东西」不等于「这一节读完了」。
+    """
+    pages = dict(P08439)
+    pages[14] += ("股份要約價每股要約股份0.818港元亦表示："
+                  "(i) 較基於本公司於2025年3月31日的經審核綜合資產淨值計算的"
+                  "經審核綜合資產淨值每股約0.427港元（按本聯合公告日期已發行"
+                  "股份數目計算）溢價約91.6%；及"
+                  "(ii) 較基於本公司於2025年9月30日的未經審核綜合資產淨值"
+                  "每股約0.410港元溢價約99.5%。")
+    ex = extractor.extract("聯合公告 可能強制性無條件現金要約", pages)
+    ladder = {(c.anchor, c.window): c.stated_pct for c in ex.comparisons}
+    assert ladder[("last_trading_day", "30d")] == "40.8"
+    assert ladder[("undisturbed", "30d")] == "129.8"
+    # 净资产那两句自己也得判对。它们紧跟在表格最后一行后面，
+    # 判锚点时会把那一行的「最後交易日…六十(60)個交易日」一起看进来 ——
+    # 于是每股净资产被当成「最後交易日前 60 日均价」，数字对、口径错。
+    assert ladder[("nav", "nav")] in ("91.6", "99.5")
+    assert not [c for c in ex.comparisons
+                if c.benchmark in ("0.427", "0.410") and c.anchor != "nav"]
 
 
 def test_the_other_spelling_of_undisturbed_is_recognised():
@@ -983,3 +1028,73 @@ def test_02362_partial_offer_reads_end_to_end():
     ladder = {c.window: (c.stated_direction, c.stated_pct)
               for c in ex.comparisons}
     assert ladder["30d"] == ("discount", "51.53")
+
+
+# 01428 耀才證券金融（真原文，页 14）—— 交易规模的干扰值和正解**同一页**
+P01428 = {
+    14: "價值比較要約價每股要約股份3.28港元較股份於最後交易日在聯交所所報"
+        "收市價每股2.79港元溢價約17.6%；及較股份於截至最後交易日（包括該日）"
+        "止最後三十個交易日在聯交所所報平均收市價每股約2.76港元溢價約18.8%。"
+        "按每股要約股份3.28港元的要約價，本公司的全部已發行股本價值將為約"
+        "5,567,131,890.24港元。假設於完成日期或之後不會發行新股份，根據每股"
+        "要約股份3.28港元的要約價及839,316,308股要約股份，要約的最高代價將為"
+        "2,752,957,490.24港元。財政資源確認要約人有意以內部資源及外部銀行融資"
+        "撥付及支付購股協議項下及要約獲全數接納時應付代價。假設要約獲全數接納"
+        "及概無發行新股份，則要約人於購股協議項下及要約獲全數接納時應付的"
+        "最高總金額（為免生疑問，不包括要約人於購股協議日期已向賣方支付的"
+        "按金）將為5,285,714,451港元。",
+}
+
+
+def test_a_spa_plus_offer_total_is_not_the_deal_size():
+    """01428 耀才證券：同一页上印着两个「最高」总额，差了一倍。
+
+        要約的最高代價                                2,752,957,490.24  ← 要的
+        購股協議項下**及**要約…應付的最高總金額        5,285,714,451     ← 干扰
+
+    后者含着付给卖方的那一大笔（要约人先从卖方手上买走的控股权），
+    不是要约本身的规模。它骗过了「付给卖方的对价」那道闸 ——
+    因为同一句话里**两个标记都有**（既有「購股協議」又有「要約」），
+    按「这句提到卖方吗」去判，判不出来。
+
+    判据得盯住那个**并列连词**：「購股協議項下及要約」＝两笔加在一起。
+    """
+    ex = extractor.extract("聯合公告 強制性無條件現金要約", P01428)
+    assert ex.deal_size == "2752957490.24"
+    assert any("协议＋要约的合计" in n for n in ex.notes)
+
+
+# 00195 綠科科技國際 2026-05-29（真原文）—— 文字层错位，日期也被提到了前面
+P00195_PO = {
+    7: "價值比較0.25要約價每股要約股份港元較："
+       "(i) 2024 8 30 0.28股份於年月日（即最後交易日）在聯交所所報收市價"
+       "每股港元10.71%折讓約 ；"
+       "(ii)股份於截至最後交易日（包括該日）止最後連續五個交易日在聯交所所報"
+       "0.40 37.50%平均收市價每股港元折讓 ；"
+       "(iii)股份於截至最後交易日（包括該日）止最後連續十個交易日在聯交所所報"
+       "0.39 35.90%平均收市價每股港元折讓約 ；"
+       "(iv)股份於截至最後交易日（包括該日）止最後連續三十個交易日在聯交所所"
+       "0.38 34.21%報平均收市價每股約港元折讓約 。最高及最低股價",
+}
+
+
+def test_a_hoisted_date_is_not_read_as_a_window():
+    """00195 綠科：错位排版把**日期**也提到了词的前面。
+
+        (i) 2024 8 30 0.28股份於年月日（即最後交易日）…收市價…10.71%
+
+    那是 2024 年 8 月 30 日，不是 30 个交易日 —— 可它偏偏也长成
+    「一个裸整数紧挨着基准价」，和真窗口一模一样。判成 30 日的话，
+    收市价那条把真正的 30 日均价挤掉，主值取到 -10.71%（答案 -34.21%）。
+
+    分辨的办法：真窗口那一条里**只有一个**裸整数（基准价和百分比都带
+    小数点）；被提前的日期是三个（年、月、日）。
+    """
+    ex = extractor.extract("公告 提出附帶先決條件的自願現金部分收購要約",
+                           P00195_PO)
+    ladder = {c.window: (c.stated_direction, c.stated_pct)
+              for c in ex.comparisons}
+    assert ladder["spot"] == ("discount", "10.71")
+    assert ladder["5d"] == ("discount", "37.50")
+    assert ladder["10d"] == ("discount", "35.90")
+    assert ladder["30d"] == ("discount", "34.21")

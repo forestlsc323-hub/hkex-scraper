@@ -728,6 +728,8 @@ _ANCHORS = [
     ("last_trading_day", re.compile(r"最後交易日")),
 ]
 
+_NAV_WORDS = dict(_ANCHORS)["nav"]
+
 # ⚠️ 表格排版会把「…的三十(30)個交易日」拦腰劈开，扁平化后变成
 # 「…的三 0.356 129.8% 157.9%十(30)個交易日」—— 中文数字和括号数字之间
 # 插进了三列数据。所以括号里那个数字必须能**单独**认出来，
@@ -874,13 +876,22 @@ def _window_from_hoisted_number(item: str) -> str:
     放到通用的 _classify 里会误伤：正常条文里也常有零散的裸整数，
     1417 那单的收市价一条立刻被判成 5 日均价，而且看不出错。
     错位的公告本来就已经「正着读一条都读不出来」，在那里放宽才安全。
+
+    ⚠️ 还要求这一条里**只有一个**裸整数。日期也会被提到前面：
+        「(i) 2024 8 30 0.28股份於年月日（即最後交易日）…收市價…10.71%」
+    那是 2024 年 8 月 30 日，不是 30 个交易日 —— 而它偏偏也是「一个整数
+    紧挨着基准价」。00195 綠科实跑就是这么把收市价那条判成 30 日均价的，
+    于是主值取了 -10.71%（答案 -34.21%，那是真正的 30 日）。
+    真正的窗口那一条里只有一个裸整数（基准价和百分比都带小数点）。
     """
     if not _TRADING_DAYS.search(item):
         return ""
-    for m in _BARE_INT.finditer(item):
-        for name, pat in _WINDOWS:
-            if pat.search(m.group(1) + "個"):
-                return name
+    ints = list(_BARE_INT.finditer(item))
+    if len(ints) != 1:
+        return ""              # 零个：没有；多个：多半是被提前的日期
+    for name, pat in _WINDOWS:
+        if pat.search(ints[0].group(1) + "個"):
+            return name
     return ""
 
 
@@ -983,10 +994,26 @@ def extract_comparisons(pages: dict[int, str],
         out.extend(found)
         parallel = parallel or skipped
 
-    # 小标题在、但一条都没切出来 → 多半是表格排版（08439 就是），
-    # 换一套读法再试一次。绝不放着一个「有小标题却零条比较」的结果不管。
-    if not out:
-        out = _comparisons_from_table(section, page_at(0))
+    # 三套读法叠着用，**同一个印出来的百分比只许出一条**，谁先谁算数：
+    #   1. 散文读法（上面那段循环）—— 最准，能看见「溢價／折讓」的字面
+    #   2. 表格读法 —— 一行行读印刷体的梯子，标签折行也拼得回来
+    #   3. 最宽的兜底 —— 只在散文一条都读不出来（文字层错位）时才放出来
+    #
+    # ⚠️ 第 2 条**不能**写成「前面空了才做」：08439 新百利的表格后面跟着
+    # 两句净资产的散文，那两句抽到了，十行梯子就永远轮不上 ——
+    # 主值因此取到 91.6%（净资产口径），答案是 40.8%。
+    # 「有没有抽到东西」不等于「这一节读完了」。
+    #
+    # ⚠️ 第 3 条排在第 2 条**后面**：它按条目切、一条只取头一个百分比，
+    # 遇到干净表格时会把两行粘成一条（08439 的收市价那行被判成 5 日均价）。
+    # 它的价值只在补第 2 条读不到的行（02362 那种基准价后面紧跟中文的）。
+    wide = _comparisons_from_table(section, page_at(0)) if not out else []
+    seen = {(c.benchmark, c.stated_pct) for c in out}
+    for c in _comparisons_from_ladder(section, page_at) + wide:
+        if (c.benchmark, c.stated_pct) in seen:
+            continue
+        seen.add((c.benchmark, c.stated_pct))
+        out.append(c)
     if parallel and notes is not None:
         notes.append(_PARALLEL_NOTE)
     return out
@@ -1244,6 +1271,16 @@ def _comparisons_in(item: str, page: int,
         scope = head if len(pcts) == 1 else head[prev_end:p.end]
         prev_end = p.end
         anchor, window = _classify(scope)
+        # ⚠️ 净资产那一句常常紧跟在价值比较表的最后一行后面，而这一条的
+        # scope 是从上一处百分比算起的，会把表格行的「最後交易日…六十(60)
+        # 個交易日」一起看进来。08439 新百利就是这样：每股净资产 0.427 港元
+        # 那条被判成「最後交易日前 60 日均价」，锚点和窗口全错，
+        # 而数字本身是对的，看不出任何异常。
+        # 基准价**跟前**提到净资产，这一条讲的就是净资产
+        #（「…經審核綜合資產淨值每股約0.427港元」——净资产四个字紧贴在
+        #  基准价左边，所以往左多看一点点，不看整条）。
+        if _NAV_WORDS.search(item[max(0, bench.start() - 24):p.start]):
+            anchor, window = "nav", "nav"
         number = bench.group(3).replace(",", "")
         approx = bench.group(1) is not None or bench.group(2) is not None
         out.append(Comparison(
@@ -1319,6 +1356,97 @@ def _comparisons_from_table(section: str, page: int) -> list[Comparison]:
             stated_pct=m.group(1),
             stated_direction=DISCOUNT if neg else PREMIUM,
             page=page, quote=item.strip()[:220], venue=_venue(item),
+            direction_assumed=True))
+    return out
+
+
+# ------------------------------------------------------------ 干净的印刷表格
+#
+# 上面那条读法（_comparisons_from_table）是给**文字层错位**的公告兜底的，
+# 而且只在「一条都没抽出来」时才启用。08439 新百利卡在这两条之间：
+# 它的表格排得很干净，但节末尾跟着两句净资产的散文 —— 那两句被正常读法
+# 抽到了，于是 out 非空，兜底那条永远轮不上，十行梯子一条都没进去。
+# 主值因此取到 91.6%（净资产口径），答案是 40.8%（最後交易日前 30 日）。
+#
+# 教训：**「有没有抽到东西」不等于「这一节读完了」。** 表格行和散文句
+# 各读各的，谁也不该挡住谁。
+#
+# 扁平化之后一行长这样：
+#
+#   (iv) 緊接不受干擾日期前及包括該日在內的三 0.356 129.8% 157.9%十(30)個交易日
+#        └── 标签前半截 ──────────────────┘ └基准┘ └要的┘ └另一口径┘└标签后半截┘
+#
+# 标签是**被数字列拦腰劈开**的：只看前半截，「三十(30)個交易日」只剩个
+# 「三」，窗口判成收市价；只看后半截，上一行折下来的尾巴会被认成自己的。
+# 所以一行的标签＝「本行编号之后」＋「本行数字之后、下一个编号之前」。
+# 标签里混进来的邻行数字（基准价、另一口径的百分比）。判锚点和窗口之前
+# 先擦掉，否则「十(10) 」＋「 159.3%個交易日」拼不回「十(10)個交易日」。
+# ⚠️ 只擦**带小数点**的数字：「(5)」「(30)」是窗口本身的一部分，擦了就没了。
+_LADDER_NOISE = re.compile(r"[（(]?\s*\d+\.\d{1,4}\s*[)）]?\s*%?")
+
+# 拼回来的标签得看着像一行价值比较，否则不认。价值比较节里也会印别的表
+# （持股量、财务资料），不设这道闸会凭空造出几条比较来。
+_LADDER_LABEL = re.compile(r"交易日|收市價|收市价|平均價|平均价|[未不]受干擾")
+
+
+# 行编号。⚠️ 这里**不能**用 _split_items 那套「必须连号」：表格前面往往
+# 还有一段引子，引子自己也编着 (i)(ii)，把表格的 (i)(ii) 挤出了序列 ——
+# 于是第一行的标签一路吃到第二行，「五(5)個」跟着进来，收市价那行被判成
+# 5 日均价。这里换两条更贴合排版的判据：
+#   · 编号后面得有个空白（「五(5)個」「(30)個交易日」紧贴着「個」，出局）；
+#   · 编号前面不能是中文数字 —— 折行时窗口里的括号数字恰好也会落在数字列
+#     前面并带上空格：「…及包括該日在內的十(10) 0.354 131.1%」。
+#     「十(10) 」看着和真编号一模一样，认了它，本行标签只剩个「個交易日」。
+_LADDER_MARK = re.compile(
+    r"(?<![一二三四五六七八九十百])[(（]\s*(?:[ivx]{1,5}|[a-z]|\d{1,2})\s*[)）]\s")
+
+
+def _comparisons_from_ladder(section: str, page_at) -> list[Comparison]:
+    """干净印刷体的价值比较表 → 若干 Comparison。
+
+    方向按**括号**读（表头印的是「溢價╱（折讓）」），但仍标成猜的 ——
+    最后由 _fix_assumed_directions 拿要约价比大小定夺。铁律一：判断归复算。
+    """
+    rows = list(_TABLE_ROW.finditer(section))
+    if len(rows) < 2:
+        return []                 # 一行不成表，多半是散文里的巧合
+    marks = list(_LADDER_MARK.finditer(section))
+    # ⚠️ 行与行之间必须都找得到编号，否则这套读法整条作废。
+    # 标签的边界完全靠编号划：划不出来，本行的标签就会一直吃到下一行，
+    # 把下一行的窗口词也吃进来。00195 綠科的编号写成「(ii)股份於…」，
+    # 中间没有空格，认不出来 —— 于是「連續五個交易日」那行读到了
+    # 「連續十個交易日」，三行窗口错了两行，而每个数字本身都是对的。
+    # 这种公告交给下面最宽的那套读法（它按条目切，不靠编号定边界）。
+    for prev, row in zip(rows, rows[1:]):
+        if not any(prev.end() <= k.start() < row.start() for k in marks):
+            return []
+    out: list[Comparison] = []
+    for i, m in enumerate(rows):
+        lo = rows[i - 1].end() if i else 0
+        hi = rows[i + 1].start() if i + 1 < len(rows) else len(section)
+        # 本行标签＝「本行编号之后到数字列之前」＋「数字列之后到下一个编号之前」
+        head = max((k.end() for k in marks if lo <= k.start() < m.start()),
+                   default=lo)
+        tail = min((k.start() for k in marks if m.end() <= k.start() < hi),
+                   default=hi)
+        label = re.sub(r"\s+", "", _LADDER_NOISE.sub(
+            "", section[head:m.start()] + section[m.end():tail]))
+        if not _LADDER_LABEL.search(label):
+            continue
+        anchor, window = _classify(label)
+        if window == "spot":
+            # 文字层错位时天数也被提到了前面：「(iii) 10較截至…止最後個連續
+            # 交易日…」——「10」和「個連續交易日」被拆散，正则够不着。
+            window = _window_from_hoisted_number(label) or "spot"
+        bench = m.group("bench")
+        out.append(Comparison(
+            anchor=anchor, window=window,
+            benchmark=bench, benchmark_decimals=_decimals(bench),
+            benchmark_is_exact=True,          # 表格里印的就是精确值
+            stated_pct=m.group("pct"),
+            stated_direction=DISCOUNT if m.group("neg") else PREMIUM,
+            page=page_at(m.start()), quote=(label or section)[:220],
+            at=m.start("pct"), venue=_venue(label),
             direction_assumed=True))
     return out
 
@@ -1824,8 +1952,23 @@ def _in_funding_section(flat: str, at: int) -> bool:
 # 长得像交易规模、但口径不对的那些数字，各自有名字。
 # 只是「跳过」的话，备注里看不出为什么；归了类就能一眼看懂，
 # 也能在准确率报告里按类统计到底哪一类最常骗到人。
+# 「購股協議項下**及**要約…應付的最高總金額」——协议的钱加上要约的钱。
+# 一部分付给卖方、一部分付给公众股东，混在一起的数不是交易规模。
+# 01428 耀才證券实跑取到 5,285,714,451（含协议），答案是 2,752,957,490.24
+#（纯要约）。这个数骗过了「付给卖方」那条判据 —— 因为它同一句里
+# 既有「購股協議」也有「要約獲」，两边的标记都齐。
+_SPA_PLUS_OFFER = re.compile(
+    r"(?:購股協議|買賣協議|股份收購協議)(?:項下)?(?:及|與|和)(?:該)?要約|"
+    r"要約(?:及|與|和)(?:購股|買賣)協議(?:項下)?")
+
+
+def _spa_plus_offer(flat: str, at: int) -> bool:
+    return bool(_SPA_PLUS_OFFER.search(flat[max(0, at - 90):at]))
+
+
 _DISTRACTORS = [
     ("整家公司的估值", lambda flat, at: _is_equity_value(flat, at)),
+    ("协议＋要约的合计（含付给卖方那部分）", lambda flat, at: _spa_plus_offer(flat, at)),
     ("付给卖方的对价", lambda flat, at: _paid_to_the_seller(flat, at)),
 ]
 
