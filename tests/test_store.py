@@ -604,3 +604,41 @@ def test_a_blip_is_retried_once_more_at_the_end_of_the_run(isolated, monkeypatch
                                   None, open_pdf=blip)
     assert [d.verdict for d in deals] == ["offer"] * 3, "补跑那一份没救回来"
     assert set(store.load_deals(isolated)) == {"n0", "n1", "n2"}
+
+
+def test_a_cluster_that_produced_nothing_gets_another_try(isolated, monkeypatch):
+    """整簇公告都开过了，却一条要约都没抽出来 —— 这单还是丢了。
+
+    06113 UTS 就卡在这儿：簇里有一条进了留存桶，所以筛查之后那一遍认为
+    它没事；可那一条打开是后续公告，正文里没有要約價 —— 日志上只写
+    「非要约」，看不出丢了一整单。
+
+    「有后续公告就一定存在过一份 T0」这条演绎，在抽取之后同样成立。
+    """
+    from hkexdb import screening as S
+    from tests.test_runner import fake_open_pdf
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 1, "keyword", ["要約"]))
+    rows = [
+        {"row_id": "a", "date": "2025-05-06", "code": "06113", "name": "UTS",
+         "title": "聯合公告 延遲寄發有關收購UTS之綜合要約及回應文件",
+         "pdf_url": "/x/a.pdf", "verdict": S.Verdict(bucket=S.RETAINED)},
+        {"row_id": "b", "date": "2025-04-28", "code": "06113", "name": "UTS",
+         "title": "聯合公告 提出強制性無條件現金要約以收購UTS全部已發行股份",
+         "pdf_url": "/x/b.pdf", "verdict": S.Verdict(bucket=S.EXCLUDED)},
+        {"row_id": "c", "date": "2025-06-13", "code": "06113", "name": "UTS",
+         "title": "聯合公告 要約結果", "verdict": S.Verdict(bucket=S.EXCLUDED)},
+    ]
+
+    def opener(url):
+        if url.endswith("a.pdf"):
+            return b"%PDF-1.4 \n", "application/pdf"   # 打得开，但不是要约
+        return fake_open_pdf(url)
+
+    deals = runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                                  None, open_pdf=opener)
+    assert [d.row_id if hasattr(d, "row_id") else d.news_id for d in deals] \
+        [:1] == ["a"], "第一遍开的还是留存桶那一份"
+    assert any(d.news_id == "b" and d.verdict == "offer" for d in deals), \
+        "整簇没抽出要约，却没有回头再开一份"

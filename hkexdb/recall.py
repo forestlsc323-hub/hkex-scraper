@@ -120,10 +120,24 @@ def _clusters(rows: list, gap_days: int) -> list[list]:
     return out
 
 
-def find_orphans(screened: list, gap_days: int = GAP_DAYS) -> list[Orphan]:
-    """找出「有后续公告、却一条都没留存」的单。
+def find_orphans(screened: list, gap_days: int = GAP_DAYS,
+                 produced: set | None = None) -> list[Orphan]:
+    """找出「有后续公告、却一条都没**成事**」的单。
 
     `screened` 是筛查层的行（含 code / date / title / verdict.bucket）。
+
+    「成事」有两个口径，同一套判据两处用：
+
+      produced=None   筛查之后跑：成事＝进了留存桶。
+                      答的是「筛查层有没有把一整单灰掉」。
+
+      produced={id…}  抽取之后跑：成事＝**真抽出了一条要约**。
+                      答的是「这一整簇公告都打开过了，却一条要约都没抽出来」。
+
+    后一个口径更硬，也更该管：06113 UTS 的簇里有一条进了留存桶，
+    所以第一个口径认为它没事；可那一条打开一看是后续公告，正文里没有
+    要約價 —— 这单照样丢了，而且日志上只写「非要约」，看不出丢了一单。
+    「有后续公告就一定存在过一份 T0」这条演绎在两个口径下同样成立。
     """
     by_code: dict[str, list] = {}
     for row in screened:
@@ -132,13 +146,18 @@ def find_orphans(screened: list, gap_days: int = GAP_DAYS) -> list[Orphan]:
             continue          # 没有代码的归不到单上，另有报告管它们
         by_code.setdefault(code, []).append(row)
 
+    def worked(row: dict) -> bool:
+        if produced is None:
+            return _bucket(row) == RETAINED
+        return str(row.get("row_id") or "") in produced
+
     out: list[Orphan] = []
     for code, rows in sorted(by_code.items()):
         kept = [d for d in (_day(r.get("date", "")) for r in rows
-                            if _bucket(r) == RETAINED) if d]
+                            if worked(r)) if d]
         for cluster in _clusters(rows, gap_days):
-            if any(_bucket(r) == RETAINED for r in cluster):
-                continue      # 有 T0 留存，不是孤儿
+            if any(worked(r) for r in cluster):
+                continue      # 这一簇成事了，不是孤儿
             # ⚠️ 范围外只看**那条证据本身**，不看整簇。一簇里混进一条
             #    「購回股份」的无关公告，不该把整单交易一起判出局
             #    （01939 東京中央拍賣第一版就是这么被误杀的）。

@@ -1144,6 +1144,12 @@ def _screen(records, result: Result, log):
     return recs, rules
 
 
+# 一次跑最多为「整簇没抽出要约」再开几单。每单最多 RESCUE_TRIES 份，
+# 所以上限是 LOST_DEAL_LIMIT × 3 次下载 —— 别让一次异常跑把整天的
+# 请求额度用在捞单上。
+LOST_DEAL_LIMIT = 12
+
+
 def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
                    on_activity=None) -> list[Deal]:
     """对留存桶里的公告打开 PDF，抽要约字段。
@@ -1393,6 +1399,44 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
                 if _was_read(deal):
                     deals[i] = deal
                     flush([deal])
+
+        # 再补一遍，这次补的是**抽完之后才看得出来**的漏：一整簇公告都
+        # 开过了，却一条要约都没抽出来 —— 这单还是丢了。
+        #
+        # 筛查之后那一遍问的是「有没有留存」，这一遍问的是「有没有抽出
+        # 东西」，后者更硬。06113 UTS 就卡在两者之间：簇里有一条进了留存
+        # 桶，所以筛查后那一遍认为它没事；可那一条打开是后续公告，正文里
+        # 没有要約價 —— 这单照样丢了，而日志上只写「非要约」。
+        opened = {r.get("row_id") for r in targets}
+        got = {d.news_id for d in deals
+               if d.verdict == "offer" and d.news_id}
+        queues = []
+        for orphan in recall.find_orphans(rows, produced=got):
+            queue = [r for r in recall.rescue_ranked(orphan)
+                     if r.get("row_id") not in opened]
+            if queue:
+                queues.append((orphan, queue))
+        if queues:
+            log(f"  有 {len(queues)} 单**整簇都开过了却一条要约都没抽出来**，"
+                f"再换几份试：")
+        for orphan, queue in queues[:LOST_DEAL_LIMIT]:
+            for row in queue:
+                row["verdict"].bucket = recall.RESCUED
+                deal = _extract_one(row, opener, cancel_event, extractor,
+                                    pdf_source, selectors, validators,
+                                    None, pool)
+                good = deal.verdict == "offer"
+                log(f"      [捞] [{'OK' if good else '--'}] {orphan.code} "
+                    f"{orphan.name}　{row.get('date', '')}　"
+                    + (f"{deal.offer_type}　{deal.offer_price}　"
+                       f"{deal.premium_pct}%　{deal.deal_size}" if good else
+                       f"{VERDICT_LABEL.get(deal.verdict, '')}："
+                       f"{deal.verdict_reason}"))
+                if _was_read(deal):
+                    deals.append(deal)
+                    flush([deal])
+                if good:
+                    break              # 捞回来了，这一簇不用再开
     except (Cancelled, KeyboardInterrupt):
         # 停在半路也要把已经抽好的存下来 —— 下次接着跑，不用重下
         flush(deals)
