@@ -549,6 +549,50 @@ def _drop_impossible_deal_size(result) -> None:
         result.deal_size_evidence = Evidence()
 
 
+# 标题里常常直接写着受要约股数：
+#     「…提出附帶先決條件的自願現金部分收購要約以收購中國龍天集團有限公司
+#       (股份代號:1863)的最多85,261,250股股份」
+# 七位以上才算，免得把股份代号（1863）和年份当成股数。
+_TITLE_SHARES = re.compile(r"([\d,]{9,})\s*股")
+
+
+def _prefer_title_shares(result, title: str, candidates) -> None:
+    """标题写了受要约股数，就拿它定交易规模。
+
+    01863 中國龍天：标题白纸黑字「最多85,261,250股股份」，要约价 0.01，
+    乘出来是 852,612.50 —— 而程序取的是 85,261.25，正好差十倍
+    （用的是另一处的 8,526,125 股）。**852,612.50 本来就在候选里**，
+    只是排在后面。
+
+    标题是披露易索引里的字段，抓取层一定有，比正文任何一处都硬 ——
+    正文里那几个股数（已发行股本／销售股份／受要约股份）恰恰是最容易
+    混的地方。这里只做一次乘法和一次比对，不做判断（铁律一）。
+    """
+    price = _dec_or_none(result.offer_price)
+    m = _TITLE_SHARES.search(title or "")
+    if not m or not price or price <= 0:
+        return
+    shares = _dec_or_none(m.group(1))
+    if not shares or shares <= 0:
+        return
+    want = price * shares
+    for amount, page, quote in candidates:
+        value = _dec_or_none(amount)
+        if not value or value <= 0:
+            continue
+        if abs(value / want - 1) > Decimal("0.005"):
+            continue
+        if amount == result.deal_size:
+            return                      # 本来就取对了
+        result.notes.append(
+            f"交易规模按**标题写的股数**定：标题里是 {m.group(1)} 股，"
+            f"乘要约价 {result.offer_price} 得 {amount}；"
+            f"原来取的是 {result.deal_size or '（空）'}")
+        result.deal_size = amount
+        result.deal_size_evidence = Evidence(page, quote)
+        return
+
+
 def _choose_deal_size(result, candidates: list[tuple[str, int, str]],
                       equity_value: str = "") -> None:
     """按优先级挑第一个**讲得通**的候选。
@@ -2545,6 +2589,7 @@ def extract(title: str, pages: dict[int, str]) -> Extraction:
     result.spa_price, result.spa_price_evidence = extract_spa_price(pages)
     _drop_impossible_offer_price(result, price_candidates)
     _choose_deal_size(result, others, stated_equity_value(pages))
+    _prefer_title_shares(result, title, others)
 
     # 候选不止一个时说出来。2025 全年实测交易规模只对 12/51，而错的那些
     # 比值连续散布在 0.019~3.201 —— 说明不是稳定取错了某个口径，

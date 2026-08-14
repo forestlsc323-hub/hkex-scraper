@@ -1407,15 +1407,29 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
         # 东西」，后者更硬。06113 UTS 就卡在两者之间：簇里有一条进了留存
         # 桶，所以筛查后那一遍认为它没事；可那一条打开是后续公告，正文里
         # 没有要約價 —— 这单照样丢了，而日志上只写「非要约」。
-        opened = {r.get("row_id") for r in targets}
+        # ⚠️「已经开过」和「已经成事」都必须把**存档复用的那些行**算进来。
+        # 第一版只看这一轮新抽的 deals，而存档全命中时 deals 是空的 ——
+        # 于是 229 单里 94 单被判成「整簇都没抽出要约」，白开一批 PDF。
+        # 而且那一轮 targets 为空、解析进程根本没起（pool 是 None），
+        # 每一次捞都直接抛 'NoneType' object has no attribute 'parse'。
+        opened = ({r.get("row_id") for r in targets}
+                  | {str(r.get("NEWS_ID", "")) for r in reused_rows})
         got = {d.news_id for d in deals
                if d.verdict == "offer" and d.news_id}
+        got |= {str(r.get("NEWS_ID", "")) for r in reused_rows
+                if str(r.get("判定", "")).strip() == "要约"}
         queues = []
         for orphan in recall.find_orphans(rows, produced=got):
             queue = [r for r in recall.rescue_ranked(orphan)
                      if r.get("row_id") not in opened]
             if queue:
                 queues.append((orphan, queue))
+        if queues and pool is None:
+            # 这一轮一份 PDF 都没开（存档全命中），解析进程没起，
+            # 捞也捞不了。留到下一轮真要抽东西的时候再捞。
+            log(f"  有 {len(queues)} 单整簇没抽出要约，但这一轮没起解析进程，"
+                f"先不捞（下次有新公告要抽时会一并处理）")
+            queues = []
         if queues:
             log(f"  有 {len(queues)} 单**整簇都开过了却一条要约都没抽出来**，"
                 f"再换几份试：")
