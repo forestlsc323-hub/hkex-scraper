@@ -574,3 +574,33 @@ def test_a_download_failure_is_not_written_into_the_archive(isolated, monkeypatc
     again = {u.rsplit("/", 1)[-1] for u in opened}
     assert {"1.pdf", "3.pdf"} <= again, "失败的那两份没有重试"
     assert not (again & {"0.pdf", "2.pdf"}), "成功的那两份又重下了一遍"
+
+
+def test_a_blip_is_retried_once_more_at_the_end_of_the_run(isolated, monkeypatch):
+    """网络一抖往往抖一分钟，而单次下载只退避 1.5 秒和 3 秒。
+
+    实跑有 8 单**连着**栽在 ConnectionReset 上 —— 那不是八个坏链接，
+    是同一段网络抖动。跑完回头再补一遍，那时候离出事已经好几分钟。
+    """
+    from hkexdb import screening as S
+    from tests.test_runner import fake_open_pdf
+
+    monkeypatch.setattr(runner, "_speed_settings",
+                        lambda: (4000, 1, "keyword", ["要約"]))
+    rows = [{"row_id": f"n{i}", "date": "2026-06-15", "code": f"{i:05d}",
+             "name": f"公司{i}", "title": "作出強制性無條件現金要約",
+             "pdf_url": f"/x/{i}.pdf", "verdict": S.Verdict(bucket=S.RETAINED)}
+            for i in range(3)]
+
+    tried: dict = {}
+
+    def blip(url):
+        tried[url] = tried.get(url, 0) + 1
+        if url.endswith("1.pdf") and tried[url] == 1:
+            raise ConnectionError("远程主机强迫关闭了一个现有的连接")
+        return fake_open_pdf(url)
+
+    deals = runner._extract_deals(rows, lambda *_: None, lambda *_: None,
+                                  None, open_pdf=blip)
+    assert [d.verdict for d in deals] == ["offer"] * 3, "补跑那一份没救回来"
+    assert set(store.load_deals(isolated)) == {"n0", "n1", "n2"}

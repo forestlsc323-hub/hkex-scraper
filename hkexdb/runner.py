@@ -1339,9 +1339,11 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
     deals: list[Deal] = []
 
     def flush(rows: list[Deal]) -> None:
+        # ⚠️ 没读到的不进存档（见 _was_read）。这一条在**中途刷盘**这里
+        # 一样要守住：只在最后那次过滤，中途刷进去的失败照样留在存档里。
         keep_rows = [{"NEWS_ID": d.news_id, "抽取器版本": store.EXTRACTOR_VERSION,
                       **dict(zip(DEAL_COLUMNS, _deal_row(d)))}
-                     for d in rows if d.news_id]
+                     for d in rows if d.news_id and _was_read(d)]
         if keep_rows:
             store.merge_deals(ROOT, keep_rows, DEAL_COLUMNS)
             store.merge_evidence(ROOT, {d.pdf_url: d.evidence
@@ -1367,6 +1369,30 @@ def _extract_deals(rows, log, on_step, cancel_event, open_pdf=None,
                         flush(pending)
                         pending = []
                 flush(pending)
+
+        # 网络一抖往往抖一分钟，而单次下载只退避 1.5 秒和 3 秒 ——
+        # 上次实跑有 8 单连着栽在 ConnectionReset 上，一整批全丢。
+        # 跑完回头再补一遍：那时候离出事已经过去好几分钟，多半好了。
+        # 补不回来的保留原来那条记录（备注里写着为什么），也不进存档。
+        retry = [(i, r) for i, (r, d) in enumerate(zip(targets, deals))
+                 if not _was_read(d)]
+        if retry:
+            log(f"  有 {len(retry)} 份没能读到（下载失败／解析超时），"
+                f"跑完回头补一遍：")
+            for i, row in retry:
+                deal = _extract_one(row, opener, cancel_event, extractor,
+                                    pdf_source, selectors, validators,
+                                    None, pool)
+                good = deal.verdict == "offer"
+                log(f"      [补] [{'OK' if good else '--'}] "
+                    f"{deal.code} {deal.name}　"
+                    + (f"{deal.offer_type}　{deal.offer_price}　"
+                       f"{deal.premium_pct}%　{deal.deal_size}" if good else
+                       f"{VERDICT_LABEL.get(deal.verdict, '')}："
+                       f"{deal.verdict_reason}"))
+                if _was_read(deal):
+                    deals[i] = deal
+                    flush([deal])
     except (Cancelled, KeyboardInterrupt):
         # 停在半路也要把已经抽好的存下来 —— 下次接着跑，不用重下
         flush(deals)
