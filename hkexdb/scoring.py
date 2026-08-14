@@ -116,7 +116,7 @@ class Report:
             lines += ["", "错在哪里", "-" * 56]
             any_wrong = False
             for s in self.scores:
-                for key, got, want, ver, paired in s.wrong:
+                for key, got, want, ver, paired, why, link in s.wrong:
                     any_wrong = True
                     lines.append(f"[{s.field}] {'/'.join(key)}")
                     lines.append(f"    抽到：{got or '（空）'}")
@@ -132,6 +132,15 @@ class Report:
                     hint = _hint(got, want)
                     if hint:
                         lines.append(f"    ↳ {hint}")
+                    # ⚠️ 把程序自己的「备注」原样贴出来。
+                    # 「差一点」的那一类几乎全是口径分歧，而备注里已经列着
+                    # 这一单的**全部候选**——答案数在候选里就是选错了
+                    # （改优先级一次修一批），不在候选里才需要翻原文。
+                    # 不印出来的话，每一单都得重新去要一份 PDF。
+                    if why:
+                        lines.append(f"    ↳ 程序的备注：{why[:400]}")
+                    if link:
+                        lines.append(f"    ↳ 原文：{link}")
                     if ver and self.version and ver != self.version:
                         lines.append(
                             f"    ⚠ 这一行是旧版本 {ver} 抽的（当前 {self.version}）"
@@ -294,7 +303,9 @@ def score(got_rows: list[dict], answer_rows: list[dict]) -> Report:
             else:
                 s.wrong.append((key, str(got), str(want),
                                 str(got_row.get("抽取器版本", "")).strip(),
-                                (str(got_row.get("公告日期", "")).strip(), _gap)))
+                                (str(got_row.get("公告日期", "")).strip(), _gap),
+                                str(got_row.get("备注", "")).strip(),
+                                str(got_row.get("PDF链接", "")).strip()))
 
     extra = [_key(r) for r in leftovers]
     # 旧版本抽的行拿来算准确率，量的是历史不是现在的规则 —— 必须说出来。
