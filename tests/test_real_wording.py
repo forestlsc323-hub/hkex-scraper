@@ -1256,3 +1256,36 @@ def test_a_ladder_that_disagrees_with_the_offer_price_is_left_alone():
                 "每股2.892港元溢價約75.48%。"}
     ex = extractor.extract("", pages)
     assert {c.stated_pct for c in ex.comparisons} == {"42.76", "57.20", "75.48"}
+
+
+# 08232 CLASSIFIED GP（真原文，页 5）—— 一点都不错位的普通散文
+P08232 = {
+    5: "要約價每股要約股份1.318港元："
+       "(i) 較股份於二零二五年六月三十日（即最後交易日）在聯交所所報收市價"
+       "每股1.090港元溢價約20.9%；"
+       "(ii) 較股份於緊接最後交易日（包括該日）前連續五個交易日在聯交所所報"
+       "平均收市價每股約1.092港元溢價約20.7%；"
+       "(iii) 較股份於緊接最後交易日（包括該日）前連續十個交易日在聯交所所報"
+       "平均收市價每股約1.094港元溢價約20.5%；"
+       "(iv) 較股份於緊接最後交易日（包括該日）前連續三十個交易日在聯交所"
+       "所報平均收市價每股約1.070港元溢價約23.1%。最高與最低股價",
+}
+
+
+def test_a_chinese_date_is_not_read_as_a_trading_day_window():
+    """「二零二五年六月**三十**日」里的三十不是三十个交易日。
+
+    这一条一点都不错位，就是普通散文 —— 而窗口正则原来认光秃秃的
+    「三十」，于是收市价那条被判成 30 日均价，顶掉了真正的 30 日
+    （1.070／23.1%），主值取到 20.9%。中文日期里「三十日」「三十一日」
+    到处都是，这不是个别现象。
+
+    天数必须跟着量词「個」才算数。
+    """
+    ex = extractor.extract("聯合公佈 強制性無條件現金要約", P08232)
+    ladder = {(c.anchor, c.window): (c.benchmark, c.stated_pct)
+              for c in ex.comparisons}
+    assert ladder[("last_trading_day", "spot")] == ("1.090", "20.9")
+    assert ladder[("last_trading_day", "5d")] == ("1.092", "20.7")
+    assert ladder[("last_trading_day", "10d")] == ("1.094", "20.5")
+    assert ladder[("last_trading_day", "30d")] == ("1.070", "23.1")
